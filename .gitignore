@@ -1,0 +1,7 @@
+# local, per-user configuration (never commit real servers/routes)
+config.sh
+
+# uv / Python
+.venv/
+__pycache__/
+*.py[cod]

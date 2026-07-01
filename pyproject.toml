@@ -1,0 +1,10 @@
+[project]
+name = "openconnect-auto-sso"
+version = "0.1.0"
+description = "Connect to browser-SSO (SAML) VPNs with openconnect: unprivileged login browser, remembered sessions, optional split-tunnel routing."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pyqt6>=6.11.0",
+    "pyqt6-webengine>=6.11.0",
+]
