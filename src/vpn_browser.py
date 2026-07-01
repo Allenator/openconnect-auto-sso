@@ -111,15 +111,25 @@ def main(argv):
 
     done = {"v": False}
 
+    def flush_cookies():
+        # A no-op delete forces the cookie store to sync to disk.
+        _profile.cookieStore().deleteCookie(QNetworkCookie())
+
     def finish():
         if done["v"]:
             return
         done["v"] = True
         log("callback reached; flushing cookies and quitting")
-        # Force the cookie store to sync to disk even for a very short-lived
-        # (warm-cookie) run: a no-op delete triggers the flush. Then quit.
-        _profile.cookieStore().deleteCookie(QNetworkCookie())
+        flush_cookies()
         QTimer.singleShot(800, app.quit)
+
+    # Not every server uses the localhost callback (some complete the SSO
+    # server-side), so we can't always self-close -- the connect script ends us
+    # once Phase 1 finishes. Periodically sync cookies to disk so the persistent
+    # session survives that termination whenever it happens.
+    flusher = QTimer()
+    flusher.timeout.connect(flush_cookies)
+    flusher.start(3000)
 
     idle = QTimer()
     idle.setSingleShot(True)
