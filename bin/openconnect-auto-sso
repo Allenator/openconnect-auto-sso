@@ -1,0 +1,73 @@
+#!/bin/sh
+# openconnect-auto-sso — connect to a browser-SSO VPN in two phases so the
+# login browser never runs as root:
+#   Phase 1 (as you):   openconnect --authenticate --external-browser=<helper>
+#                       -> prints COOKIE / CONNECT_URL / FINGERPRINT / RESOLVE
+#   Phase 2 (sudo):     openconnect --cookie-on-stdin ...  (no browser)
+#
+# All site-specifics come from config.sh (see config.example.sh).
+set -eu
+
+# --- locate the project (works when symlinked into ~/.local/bin) -------------
+src=$0
+while [ -L "$src" ]; do
+    dir=$(cd "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case $src in /*) ;; *) src=$dir/$src ;; esac
+done
+PROJ=$(cd "$(dirname "$src")/.." && pwd)
+
+# --- load configuration ------------------------------------------------------
+CONFIG="${OC_AUTO_SSO_CONFIG:-$PROJ/config.sh}"
+if [ ! -f "$CONFIG" ]; then
+    echo "error: no config at $CONFIG" >&2
+    echo "       cp config.example.sh config.sh   # then edit SERVER" >&2
+    exit 1
+fi
+# shellcheck disable=SC1090
+. "$CONFIG"
+
+: "${SERVER:?SERVER must be set in config.sh}"
+PROTOCOL="${PROTOCOL:-}"
+SPLIT_ROUTES="${SPLIT_ROUTES:-}"
+PROFILE_NAME="${PROFILE_NAME:-openconnect-auto-sso}"
+CALLBACK="${CALLBACK:-localhost:29786}"
+USER="${USER:-$(id -un)}"
+
+# The SSO browser helper (spawned by openconnect) reads these from the env.
+export PROFILE_NAME CALLBACK
+
+# --- Phase 1: authenticate as the current user (no sudo, no root browser) ----
+echo ">> authenticating to $SERVER" >&2
+authenticate() {
+    if [ -n "$PROTOCOL" ]; then
+        openconnect --protocol="$PROTOCOL" \
+            --external-browser="$PROJ/bin/vpn-browser" --authenticate "$SERVER"
+    else
+        openconnect \
+            --external-browser="$PROJ/bin/vpn-browser" --authenticate "$SERVER"
+    fi
+}
+
+COOKIE=''; HOST=''; CONNECT_URL=''; FINGERPRINT=''; RESOLVE=''
+auth_out=$(authenticate) || { echo "error: authentication failed" >&2; exit 1; }
+eval "$auth_out"   # sets COOKIE / HOST / CONNECT_URL / FINGERPRINT / RESOLVE
+
+if [ -z "$COOKIE" ]; then
+    echo "error: no session cookie (login cancelled, or server has no SSO)" >&2
+    exit 1
+fi
+
+# --- Phase 2: build the tunnel as root (no browser involved) -----------------
+set -- --cookie-on-stdin --servercert "$FINGERPRINT" --setuid "$USER"
+[ -n "$RESOLVE" ] && set -- "$@" --resolve "$RESOLVE"
+[ -n "$PROTOCOL" ] && set -- "$@" --protocol="$PROTOCOL"
+if [ -n "$SPLIT_ROUTES" ]; then
+    # root's PATH usually excludes Homebrew, so resolve vpn-slice to an abs path.
+    VPN_SLICE=$(command -v vpn-slice || true)
+    [ -n "$VPN_SLICE" ] || { echo "error: SPLIT_ROUTES set but vpn-slice not found" >&2; exit 1; }
+    set -- "$@" -s "$VPN_SLICE $SPLIT_ROUTES"
+fi
+
+echo ">> connecting tunnel (sudo)" >&2
+printf '%s' "$COOKIE" | sudo openconnect "$@" "$CONNECT_URL"
