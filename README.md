@@ -64,6 +64,7 @@ Without `install.sh`, run it in place with `./bin/openconnect-auto-sso`.
 | `CALLBACK`     | openconnect's external-browser callback `host:port`. Rarely changed.    |
 | `KEEPALIVE_HOST` | Optional. Host to ping through the tunnel to avoid idle-disconnects; must be reachable inside the VPN. Blank = off. |
 | `KEEPALIVE_INTERVAL` | Seconds between keepalive pings (default 30).                     |
+| `ALLOW_INCOMING` | `1` passes `vpn-slice -i` (allow incoming from VPN, no pf firewall). Lets iCloud Private Relay keep working; default `0` blocks incoming. |
 
 ## Usage
 
@@ -113,6 +114,13 @@ SPLIT_ROUTES="<your-vpn-subnets> %100.64.0.0/10"
 
 With a split tunnel the VPN only claims your corporate routes, so Tailscale's default
 route and `100.64.0.0/10` are untouched.
+
+**Keep iCloud Private Relay working.** macOS disables Private Relay when it sees a
+default-route rule, a DNS takeover, *or* a packet-filter change. A route-only split
+tunnel avoids the first two, but `vpn-slice`'s default "block incoming" firewall adds a
+pf anchor that trips the third. Set `ALLOW_INCOMING=1` (passes `vpn-slice -i`) to drop
+that firewall so Private Relay stays on — weigh it against letting VPN hosts reach open
+ports on your machine.
 
 **Skip the sudo prompt.** Add a scoped `sudoers` rule (via `sudo visudo`) so only
 `openconnect` can run without a password:

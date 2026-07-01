@@ -27,3 +27,9 @@ CALLBACK="localhost:29786"
 # mode) so the traffic actually goes through the tunnel. Blank = disabled.
 KEEPALIVE_HOST=""
 KEEPALIVE_INTERVAL="30"
+
+# vpn-slice blocks incoming connections from the VPN by default, via a pf firewall
+# rule that also disables iCloud Private Relay. Set to 1 to allow incoming (pass
+# vpn-slice -i): no pf rule, so Private Relay keeps working -- at the cost of hosts
+# on the VPN being able to reach open ports on your machine. Only affects split mode.
+ALLOW_INCOMING="0"

@@ -34,6 +34,7 @@ PROFILE_NAME="${PROFILE_NAME:-openconnect-auto-sso}"
 CALLBACK="${CALLBACK:-localhost:29786}"
 KEEPALIVE_HOST="${KEEPALIVE_HOST:-}"
 KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
+ALLOW_INCOMING="${ALLOW_INCOMING:-0}"
 
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
@@ -85,7 +86,12 @@ if [ -n "$SPLIT_ROUTES" ]; then
     # root's PATH usually excludes Homebrew, so resolve vpn-slice to an abs path.
     VPN_SLICE=$(command -v vpn-slice || true)
     [ -n "$VPN_SLICE" ] || { echo "error: SPLIT_ROUTES set but vpn-slice not found" >&2; exit 1; }
-    set -- "$@" -s "$VPN_SLICE $SPLIT_ROUTES"
+    # By default vpn-slice blocks incoming VPN traffic via a pf firewall anchor,
+    # which also disables iCloud Private Relay. ALLOW_INCOMING=1 passes -i so no
+    # pf rule is installed (Private Relay keeps working; VPN hosts can reach you).
+    vs_incoming=
+    [ "$ALLOW_INCOMING" = "1" ] && vs_incoming="-i "
+    set -- "$@" -s "$VPN_SLICE ${vs_incoming}$SPLIT_ROUTES"
 fi
 
 # Optional keepalive: some servers drop an idle tunnel. Ping a host *inside* the
