@@ -62,6 +62,8 @@ Without `install.sh`, run it in place with `./bin/openconnect-auto-sso`.
 | `SPLIT_ROUTES` | `vpn-slice` args; blank = full tunnel. `%CIDR` excludes a subnet.       |
 | `PROFILE_NAME` | Persistent browser-profile storage key. Usually leave as-is.            |
 | `CALLBACK`     | openconnect's external-browser callback `host:port`. Rarely changed.    |
+| `KEEPALIVE_HOST` | Optional. Host to ping through the tunnel to avoid idle-disconnects; must be reachable inside the VPN. Blank = off. |
+| `KEEPALIVE_INTERVAL` | Seconds between keepalive pings (default 30).                     |
 
 ## Usage
 
@@ -89,6 +91,17 @@ SPLIT_ROUTES="10.0.0.0/8 %100.64.0.0/10"         # …but exclude a range
 
 The connect script resolves `vpn-slice` to an absolute path, since `sudo` (Phase 2)
 usually doesn't have Homebrew on its `PATH`.
+
+## Keeping an idle tunnel alive
+
+Many VPN servers disconnect a tunnel that carries no traffic (openconnect reports
+`Received server disconnect: ... 'Idle Timeout'`). In split-tunnel mode that happens
+easily, since only your routed subnets generate traffic. Set `KEEPALIVE_HOST` to a host
+that is reachable **inside** the VPN — i.e. one covered by `SPLIT_ROUTES` (or anything, in
+full-tunnel mode) — and the connect script pings it every `KEEPALIVE_INTERVAL` seconds
+while connected, stopping automatically on disconnect. An internal DNS server is a good,
+stable choice; just make sure its subnet is in `SPLIT_ROUTES` so the ping goes through the
+tunnel.
 
 ## Recipes
 

@@ -20,3 +20,10 @@ PROFILE_NAME="openconnect-auto-sso"
 
 # openconnect's external-browser loopback callback (host:port). Rarely changed.
 CALLBACK="localhost:29786"
+
+# Keepalive (optional): some servers drop an idle tunnel. If set, ping this host
+# through the tunnel every KEEPALIVE_INTERVAL seconds to keep it alive. The host
+# MUST be reachable inside the VPN (within SPLIT_ROUTES, or any host in full-tunnel
+# mode) so the traffic actually goes through the tunnel. Blank = disabled.
+KEEPALIVE_HOST=""
+KEEPALIVE_INTERVAL="30"

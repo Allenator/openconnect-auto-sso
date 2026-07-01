@@ -32,6 +32,8 @@ PROTOCOL="${PROTOCOL:-}"
 SPLIT_ROUTES="${SPLIT_ROUTES:-}"
 PROFILE_NAME="${PROFILE_NAME:-openconnect-auto-sso}"
 CALLBACK="${CALLBACK:-localhost:29786}"
+KEEPALIVE_HOST="${KEEPALIVE_HOST:-}"
+KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
 
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
@@ -84,6 +86,19 @@ if [ -n "$SPLIT_ROUTES" ]; then
     VPN_SLICE=$(command -v vpn-slice || true)
     [ -n "$VPN_SLICE" ] || { echo "error: SPLIT_ROUTES set but vpn-slice not found" >&2; exit 1; }
     set -- "$@" -s "$VPN_SLICE $SPLIT_ROUTES"
+fi
+
+# Optional keepalive: some servers drop an idle tunnel. Ping a host *inside* the
+# VPN periodically so a little traffic keeps flowing. The subshell watches the
+# script's PID and stops when we exit (belt-and-suspenders with the EXIT trap).
+if [ -n "$KEEPALIVE_HOST" ]; then
+    ( while kill -0 "$$" 2>/dev/null; do
+          ping -c 1 -t 5 "$KEEPALIVE_HOST" >/dev/null 2>&1 || true
+          sleep "$KEEPALIVE_INTERVAL"
+      done ) &
+    KA_PID=$!
+    trap 'kill "$KA_PID" 2>/dev/null || true' EXIT
+    echo ">> keepalive: ping $KEEPALIVE_HOST every ${KEEPALIVE_INTERVAL}s" >&2
 fi
 
 echo ">> connecting tunnel (sudo)" >&2
