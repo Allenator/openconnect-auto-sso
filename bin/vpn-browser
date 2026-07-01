@@ -1,0 +1,17 @@
+#!/bin/sh
+# Launch the persistent-profile SSO browser via the project's uv environment.
+# openconnect --external-browser invokes this with the login URL as $1.
+#
+# Resolves its own real path first, so it works when symlinked into ~/.local/bin.
+src=$0
+while [ -L "$src" ]; do
+    dir=$(cd "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case $src in
+        /*) ;;
+        *) src=$dir/$src ;;
+    esac
+done
+proj=$(cd "$(dirname "$src")/.." && pwd)
+
+exec uv run --directory "$proj" --quiet python "$proj/src/vpn_browser.py" "$@"
