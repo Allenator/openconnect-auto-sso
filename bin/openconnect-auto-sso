@@ -32,7 +32,6 @@ PROTOCOL="${PROTOCOL:-}"
 SPLIT_ROUTES="${SPLIT_ROUTES:-}"
 PROFILE_NAME="${PROFILE_NAME:-openconnect-auto-sso}"
 CALLBACK="${CALLBACK:-localhost:29786}"
-USER="${USER:-$(id -un)}"
 
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
@@ -59,7 +58,12 @@ if [ -z "$COOKIE" ]; then
 fi
 
 # --- Phase 2: build the tunnel as root (no browser involved) -----------------
-set -- --cookie-on-stdin --servercert "$FINGERPRINT" --setuid "$USER"
+# NOTE: deliberately NO --setuid. On macOS, dropping privileges makes openconnect
+# run the DISCONNECT vpnc-script as the unprivileged user, which then cannot
+# restore routes or DNS -- leaving the machine with no default route and stale VPN
+# DNS servers after you disconnect. Staying root for the tunnel's lifetime lets
+# teardown cleanly undo everything.
+set -- --cookie-on-stdin --servercert "$FINGERPRINT"
 [ -n "$RESOLVE" ] && set -- "$@" --resolve "$RESOLVE"
 [ -n "$PROTOCOL" ] && set -- "$@" --protocol="$PROTOCOL"
 if [ -n "$SPLIT_ROUTES" ]; then

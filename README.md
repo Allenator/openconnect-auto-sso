@@ -111,7 +111,10 @@ youruser ALL=(root) NOPASSWD: /opt/homebrew/bin/openconnect
 ## Security notes
 
 - **The browser is never root.** Phase 1 runs as you; only Phase 2 (the tunnel) uses
-  `sudo`, and it sheds root immediately via `--setuid $USER` once routes are set.
+  `sudo`. openconnect keeps root for the tunnel's lifetime — on macOS this is required so
+  that *disconnecting* can cleanly restore your routes and DNS. (Dropping privileges with
+  `--setuid` makes teardown run unprivileged, which fails to restore them and can strand
+  your network.)
 - **No secrets are stored by this tool.** Authentication uses your real IdP session
   (passkeys, Duo, Touch ID…). The only persisted item is the IdP's own browser cookie,
   in a profile under your user account — exactly like any browser's "stay signed in".
