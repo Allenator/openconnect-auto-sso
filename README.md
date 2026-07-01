@@ -122,6 +122,12 @@ pf anchor that trips the third. Set `ALLOW_INCOMING=1` (passes `vpn-slice -i`) t
 that firewall so Private Relay stays on — weigh it against letting VPN hosts reach open
 ports on your machine.
 
+That firewall can also *leak*: `vpn-slice` appends its anchor to `/etc/pf.conf` and
+sometimes fails to remove it on teardown, leaving the anchor loaded on every boot — which
+keeps Private Relay disabled even with no VPN connected. `openconnect-auto-sso` **warns at
+startup** if it finds such a leftover and offers to clean it (strip the line and reload
+pf). `ALLOW_INCOMING=1` avoids creating it in the first place.
+
 **Skip the sudo prompt.** Add a scoped `sudoers` rule (via `sudo visudo`) so only
 `openconnect` can run without a password:
 

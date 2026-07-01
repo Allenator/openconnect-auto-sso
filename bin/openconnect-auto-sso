@@ -39,6 +39,35 @@ ALLOW_INCOMING="${ALLOW_INCOMING:-0}"
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
 
+# --- warn about leaked vpn-slice pf anchors --------------------------------
+# vpn-slice's "block incoming" firewall appends an anchor to /etc/pf.conf and can
+# fail to remove it on teardown. The leftover reloads on every boot and keeps
+# iCloud Private Relay disabled even with no VPN connected. Warn (and offer to fix).
+if [ -r /etc/pf.conf ] && grep -q 'anchor "vpn_slice' /etc/pf.conf 2>/dev/null; then
+    echo "WARNING: leftover vpn-slice firewall anchor in /etc/pf.conf:" >&2
+    grep -n 'anchor "vpn_slice' /etc/pf.conf | sed 's/^/    /' >&2
+    echo "  It persists across reboots and can keep iCloud Private Relay off even" >&2
+    echo "  with no VPN connected (a vpn-slice teardown bug)." >&2
+    _cleaned=n
+    if [ -t 0 ]; then
+        printf "  Remove it now (needs sudo)? [y/N] " >&2
+        read -r _ans || _ans=n
+        case "$_ans" in
+            [yY]*)
+                if sudo cp /etc/pf.conf /etc/pf.conf.bak &&
+                   sudo sed -i '' '/anchor "vpn_slice/d' /etc/pf.conf &&
+                   sudo pfctl -f /etc/pf.conf 2>/dev/null; then
+                    echo "  cleaned (backup at /etc/pf.conf.bak)." >&2
+                    _cleaned=y
+                else
+                    echo "  cleanup failed; remove the line manually." >&2
+                fi ;;
+        esac
+    fi
+    [ "$_cleaned" = y ] || \
+        echo "  Clean later:  sudo sed -i '' '/anchor \"vpn_slice/d' /etc/pf.conf && sudo pfctl -f /etc/pf.conf" >&2
+fi
+
 # --- Phase 1: authenticate as the current user (no sudo, no root browser) ----
 echo ">> authenticating to $SERVER" >&2
 authenticate() {
