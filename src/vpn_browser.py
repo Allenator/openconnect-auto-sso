@@ -15,12 +15,13 @@ Environment (all optional; set by bin/vpn-browser / the connect script):
   PROFILE_NAME            Qt persistent-profile storage key (default: openconnect-auto-sso)
   CALLBACK                host:port openconnect listens on (default: localhost:29786)
   VPN_BROWSER_SHOW=1      always show the window (debugging)
-  VPN_BROWSER_IDLE_MS     idle ms before revealing the window (default: 2500)
+  VPN_BROWSER_IDLE_MS     idle ms before checking whether to reveal (default: 3500)
   VPN_BROWSER_TIMEOUT_MS  overall safety timeout in ms (default: 180000)
   VPN_BROWSER_DEBUG=1     log lifecycle events to stderr
 """
 import os
 import sys
+import time
 
 # QtWebEngine must be imported before the QApplication is constructed.
 from PyQt6.QtWebEngineWidgets import QWebEngineView
@@ -81,13 +82,15 @@ def main(argv):
     profile_name = os.environ.get("PROFILE_NAME") or APP_NAME
     cb_host, cb_port = parse_callback(os.environ.get("CALLBACK") or "localhost:29786")
     show_always = os.environ.get("VPN_BROWSER_SHOW") == "1"
-    idle_ms = int(os.environ.get("VPN_BROWSER_IDLE_MS") or "2500")
+    idle_ms = int(os.environ.get("VPN_BROWSER_IDLE_MS") or "3500")
     hard_ms = int(os.environ.get("VPN_BROWSER_TIMEOUT_MS") or "180000")
     debug = os.environ.get("VPN_BROWSER_DEBUG") == "1"
+    t0 = time.monotonic()
 
     def log(*a):
         if debug:
-            print("[vpn-browser]", *a, file=sys.stderr, flush=True)
+            print("[vpn-browser +%.1fs]" % (time.monotonic() - t0), *a,
+                  file=sys.stderr, flush=True)
 
     app = QApplication([argv[0]])
     app.setApplicationName(APP_NAME)      # stable persistent-storage path
@@ -121,19 +124,49 @@ def main(argv):
     idle = QTimer()
     idle.setSingleShot(True)
 
-    def reveal():
+    # A warm SSO flow transits blank/redirect pages that momentarily look idle.
+    # Only reveal the window when the current page actually has something to
+    # interact with (a visible input/button/link), so those transients stay hidden.
+    NEEDS_INPUT_JS = (
+        "(function(){var s=document.querySelectorAll("
+        "'input:not([type=hidden]),textarea,select,button,[role=button],a[href]');"
+        "for(var i=0;i<s.length;i++){var e=s[i],r=e.getBoundingClientRect();"
+        "if(r.width>4&&r.height>4&&e.offsetParent!==null)return true;}"
+        "return false;})()"
+    )
+
+    def do_reveal():
         if done["v"] or view.isVisible():
             return
-        log("flow idle; revealing window for interaction")
+        log("revealing window for interaction")
         set_activation_policy(app, 0)     # become a normal app for interaction
         view.show()
         view.raise_()
         view.activateWindow()
 
-    idle.timeout.connect(reveal)
+    def on_idle():
+        if done["v"] or view.isVisible():
+            return
+
+        def decide(has_input):
+            if done["v"] or view.isVisible():
+                return
+            if has_input:
+                do_reveal()
+            else:
+                log("idle on a non-interactive page (%s); staying hidden"
+                    % view.url().toString())
+                idle.start(idle_ms)     # still a transient; keep waiting
+
+        try:
+            view.page().runJavaScript(NEEDS_INPUT_JS, decide)
+        except Exception:
+            do_reveal()
+
+    idle.timeout.connect(on_idle)
 
     def bump():
-        # Progress happened (navigation / load). Postpone revealing the window.
+        # Progress happened (navigation / load). Postpone the reveal check.
         if not view.isVisible() and not done["v"]:
             idle.start(idle_ms)
 
@@ -141,6 +174,7 @@ def main(argv):
         if is_callback(url, cb_host, cb_port):
             finish()
         else:
+            log("navigated:", url.toString())
             bump()
 
     view.urlChanged.connect(on_url)
