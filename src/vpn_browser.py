@@ -16,7 +16,10 @@ Environment (all optional; set by bin/vpn-browser / the connect script):
   CALLBACK                host:port openconnect listens on (default: localhost:29786)
   VPN_BROWSER_SHOW=1      always show the window (debugging)
   VPN_BROWSER_IDLE_MS     idle ms before checking whether to reveal (default: 3500)
-  VPN_BROWSER_TIMEOUT_MS  overall safety timeout in ms (default: 180000)
+  VPN_BROWSER_TIMEOUT_MS  orphan-cleanup backstop in ms (default: 300000). The
+                          connect script normally ends us once auth completes;
+                          this only fires if we're left orphaned. Keep it well
+                          above the longest plausible interactive login.
   VPN_BROWSER_DEBUG=1     log lifecycle events to stderr
 """
 import os
@@ -83,7 +86,7 @@ def main(argv):
     cb_host, cb_port = parse_callback(os.environ.get("CALLBACK") or "localhost:29786")
     show_always = os.environ.get("VPN_BROWSER_SHOW") == "1"
     idle_ms = int(os.environ.get("VPN_BROWSER_IDLE_MS") or "3500")
-    hard_ms = int(os.environ.get("VPN_BROWSER_TIMEOUT_MS") or "180000")
+    hard_ms = int(os.environ.get("VPN_BROWSER_TIMEOUT_MS") or "300000")
     debug = os.environ.get("VPN_BROWSER_DEBUG") == "1"
     t0 = time.monotonic()
 
@@ -197,7 +200,9 @@ def main(argv):
     else:
         idle.start(idle_ms)               # hidden; reveal only if the flow stalls
 
-    QTimer.singleShot(hard_ms, app.quit)  # safety net
+    # Orphan backstop only: the connect script ends us when Phase 1 finishes.
+    # This must never fire during a legitimate (possibly slow) interactive login.
+    QTimer.singleShot(hard_ms, app.quit)
     return app.exec()
 
 
