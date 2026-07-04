@@ -33,3 +33,15 @@ KEEPALIVE_INTERVAL="30"
 # vpn-slice -i): no pf rule, so Private Relay keeps working -- at the cost of hosts
 # on the VPN being able to reach open ports on your machine. Only affects split mode.
 ALLOW_INCOMING="0"
+
+# Split DNS: comma-separated domains resolved via the VPN's DNS servers (pushed
+# dynamically by the connection), like Tailscale's MagicDNS for *.ts.net -- queries
+# for these go to the VPN DNS, everything else keeps your normal resolver.
+# e.g. VPN_DOMAINS="yale.edu"
+VPN_DOMAINS=""
+
+# Consume routes the VPN pushes instead of hardcoding them:
+#   ROUTE_INTERNAL=1  also route the VPN's own subnet (server-provided)
+#   ROUTE_SPLITS=1    also route the server's split-include subnets (if it sends any)
+ROUTE_INTERNAL="0"
+ROUTE_SPLITS="0"

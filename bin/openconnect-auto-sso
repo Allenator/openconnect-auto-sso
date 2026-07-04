@@ -35,6 +35,9 @@ CALLBACK="${CALLBACK:-localhost:29786}"
 KEEPALIVE_HOST="${KEEPALIVE_HOST:-}"
 KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
 ALLOW_INCOMING="${ALLOW_INCOMING:-0}"
+VPN_DOMAINS="${VPN_DOMAINS:-}"          # split-DNS: domains resolved via the VPN's DNS
+ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (server-pushed)
+ROUTE_SPLITS="${ROUTE_SPLITS:-0}"       # also add the server's split-include subnets
 
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
@@ -111,16 +114,19 @@ fi
 set -- --cookie-on-stdin --servercert "$FINGERPRINT"
 [ -n "$RESOLVE" ] && set -- "$@" --resolve "$RESOLVE"
 [ -n "$PROTOCOL" ] && set -- "$@" --protocol="$PROTOCOL"
-if [ -n "$SPLIT_ROUTES" ]; then
+if [ -n "$SPLIT_ROUTES$VPN_DOMAINS" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUTE_SPLITS" = "1" ]; then
     # root's PATH usually excludes Homebrew, so resolve vpn-slice to an abs path.
     VPN_SLICE=$(command -v vpn-slice || true)
-    [ -n "$VPN_SLICE" ] || { echo "error: SPLIT_ROUTES set but vpn-slice not found" >&2; exit 1; }
-    # By default vpn-slice blocks incoming VPN traffic via a pf firewall anchor,
-    # which also disables iCloud Private Relay. ALLOW_INCOMING=1 passes -i so no
-    # pf rule is installed (Private Relay keeps working; VPN hosts can reach you).
-    vs_incoming=
-    [ "$ALLOW_INCOMING" = "1" ] && vs_incoming="-i "
-    set -- "$@" -s "$VPN_SLICE ${vs_incoming}$SPLIT_ROUTES"
+    [ -n "$VPN_SLICE" ] || { echo "error: split/DNS options set but vpn-slice not found" >&2; exit 1; }
+    vs="$VPN_SLICE"
+    # ALLOW_INCOMING=1 drops vpn-slice's pf firewall (keeps iCloud Private Relay working).
+    [ "$ALLOW_INCOMING" = "1" ] && vs="$vs -i"
+    # Dynamic routes/DNS pushed by the VPN (no need to hardcode them):
+    [ "$ROUTE_INTERNAL" = "1" ] && vs="$vs -I"                         # VPN's own subnet
+    [ "$ROUTE_SPLITS" = "1" ] && vs="$vs -S"                           # server split-includes
+    [ -n "$VPN_DOMAINS" ] && vs="$vs --domains-vpn-dns $VPN_DOMAINS"   # split DNS
+    [ -n "$SPLIT_ROUTES" ] && vs="$vs $SPLIT_ROUTES"                   # your explicit subnets
+    set -- "$@" -s "$vs"
 fi
 
 # Optional keepalive: some servers drop an idle tunnel. Ping a host *inside* the

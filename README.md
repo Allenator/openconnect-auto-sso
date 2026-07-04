@@ -65,6 +65,9 @@ Without `install.sh`, run it in place with `./bin/openconnect-auto-sso`.
 | `KEEPALIVE_HOST` | Optional. Host to ping through the tunnel to avoid idle-disconnects; must be reachable inside the VPN. Blank = off. |
 | `KEEPALIVE_INTERVAL` | Seconds between keepalive pings (default 30).                     |
 | `ALLOW_INCOMING` | `1` passes `vpn-slice -i` (allow incoming from VPN, no pf firewall). Lets iCloud Private Relay keep working; default `0` blocks incoming. |
+| `VPN_DOMAINS` | Comma-separated domains resolved via the VPN's DNS (split DNS, à la Tailscale MagicDNS). Resolvers are pulled from the connection. Blank = off. |
+| `ROUTE_INTERNAL` | `1` also routes the VPN's own subnet (server-pushed, `vpn-slice -I`). |
+| `ROUTE_SPLITS` | `1` also routes the server's split-include subnets, if any (`vpn-slice -S`). |
 
 ## Usage
 
