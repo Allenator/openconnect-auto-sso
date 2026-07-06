@@ -67,7 +67,7 @@ override with `$OC_AUTO_SSO_CONFIG`, or drop a `config.toml` in the repo for dev
 | `route_internal` | bool | Also route the VPN's own subnet, server-pushed (`vpn-slice -I`). |
 | `route_splits` | bool | Also route the server's split-include subnets, if any (`vpn-slice -S`). |
 | `allow_incoming` | bool | `true` allows incoming from the VPN (no pf firewall) so iCloud Private Relay keeps working. |
-| `keepalive_host` | string | Host to ping through the tunnel to avoid idle-disconnects; must be reachable inside the VPN. `""` = off. |
+| `keepalive_host` | string | Host to ping through the tunnel to avoid idle-disconnects. `"@dns"` auto-targets the VPN's own pushed DNS server (recommended); or a specific in-VPN host. `""` = off. |
 | `keepalive_interval` | int | Seconds between keepalive pings (default 30). |
 | `profile_name` | string | Qt persistent-profile storage key. Usually leave default. |
 | `callback` | string | openconnect external-browser callback `host:port`. Rarely changed. |
@@ -106,9 +106,9 @@ Many VPN servers disconnect a tunnel that carries no traffic (openconnect report
 easily, since only your routed subnets generate traffic. Set `keepalive_host` to a host
 that is reachable **inside** the VPN — i.e. one covered by `split_routes` (or anything, in
 full-tunnel mode) — and the connect script pings it every `keepalive_interval` seconds
-while connected, stopping automatically on disconnect. An internal DNS server is a good,
-stable choice; just make sure its subnet is in `split_routes` so the ping goes through the
-tunnel.
+while connected, stopping automatically on disconnect. The easiest choice is
+`keepalive_host = "@dns"`, which auto-targets the VPN's own pushed DNS server — always
+routed and always up, so you don't have to name it.
 
 ## Recipes
 

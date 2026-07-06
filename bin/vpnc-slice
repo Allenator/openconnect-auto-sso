@@ -11,15 +11,20 @@
 # vars set; those pass through to vpn-slice unchanged via exec.
 set -eu
 
-# Optional one-shot diagnostic: dump every env var openconnect advertises (the
-# CISCO_*/INTERNAL_IP4_* the server pushed) on the connect pass. Enabled by the
-# connect script when $OC_DUMP is set.
-if [ "${1:-}" = "--dump-env" ]; then
-    _dump="$2"; shift 2
-    case "${reason:-}" in
-        connect|reconnect) env | sort > "$_dump" 2>/dev/null || true ;;
+# Optional leading directives (consumed before the vpn-slice args); the connect
+# script uses them for diagnostics and keepalive auto-config. Both act only on the
+# connect pass, once openconnect has populated the CISCO_*/INTERNAL_IP4_* env.
+while :; do
+    case "${1:-}" in
+        --dump-env)   # dump the full server-advertised environment to a file
+            _f="$2"; shift 2
+            case "${reason:-}" in connect|reconnect) env | sort > "$_f" 2>/dev/null || true ;; esac ;;
+        --write-dns)  # write the VPN's first pushed DNS server to a file
+            _f="$2"; shift 2
+            case "${reason:-}" in connect|reconnect) printf '%s\n' "${INTERNAL_IP4_DNS%% *}" > "$_f" 2>/dev/null || true ;; esac ;;
+        *) break ;;
     esac
-fi
+done
 
 vpn_slice="$1"; spec="$2"; shift 2
 [ "$spec" = "-" ] && spec=""

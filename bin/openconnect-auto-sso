@@ -52,6 +52,7 @@ ALLOW_INCOMING="${ALLOW_INCOMING:-0}"
 VPN_DOMAINS="${VPN_DOMAINS:-}"          # split-DNS: domains resolved via the VPN's DNS
 ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (server-pushed)
 ROUTE_SPLITS="${ROUTE_SPLITS:-0}"       # also add the server's split-include subnets
+KA_DNS_FILE="${TMPDIR:-/tmp}/openconnect-auto-sso.dns.$$"   # keepalive @dns target
 
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
@@ -135,7 +136,8 @@ if [ -n "$SPLIT_ROUTES$VPN_DOMAINS" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUT
     # Route through the vpnc-slice wrapper so split-DNS domains (incl. the @server
     # token) can be pulled from the VPN's pushed CISCO_SPLIT_DNS/CISCO_DEF_DOMAIN.
     vs="$PROJ/bin/vpnc-slice"
-    [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env $OC_DUMP"   # diagnostic env dump
+    [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env $OC_DUMP"          # diagnostic env dump
+    [ "$KEEPALIVE_HOST" = "@dns" ] && vs="$vs --write-dns $KA_DNS_FILE"  # keepalive target
     vs="$vs $VPN_SLICE ${VPN_DOMAINS:--}"
     # ALLOW_INCOMING=1 drops vpn-slice's pf firewall (keeps iCloud Private Relay working).
     [ "$ALLOW_INCOMING" = "1" ] && vs="$vs -i"
@@ -150,13 +152,23 @@ fi
 # VPN periodically so a little traffic keeps flowing. The subshell watches the
 # script's PID and stops when we exit (belt-and-suspenders with the EXIT trap).
 if [ -n "$KEEPALIVE_HOST" ]; then
+    if [ "$KEEPALIVE_HOST" = "@dns" ]; then
+        rm -f "$KA_DNS_FILE"   # the wrapper writes the VPN's pushed DNS server here
+        echo ">> keepalive: ping the VPN's DNS server every ${KEEPALIVE_INTERVAL}s" >&2
+    else
+        echo ">> keepalive: ping $KEEPALIVE_HOST every ${KEEPALIVE_INTERVAL}s" >&2
+    fi
     ( while kill -0 "$$" 2>/dev/null; do
-          ping -c 1 -t 5 "$KEEPALIVE_HOST" >/dev/null 2>&1 || true
+          if [ "$KEEPALIVE_HOST" = "@dns" ]; then
+              host=$(cat "$KA_DNS_FILE" 2>/dev/null || true)
+          else
+              host="$KEEPALIVE_HOST"
+          fi
+          [ -n "$host" ] && ping -c 1 -t 5 "$host" >/dev/null 2>&1 || true
           sleep "$KEEPALIVE_INTERVAL"
       done ) &
     KA_PID=$!
-    trap 'kill "$KA_PID" 2>/dev/null || true' EXIT
-    echo ">> keepalive: ping $KEEPALIVE_HOST every ${KEEPALIVE_INTERVAL}s" >&2
+    trap 'kill "$KA_PID" 2>/dev/null || true; rm -f "$KA_DNS_FILE" 2>/dev/null || true' EXIT
 fi
 
 echo ">> connecting tunnel (sudo)" >&2

@@ -30,8 +30,9 @@ route_splits   = false   # also route the server's split-include subnets, if any
 # VPN being able to reach open ports on your machine.
 allow_incoming = false
 
-# Keepalive: ping a host reachable INSIDE the VPN so an idle tunnel isn't
-# dropped by the server. "" = off. Must be within split_routes (or full tunnel).
+# Keepalive: ping a host reachable INSIDE the VPN so an idle tunnel isn't dropped.
+# "" = off. Use "@dns" to auto-target the VPN's own DNS server (recommended -- it's
+# pushed by the connection, always routed, and always up), or a specific in-VPN host.
 keepalive_host = ""
 keepalive_interval = 30
 
