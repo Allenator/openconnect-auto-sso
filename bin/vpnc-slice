@@ -11,6 +11,16 @@
 # vars set; those pass through to vpn-slice unchanged via exec.
 set -eu
 
+# Optional one-shot diagnostic: dump every env var openconnect advertises (the
+# CISCO_*/INTERNAL_IP4_* the server pushed) on the connect pass. Enabled by the
+# connect script when $OC_DUMP is set.
+if [ "${1:-}" = "--dump-env" ]; then
+    _dump="$2"; shift 2
+    case "${reason:-}" in
+        connect|reconnect) env | sort > "$_dump" 2>/dev/null || true ;;
+    esac
+fi
+
 vpn_slice="$1"; spec="$2"; shift 2
 [ "$spec" = "-" ] && spec=""
 

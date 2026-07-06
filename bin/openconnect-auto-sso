@@ -134,7 +134,9 @@ if [ -n "$SPLIT_ROUTES$VPN_DOMAINS" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUT
     [ -n "$VPN_SLICE" ] || { echo "error: split/DNS options set but vpn-slice not found" >&2; exit 1; }
     # Route through the vpnc-slice wrapper so split-DNS domains (incl. the @server
     # token) can be pulled from the VPN's pushed CISCO_SPLIT_DNS/CISCO_DEF_DOMAIN.
-    vs="$PROJ/bin/vpnc-slice $VPN_SLICE ${VPN_DOMAINS:--}"
+    vs="$PROJ/bin/vpnc-slice"
+    [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env $OC_DUMP"   # diagnostic env dump
+    vs="$vs $VPN_SLICE ${VPN_DOMAINS:--}"
     # ALLOW_INCOMING=1 drops vpn-slice's pf firewall (keeps iCloud Private Relay working).
     [ "$ALLOW_INCOMING" = "1" ] && vs="$vs -i"
     # Dynamic routes pushed by the VPN (no need to hardcode them):
