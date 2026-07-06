@@ -1,0 +1,42 @@
+#!/bin/sh
+# vpnc-script wrapper for openconnect + vpn-slice.
+#
+# Expands the split-DNS domain spec (the token @server pulls the server-pushed
+# CISCO_SPLIT_DNS / CISCO_DEF_DOMAIN, which openconnect sets in our environment)
+# and hands off to vpn-slice with --domains-vpn-dns filled in dynamically.
+#
+#   usage: vpnc-slice <vpn-slice-path> <domain-spec|-> [vpn-slice args...]
+#
+# openconnect invokes this with reason=... and the CISCO_*/INTERNAL_IP4_* env
+# vars set; those pass through to vpn-slice unchanged via exec.
+set -eu
+
+vpn_slice="$1"; spec="$2"; shift 2
+[ "$spec" = "-" ] && spec=""
+
+# comma-separated spec -> space-separated words, expanding @server from the env
+raw=""
+for d in $(printf '%s' "$spec" | tr ',' ' '); do
+    if [ "$d" = "@server" ]; then
+        echo ">> server domains: split-dns='${CISCO_SPLIT_DNS:-}' def-domain='${CISCO_DEF_DOMAIN:-}'" >&2
+        raw="$raw $(printf '%s' "${CISCO_SPLIT_DNS:-${CISCO_DEF_DOMAIN:-}}" | tr ',' ' ')"
+    else
+        raw="$raw $d"
+    fi
+done
+
+# de-duplicate into a comma-separated list
+domains=""
+for d in $raw; do
+    case ",$domains," in
+        *",$d,"*) ;;
+        *) domains="${domains:+$domains,}$d" ;;
+    esac
+done
+
+if [ -n "$domains" ]; then
+    echo ">> split-DNS via VPN for: $domains" >&2
+    exec "$vpn_slice" --domains-vpn-dns "$domains" "$@"
+else
+    exec "$vpn_slice" "$@"
+fi

@@ -16,8 +16,10 @@ split_routes = []
 
 # Split DNS: resolve these domains via the VPN's DNS servers (pulled dynamically
 # from the connection), like Tailscale MagicDNS for *.ts.net. Empty = off.
+# The special token "@server" also scopes whatever domains the VPN advertises
+# (its CISCO_SPLIT_DNS / default domain) -- so you needn't name them yourself.
 vpn_domains = []
-# example: vpn_domains = ["example.com"]
+# examples: vpn_domains = ["example.com"]   or   vpn_domains = ["@server"]
 
 # Consume routes the VPN pushes instead of hardcoding them:
 route_internal = false   # also route the VPN's own subnet

@@ -63,7 +63,7 @@ override with `$OC_AUTO_SSO_CONFIG`, or drop a `config.toml` in the repo for dev
 | `server` | string | VPN server hostname or URL. **Required.** |
 | `protocol` | string | openconnect protocol; `""` auto-detects (e.g. `"anyconnect"`, `"gp"`). |
 | `split_routes` | list | Subnets/hosts routed through the VPN; a `%CIDR` entry excludes one. `[]` = full tunnel. |
-| `vpn_domains` | list | Domains resolved via the VPN's DNS (split DNS, à la Tailscale MagicDNS); resolvers pulled from the connection. |
+| `vpn_domains` | list | Domains resolved via the VPN's DNS (split DNS, à la Tailscale MagicDNS); resolvers pulled from the connection. The token `"@server"` also scopes whatever domains the VPN advertises (`CISCO_SPLIT_DNS`/default domain). |
 | `route_internal` | bool | Also route the VPN's own subnet, server-pushed (`vpn-slice -I`). |
 | `route_splits` | bool | Also route the server's split-include subnets, if any (`vpn-slice -S`). |
 | `allow_incoming` | bool | `true` allows incoming from the VPN (no pf firewall) so iCloud Private Relay keeps working. |

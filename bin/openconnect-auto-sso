@@ -132,14 +132,15 @@ if [ -n "$SPLIT_ROUTES$VPN_DOMAINS" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUT
     # root's PATH usually excludes Homebrew, so resolve vpn-slice to an abs path.
     VPN_SLICE=$(command -v vpn-slice || true)
     [ -n "$VPN_SLICE" ] || { echo "error: split/DNS options set but vpn-slice not found" >&2; exit 1; }
-    vs="$VPN_SLICE"
+    # Route through the vpnc-slice wrapper so split-DNS domains (incl. the @server
+    # token) can be pulled from the VPN's pushed CISCO_SPLIT_DNS/CISCO_DEF_DOMAIN.
+    vs="$PROJ/bin/vpnc-slice $VPN_SLICE ${VPN_DOMAINS:--}"
     # ALLOW_INCOMING=1 drops vpn-slice's pf firewall (keeps iCloud Private Relay working).
     [ "$ALLOW_INCOMING" = "1" ] && vs="$vs -i"
-    # Dynamic routes/DNS pushed by the VPN (no need to hardcode them):
-    [ "$ROUTE_INTERNAL" = "1" ] && vs="$vs -I"                         # VPN's own subnet
-    [ "$ROUTE_SPLITS" = "1" ] && vs="$vs -S"                           # server split-includes
-    [ -n "$VPN_DOMAINS" ] && vs="$vs --domains-vpn-dns $VPN_DOMAINS"   # split DNS
-    [ -n "$SPLIT_ROUTES" ] && vs="$vs $SPLIT_ROUTES"                   # your explicit subnets
+    # Dynamic routes pushed by the VPN (no need to hardcode them):
+    [ "$ROUTE_INTERNAL" = "1" ] && vs="$vs -I"        # VPN's own subnet
+    [ "$ROUTE_SPLITS" = "1" ] && vs="$vs -S"          # server split-includes
+    [ -n "$SPLIT_ROUTES" ] && vs="$vs $SPLIT_ROUTES"  # your explicit subnets
     set -- "$@" -s "$vs"
 fi
 
