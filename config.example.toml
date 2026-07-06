@@ -1,0 +1,38 @@
+# openconnect-auto-sso configuration (TOML).
+# Copy to ~/.config/openconnect-auto-sso/config.toml and edit it there
+# (kept outside the repo). An in-repo config.toml also works for development.
+
+# VPN server: hostname or full URL. Required.
+server = "vpn.example.com"
+
+# openconnect protocol; "" (or omit) auto-detects. e.g. "anyconnect", "gp".
+protocol = ""
+
+# Split tunnel: only these subnets/hosts go through the VPN; prefix a CIDR with
+# % to EXCLUDE it. Empty list = full tunnel. vpn-slice also accepts hostnames.
+split_routes = []
+# example:
+# split_routes = ["10.0.0.0/8", "vpn-host.example.com", "%100.64.0.0/10"]
+
+# Split DNS: resolve these domains via the VPN's DNS servers (pulled dynamically
+# from the connection), like Tailscale MagicDNS for *.ts.net. Empty = off.
+vpn_domains = []
+# example: vpn_domains = ["example.com"]
+
+# Consume routes the VPN pushes instead of hardcoding them:
+route_internal = false   # also route the VPN's own subnet
+route_splits   = false   # also route the server's split-include subnets, if any
+
+# Allow incoming connections from the VPN (vpn-slice -i). true installs no pf
+# firewall, so iCloud Private Relay keeps working -- at the cost of hosts on the
+# VPN being able to reach open ports on your machine.
+allow_incoming = false
+
+# Keepalive: ping a host reachable INSIDE the VPN so an idle tunnel isn't
+# dropped by the server. "" = off. Must be within split_routes (or full tunnel).
+keepalive_host = ""
+keepalive_interval = 30
+
+# Advanced (usually leave default):
+# profile_name = "openconnect-auto-sso"   # Qt persistent-profile storage key
+# callback = "localhost:29786"            # openconnect external-browser callback

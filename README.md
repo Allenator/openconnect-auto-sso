@@ -10,7 +10,7 @@ Connect to browser-SSO (SAML) VPNs with
 - optional **split-tunnel** routing via [`vpn-slice`](https://github.com/dlenski/vpn-slice).
 
 Everything site-specific (server, protocol, routes) lives in a config file outside the
-repo (`~/.config/openconnect-auto-sso/config.sh`) — nothing about any organization or
+repo (`~/.config/openconnect-auto-sso/config.toml`) — nothing about any organization or
 identity provider is hardcoded.
 
 ## How it works
@@ -47,30 +47,30 @@ instant the flow reaches openconnect's `localhost:29786` loopback callback. It s
 git clone <this-repo> && cd openconnect-auto-sso
 uv sync             # fetch the PyQt6 helper's dependencies
 ./install.sh        # symlink commands into ~/.local/bin AND seed the config
-# then edit ~/.config/openconnect-auto-sso/config.sh (SERVER, etc.)
+# then edit ~/.config/openconnect-auto-sso/config.toml (SERVER, etc.)
 ```
 
 Without `install.sh`, run it in place with `./bin/openconnect-auto-sso`.
 
 ## Configuration
 
-Config lives at `~/.config/openconnect-auto-sso/config.sh` (outside the repo; override
-with `$OC_AUTO_SSO_CONFIG`, or drop a `config.sh` in the repo for dev). It is sourced by
-the connect script:
+Config is a TOML file at `~/.config/openconnect-auto-sso/config.toml` (outside the repo;
+override with `$OC_AUTO_SSO_CONFIG`, or drop a `config.toml` in the repo for dev). It is
+**parsed** (validated and quoted) — never sourced — so a config file can't execute code.
 
-| Variable       | Meaning                                                                 |
-|----------------|-------------------------------------------------------------------------|
-| `SERVER`       | VPN server hostname or URL. **Required.**                               |
-| `PROTOCOL`     | openconnect protocol; blank = auto-detect (e.g. `anyconnect`, `gp`).    |
-| `SPLIT_ROUTES` | `vpn-slice` args; blank = full tunnel. `%CIDR` excludes a subnet.       |
-| `PROFILE_NAME` | Persistent browser-profile storage key. Usually leave as-is.            |
-| `CALLBACK`     | openconnect's external-browser callback `host:port`. Rarely changed.    |
-| `KEEPALIVE_HOST` | Optional. Host to ping through the tunnel to avoid idle-disconnects; must be reachable inside the VPN. Blank = off. |
-| `KEEPALIVE_INTERVAL` | Seconds between keepalive pings (default 30).                     |
-| `ALLOW_INCOMING` | `1` passes `vpn-slice -i` (allow incoming from VPN, no pf firewall). Lets iCloud Private Relay keep working; default `0` blocks incoming. |
-| `VPN_DOMAINS` | Comma-separated domains resolved via the VPN's DNS (split DNS, à la Tailscale MagicDNS). Resolvers are pulled from the connection. Blank = off. |
-| `ROUTE_INTERNAL` | `1` also routes the VPN's own subnet (server-pushed, `vpn-slice -I`). |
-| `ROUTE_SPLITS` | `1` also routes the server's split-include subnets, if any (`vpn-slice -S`). |
+| Key | Type | Meaning |
+|-----|------|---------|
+| `server` | string | VPN server hostname or URL. **Required.** |
+| `protocol` | string | openconnect protocol; `""` auto-detects (e.g. `"anyconnect"`, `"gp"`). |
+| `split_routes` | list | Subnets/hosts routed through the VPN; a `%CIDR` entry excludes one. `[]` = full tunnel. |
+| `vpn_domains` | list | Domains resolved via the VPN's DNS (split DNS, à la Tailscale MagicDNS); resolvers pulled from the connection. |
+| `route_internal` | bool | Also route the VPN's own subnet, server-pushed (`vpn-slice -I`). |
+| `route_splits` | bool | Also route the server's split-include subnets, if any (`vpn-slice -S`). |
+| `allow_incoming` | bool | `true` allows incoming from the VPN (no pf firewall) so iCloud Private Relay keeps working. |
+| `keepalive_host` | string | Host to ping through the tunnel to avoid idle-disconnects; must be reachable inside the VPN. `""` = off. |
+| `keepalive_interval` | int | Seconds between keepalive pings (default 30). |
+| `profile_name` | string | Qt persistent-profile storage key. Usually leave default. |
+| `callback` | string | openconnect external-browser callback `host:port`. Rarely changed. |
 
 ## Usage
 
@@ -87,13 +87,13 @@ Press `Ctrl-C` to disconnect.
 
 ## Split tunneling
 
-Set `SPLIT_ROUTES` to the hosts/subnets that should go through the VPN; everything else
+Set `split_routes` to the hosts/subnets that should go through the VPN; everything else
 stays on your normal connection. Examples:
 
-```sh
-SPLIT_ROUTES="10.0.0.0/8"                        # one subnet via the VPN
-SPLIT_ROUTES="10.0.0.0/8 wiki.corp.example.com"  # a subnet and a host
-SPLIT_ROUTES="10.0.0.0/8 %100.64.0.0/10"         # …but exclude a range
+```toml
+split_routes = ["10.0.0.0/8"]                          # one subnet via the VPN
+split_routes = ["10.0.0.0/8", "wiki.corp.example.com"] # a subnet and a host
+split_routes = ["10.0.0.0/8", "%100.64.0.0/10"]        # …but exclude a range
 ```
 
 The connect script resolves `vpn-slice` to an absolute path, since `sudo` (Phase 2)
@@ -103,19 +103,19 @@ usually doesn't have Homebrew on its `PATH`.
 
 Many VPN servers disconnect a tunnel that carries no traffic (openconnect reports
 `Received server disconnect: ... 'Idle Timeout'`). In split-tunnel mode that happens
-easily, since only your routed subnets generate traffic. Set `KEEPALIVE_HOST` to a host
-that is reachable **inside** the VPN — i.e. one covered by `SPLIT_ROUTES` (or anything, in
-full-tunnel mode) — and the connect script pings it every `KEEPALIVE_INTERVAL` seconds
+easily, since only your routed subnets generate traffic. Set `keepalive_host` to a host
+that is reachable **inside** the VPN — i.e. one covered by `split_routes` (or anything, in
+full-tunnel mode) — and the connect script pings it every `keepalive_interval` seconds
 while connected, stopping automatically on disconnect. An internal DNS server is a good,
-stable choice; just make sure its subnet is in `SPLIT_ROUTES` so the ping goes through the
+stable choice; just make sure its subnet is in `split_routes` so the ping goes through the
 tunnel.
 
 ## Recipes
 
 **Coexist with Tailscale.** Keep Tailscale's CGNAT range off the VPN by excluding it:
 
-```sh
-SPLIT_ROUTES="<your-vpn-subnets> %100.64.0.0/10"
+```toml
+split_routes = ["<your-vpn-subnets>", "%100.64.0.0/10"]
 ```
 
 With a split tunnel the VPN only claims your corporate routes, so Tailscale's default
@@ -124,7 +124,7 @@ route and `100.64.0.0/10` are untouched.
 **Keep iCloud Private Relay working.** macOS disables Private Relay when it sees a
 default-route rule, a DNS takeover, *or* a packet-filter change. A route-only split
 tunnel avoids the first two, but `vpn-slice`'s default "block incoming" firewall adds a
-pf anchor that trips the third. Set `ALLOW_INCOMING=1` (passes `vpn-slice -i`) to drop
+pf anchor that trips the third. Set `allow_incoming = true` (passes `vpn-slice -i`) to drop
 that firewall so Private Relay stays on — weigh it against letting VPN hosts reach open
 ports on your machine.
 
@@ -132,7 +132,7 @@ That firewall can also *leak*: `vpn-slice` appends its anchor to `/etc/pf.conf` 
 sometimes fails to remove it on teardown, leaving the anchor loaded on every boot — which
 keeps Private Relay disabled even with no VPN connected. `openconnect-auto-sso` **warns at
 startup** if it finds such a leftover and offers to clean it (strip the line and reload
-pf). `ALLOW_INCOMING=1` avoids creating it in the first place.
+pf). `allow_incoming = true` avoids creating it in the first place.
 
 **Skip the sudo prompt.** Add a scoped `sudoers` rule (via `sudo visudo`) so only
 `openconnect` can run without a password:

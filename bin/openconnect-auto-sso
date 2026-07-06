@@ -5,7 +5,7 @@
 #                       -> prints COOKIE / CONNECT_URL / FINGERPRINT / RESOLVE
 #   Phase 2 (sudo):     openconnect --cookie-on-stdin ...  (no browser)
 #
-# All site-specifics come from config.sh (see config.example.sh).
+# All site-specifics come from a TOML config (see config.example.toml).
 set -eu
 
 # --- locate the project (works when symlinked into ~/.local/bin) -------------
@@ -19,26 +19,29 @@ PROJ=$(cd "$(dirname "$src")/.." && pwd)
 
 # --- load configuration ------------------------------------------------------
 # Precedence: $OC_AUTO_SSO_CONFIG, then the standard external location
-# ~/.config/openconnect-auto-sso/config.sh, then an in-repo config.sh (dev only).
-XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/openconnect-auto-sso/config.sh"
+# ~/.config/openconnect-auto-sso/config.toml, then an in-repo config.toml (dev only).
+XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/openconnect-auto-sso/config.toml"
 if [ -n "${OC_AUTO_SSO_CONFIG:-}" ]; then
     CONFIG="$OC_AUTO_SSO_CONFIG"
 elif [ -f "$XDG_CONFIG" ]; then
     CONFIG="$XDG_CONFIG"
-elif [ -f "$PROJ/config.sh" ]; then
-    CONFIG="$PROJ/config.sh"
+elif [ -f "$PROJ/config.toml" ]; then
+    CONFIG="$PROJ/config.toml"
 else
     CONFIG="$XDG_CONFIG"
 fi
 if [ ! -f "$CONFIG" ]; then
     echo "error: no config found (expected $XDG_CONFIG)" >&2
-    echo "       mkdir -p \"$(dirname "$XDG_CONFIG")\" && cp \"$PROJ/config.example.sh\" \"$XDG_CONFIG\"   # then edit SERVER" >&2
+    echo "       mkdir -p \"$(dirname "$XDG_CONFIG")\" && cp \"$PROJ/config.example.toml\" \"$XDG_CONFIG\"   # then edit server" >&2
     exit 1
 fi
-# shellcheck disable=SC1090
-. "$CONFIG"
+# Parse the TOML config into shell variables. The parser validates and shell-quotes
+# each value; the config is never sourced, so it cannot execute code or inject shell.
+PY="$PROJ/.venv/bin/python"; [ -x "$PY" ] || PY=python3
+_conf=$("$PY" "$PROJ/src/loadconfig.py" "$CONFIG") || exit 1
+eval "$_conf"
 
-: "${SERVER:?SERVER must be set in config.sh}"
+: "${SERVER:?server is required in the config}"
 PROTOCOL="${PROTOCOL:-}"
 SPLIT_ROUTES="${SPLIT_ROUTES:-}"
 PROFILE_NAME="${PROFILE_NAME:-openconnect-auto-sso}"

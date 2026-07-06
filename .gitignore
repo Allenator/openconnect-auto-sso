@@ -1,5 +1,5 @@
 # local, per-user configuration (never commit real servers/routes)
-config.sh
+config.toml
 
 # uv / Python
 .venv/

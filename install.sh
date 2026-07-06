@@ -13,13 +13,13 @@ for cmd in openconnect-auto-sso vpn-browser; do
 done
 
 # Seed the config in the standard external location if it's not there yet.
-conf="${XDG_CONFIG_HOME:-$HOME/.config}/openconnect-auto-sso/config.sh"
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/openconnect-auto-sso/config.toml"
 if [ -f "$conf" ]; then
     echo "config exists at $conf"
 else
     mkdir -p "$(dirname "$conf")"
-    cp "$proj/config.example.sh" "$conf"
-    echo "created $conf -- edit SERVER (and other settings) before connecting"
+    cp "$proj/config.example.toml" "$conf"
+    echo "created $conf -- edit server (and other settings) before connecting"
 fi
 
 case ":$PATH:" in
