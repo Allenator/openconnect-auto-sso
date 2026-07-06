@@ -12,6 +12,16 @@ for cmd in openconnect-auto-sso vpn-browser; do
     echo "linked $bindir/$cmd -> $proj/bin/$cmd"
 done
 
+# Seed the config in the standard external location if it's not there yet.
+conf="${XDG_CONFIG_HOME:-$HOME/.config}/openconnect-auto-sso/config.sh"
+if [ -f "$conf" ]; then
+    echo "config exists at $conf"
+else
+    mkdir -p "$(dirname "$conf")"
+    cp "$proj/config.example.sh" "$conf"
+    echo "created $conf -- edit SERVER (and other settings) before connecting"
+fi
+
 case ":$PATH:" in
     *":$bindir:"*) ;;
     *) echo "note: $bindir is not on your PATH — add it to use the commands by name" >&2 ;;

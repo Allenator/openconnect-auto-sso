@@ -1,6 +1,7 @@
 # openconnect-auto-sso configuration.
-# Copy this file to config.sh and edit. config.sh is gitignored — keep your
-# real server and routes out of version control.
+# Copy this file to ~/.config/openconnect-auto-sso/config.sh and edit it there
+# (kept outside the repo so your real server/routes never touch version control).
+# An in-repo config.sh still works as a fallback for development.
 
 # VPN server: hostname or full URL. Required.
 SERVER="vpn.example.com"

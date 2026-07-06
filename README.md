@@ -9,8 +9,9 @@ Connect to browser-SSO (SAML) VPNs with
   connect is silent;
 - optional **split-tunnel** routing via [`vpn-slice`](https://github.com/dlenski/vpn-slice).
 
-Everything site-specific (server, protocol, routes) lives in a gitignored `config.sh` —
-nothing about any organization or identity provider is hardcoded.
+Everything site-specific (server, protocol, routes) lives in a config file outside the
+repo (`~/.config/openconnect-auto-sso/config.sh`) — nothing about any organization or
+identity provider is hardcoded.
 
 ## How it works
 
@@ -44,16 +45,18 @@ instant the flow reaches openconnect's `localhost:29786` loopback callback. It s
 
 ```sh
 git clone <this-repo> && cd openconnect-auto-sso
-uv sync                         # fetch the PyQt6 helper's dependencies
-cp config.example.sh config.sh  # then edit SERVER (see below)
-./install.sh                    # optional: symlink commands into ~/.local/bin
+uv sync             # fetch the PyQt6 helper's dependencies
+./install.sh        # symlink commands into ~/.local/bin AND seed the config
+# then edit ~/.config/openconnect-auto-sso/config.sh (SERVER, etc.)
 ```
 
 Without `install.sh`, run it in place with `./bin/openconnect-auto-sso`.
 
 ## Configuration
 
-`config.sh` (gitignored) is sourced by the connect script:
+Config lives at `~/.config/openconnect-auto-sso/config.sh` (outside the repo; override
+with `$OC_AUTO_SSO_CONFIG`, or drop a `config.sh` in the repo for dev). It is sourced by
+the connect script:
 
 | Variable       | Meaning                                                                 |
 |----------------|-------------------------------------------------------------------------|
