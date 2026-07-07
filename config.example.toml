@@ -8,22 +8,32 @@ server = "vpn.example.com"
 # openconnect protocol; "" (or omit) auto-detects. e.g. "anyconnect", "gp".
 protocol = ""
 
-# Split tunnel: only these subnets/hosts go through the VPN; prefix a CIDR with
-# % to EXCLUDE it. Empty list = full tunnel. vpn-slice also accepts hostnames.
-split_routes = []
+# What goes through the VPN. One list; each entry's shape decides how it's handled:
+#
+#   "name.example.com"   a DNS name -> resolve it via the VPN's DNS AND route every
+#                        IP it answers with through the tunnel (a macOS
+#                        /etc/resolver suffix match, so it covers that host and all
+#                        its subdomains: "example.com" covers *.example.com).
+#   "10.0.0.0/8"         an IP or CIDR -> a static route through the VPN.
+#   "%100.64.0.0/10"     a %CIDR -> EXCLUDE that range from the VPN.
+#   "@server"            proxy whatever split-DNS domains the server advertises
+#                        (its CISCO_SPLIT_DNS / default domain) -- you needn't name
+#                        them yourself.
+#   "@internal"          also route the VPN's own pool subnet (server-pushed).
+#   "@splits"            also route the server's split-include subnets, if any.
+#
+# Empty list = full tunnel (everything via the VPN, no proxy).
+via_vpn = []
 # example:
-# split_routes = ["10.0.0.0/8", "vpn-host.example.com", "%100.64.0.0/10"]
+# via_vpn = ["example.com", "10.0.0.0/8", "%100.64.0.0/10", "@internal"]
+#
+# Caveat (DNS-driven routing): a route is injected only when a name is looked up
+# through the SYSTEM resolver. An app doing its own DoH/DoT (e.g. a browser's
+# "Secure DNS") bypasses /etc/resolver, so no route is added for it -- for those,
+# put the destination's CIDR in via_vpn instead of (or in addition to) its name.
 
-# Split DNS: resolve these domains via the VPN's DNS servers (pulled dynamically
-# from the connection), like Tailscale MagicDNS for *.ts.net. Empty = off.
-# The special token "@server" also scopes whatever domains the VPN advertises
-# (its CISCO_SPLIT_DNS / default domain) -- so you needn't name them yourself.
-vpn_domains = []
-# examples: vpn_domains = ["example.com"]   or   vpn_domains = ["@server"]
-
-# Consume routes the VPN pushes instead of hardcoding them:
-route_internal = false   # also route the VPN's own subnet
-route_splits   = false   # also route the server's split-include subnets, if any
+# Loopback UDP/TCP port for the DNS-routing proxy (only used when a name is listed).
+proxy_port = 45353
 
 # Allow incoming connections from the VPN (vpn-slice -i). true installs no pf
 # firewall, so iCloud Private Relay keeps working -- at the cost of hosts on the

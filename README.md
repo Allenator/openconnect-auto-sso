@@ -7,7 +7,8 @@ Connect to browser-SSO (SAML) VPNs with
 - your identity-provider login is **remembered** between connects;
 - a browser window appears **only when you actually need to log in** — otherwise the
   connect is silent;
-- optional **split-tunnel** routing via [`vpn-slice`](https://github.com/dlenski/vpn-slice).
+- optional **split-tunnel** routing — by subnet *or* by DNS name (a name's traffic is
+  routed to wherever it resolves) — via [`vpn-slice`](https://github.com/dlenski/vpn-slice).
 
 Everything site-specific (server, protocol, routes) lives in a config file outside the
 repo (`~/.config/openconnect-auto-sso/config.toml`) — nothing about any organization or
@@ -62,10 +63,8 @@ override with `$OC_AUTO_SSO_CONFIG`, or drop a `config.toml` in the repo for dev
 |-----|------|---------|
 | `server` | string | VPN server hostname or URL. **Required.** |
 | `protocol` | string | openconnect protocol; `""` auto-detects (e.g. `"anyconnect"`, `"gp"`). |
-| `split_routes` | list | Subnets/hosts routed through the VPN; a `%CIDR` entry excludes one. `[]` = full tunnel. |
-| `vpn_domains` | list | Domains resolved via the VPN's DNS (split DNS, à la Tailscale MagicDNS); resolvers pulled from the connection. The token `"@server"` also scopes whatever domains the VPN advertises (`CISCO_SPLIT_DNS`/default domain). |
-| `route_internal` | bool | Also route the VPN's own subnet, server-pushed (`vpn-slice -I`). |
-| `route_splits` | bool | Also route the server's split-include subnets, if any (`vpn-slice -S`). |
+| `via_vpn` | list | Everything that should go through the VPN, in one list; each entry's shape decides how it's handled (see below). `[]` = full tunnel. |
+| `proxy_port` | int | Loopback port for the DNS-routing proxy (default `45353`); only used when `via_vpn` contains a name. |
 | `allow_incoming` | bool | `true` allows incoming from the VPN (no pf firewall) so iCloud Private Relay keeps working. |
 | `keepalive_host` | string | Host to ping through the tunnel to avoid idle-disconnects. `"@dns"` auto-targets the VPN's own pushed DNS server (recommended); or a specific in-VPN host. `""` = off. |
 | `keepalive_interval` | int | Seconds between keepalive pings (default 30). |
@@ -87,14 +86,43 @@ Press `Ctrl-C` to disconnect.
 
 ## Split tunneling
 
-Set `split_routes` to the hosts/subnets that should go through the VPN; everything else
-stays on your normal connection. Examples:
+`via_vpn` is the single list of everything that should go through the VPN; everything
+else stays on your normal connection. Each entry's **shape** decides how it's handled:
+
+| Entry | Example | What it does |
+|-------|---------|--------------|
+| DNS name (bare) | `example.com`, `host.corp.example.com` | Resolve it via the VPN's DNS **and** route every IP it answers with through the tunnel. A macOS `/etc/resolver` **suffix** match — `example.com` covers `example.com` *and* all its subdomains; a full host covers just that host. |
+| IP or CIDR | `10.0.0.0/8`, `10.1.2.3` | A static route through the VPN. |
+| `%CIDR` | `%100.64.0.0/10` | **Exclude** that range from the VPN. |
+| `@server` | | Proxy whatever split-DNS domains the server advertises (`CISCO_SPLIT_DNS` / default domain) — so you needn't name them. |
+| `@internal` | | Also route the VPN's own pool subnet, server-pushed (`vpn-slice -I`). |
+| `@splits` | | Also route the server's split-include subnets, if any (`vpn-slice -S`). |
 
 ```toml
-split_routes = ["10.0.0.0/8"]                          # one subnet via the VPN
-split_routes = ["10.0.0.0/8", "wiki.corp.example.com"] # a subnet and a host
-split_routes = ["10.0.0.0/8", "%100.64.0.0/10"]        # …but exclude a range
+via_vpn = ["10.0.0.0/8"]                               # one subnet via the VPN
+via_vpn = ["10.0.0.0/8", "wiki.corp.example.com"]      # a subnet and a host-by-name
+via_vpn = ["corp.example.com", "%100.64.0.0/10"]       # a whole domain, minus a range
+via_vpn = ["@server", "@internal"]                     # whatever the server advertises
 ```
+
+An empty list (`via_vpn = []`) is a **full tunnel** — everything goes through the VPN and
+no proxy or `/etc/resolver` files are created.
+
+### How name-based routing works
+
+Naming a host or domain does two things at once: its DNS *and* its traffic go through the
+VPN. On connect, each name gets a macOS `/etc/resolver/<name>` file pointing at a small
+loopback DNS proxy (`src/dnsroute.py`, started as root by the wrapper). The proxy forwards
+those lookups to the VPN's own DNS servers and, for **every** IP each answer returns, adds
+a host route out the tunnel device. So a load-balanced or rotating host gets a route for
+whatever IP it actually resolves to — you don't have to know or hardcode its addresses. On
+disconnect the proxy is stopped and the resolver files are removed; the injected routes
+vanish with the tunnel interface.
+
+> **Resolver-bypass caveat.** A route is injected only for lookups that go through the
+> **system resolver**. An app that does its own DoH/DoT — e.g. a browser with "Secure DNS"
+> on — bypasses `/etc/resolver`, so no route is added for names it resolves itself. For
+> those destinations, put a **CIDR** in `via_vpn` (a static route needs no DNS).
 
 The connect script resolves `vpn-slice` to an absolute path, since `sudo` (Phase 2)
 usually doesn't have Homebrew on its `PATH`.
@@ -104,7 +132,7 @@ usually doesn't have Homebrew on its `PATH`.
 Many VPN servers disconnect a tunnel that carries no traffic (openconnect reports
 `Received server disconnect: ... 'Idle Timeout'`). In split-tunnel mode that happens
 easily, since only your routed subnets generate traffic. Set `keepalive_host` to a host
-that is reachable **inside** the VPN — i.e. one covered by `split_routes` (or anything, in
+that is reachable **inside** the VPN — i.e. one covered by `via_vpn` (or anything, in
 full-tunnel mode) — and the connect script pings it every `keepalive_interval` seconds
 while connected, stopping automatically on disconnect. The easiest choice is
 `keepalive_host = "@dns"`, which auto-targets the VPN's own pushed DNS server — always
@@ -115,7 +143,7 @@ routed and always up, so you don't have to name it.
 **Coexist with Tailscale.** Keep Tailscale's CGNAT range off the VPN by excluding it:
 
 ```toml
-split_routes = ["<your-vpn-subnets>", "%100.64.0.0/10"]
+via_vpn = ["<your-vpn-subnets-or-names>", "%100.64.0.0/10"]
 ```
 
 With a split tunnel the VPN only claims your corporate routes, so Tailscale's default
