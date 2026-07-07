@@ -7,12 +7,16 @@ to the VPN's own DNS server(s) and, for every A/AAAA answer, adds a host route o
 the tunnel device -- so a name scoped to the VPN is not just resolved via the VPN
 but actually *reachable* over it, even when it load-balances across rotating IPs.
 
-    dnsroute.py --upstream "IP[,| IP]..." --dev TUNDEV --port P [--dry-run]
+    dnsroute.py --upstream "IP[,| IP]..." --dev TUNDEV --port P \
+                [--exclude "IP..."] [--dry-run]
 
 It is deliberately minimal and loopback-only: it binds 127.0.0.1:<port> (UDP and
 TCP), forwards the raw query bytes to the first responsive upstream (port 53),
 returns the response verbatim, and only *reads* the response to inject /32|/128
-interface routes -- never the default route. Injected interface routes vanish with
+interface routes -- never the default route, and never an --exclude'd IP (the
+wrapper passes the VPN gateway there: routing the tunnel's own transport peer
+through the tunnel would loop it). Routes are installed *before* the DNS answer
+is returned, so even the client's first packet takes the tunnel. Injected interface routes vanish with
 the utun, so there is no route teardown; a watchdog exits when the device is gone,
 and SIGTERM exits cleanly.
 """
@@ -35,6 +39,7 @@ import dns.rdatatype
 UPSTREAMS = []      # list of upstream DNS server IPs (tried in order)
 DEV = ""            # tunnel device to route answered IPs through (e.g. utun4)
 PORT = 0            # loopback port to listen on
+EXCLUDES = set()    # IPs never to route (the VPN gateway -- routing it would loop the tunnel)
 DRY_RUN = False     # log route commands instead of running them
 TIMEOUT = 3.0       # per-upstream forward timeout (seconds)
 WATCHDOG_INTERVAL = 15.0
@@ -104,6 +109,9 @@ def add_route(ip, inet6):
         if ip in _SEEN:
             return
         _SEEN.add(ip)
+    if ip in EXCLUDES:
+        log("not routing %s (excluded: the VPN gateway/transport)" % ip)
+        return
     if inet6:
         cmd = ["/sbin/route", "-n", "add", "-inet6", ip, "-interface", DEV]
     else:
@@ -151,11 +159,14 @@ class UDPHandler(socketserver.BaseRequestHandler):
         data, sock = self.request
         resp = forward_udp(data)
         if resp:
+            # Routes go in BEFORE the answer is returned, so the client's very
+            # first packet to a fresh IP already flows through the tunnel
+            # (answer-then-route would let it race out the default interface).
+            inject_routes(resp)
             try:
                 sock.sendto(resp, self.client_address)
             except OSError:
                 pass
-            inject_routes(resp)
 
 
 class TCPHandler(socketserver.BaseRequestHandler):
@@ -170,13 +181,14 @@ class TCPHandler(socketserver.BaseRequestHandler):
             return
         resp = forward_tcp(lp + query)
         if resp:
+            # Same ordering as UDP: route first, then answer.
+            if len(resp) >= 2:
+                (rlen,) = struct.unpack("!H", resp[:2])
+                inject_routes(resp[2:2 + rlen])
             try:
                 sock.sendall(resp)
             except OSError:
                 pass
-            if len(resp) >= 2:
-                (rlen,) = struct.unpack("!H", resp[:2])
-                inject_routes(resp[2:2 + rlen])
 
 
 # --- lifecycle ---------------------------------------------------------------
@@ -199,13 +211,16 @@ def _on_term(signum, frame):
 
 
 def main(argv):
-    global UPSTREAMS, DEV, PORT, DRY_RUN
+    global UPSTREAMS, DEV, PORT, DRY_RUN, EXCLUDES
     ap = argparse.ArgumentParser(description="loopback DNS proxy that routes answers via the VPN")
     ap.add_argument("--upstream", required=True,
                     help="VPN DNS server IP(s), separated by commas or whitespace "
                          "(the wrapper passes INTERNAL_IP4_DNS verbatim)")
     ap.add_argument("--dev", required=True, help="tunnel device (e.g. utun4)")
     ap.add_argument("--port", required=True, type=int, help="loopback port to listen on")
+    ap.add_argument("--exclude", default="",
+                    help="IP(s) never to route via the tunnel (the VPN gateway); "
+                         "comma/whitespace separated, may be empty")
     ap.add_argument("--dry-run", action="store_true",
                     help="log route commands instead of running them")
     args = ap.parse_args(argv[1:])
@@ -213,6 +228,7 @@ def main(argv):
     UPSTREAMS = [x for x in re.split(r"[,\s]+", args.upstream.strip()) if x]
     DEV = args.dev
     PORT = args.port
+    EXCLUDES = {x for x in re.split(r"[,\s]+", args.exclude.strip()) if x}
     DRY_RUN = args.dry_run
     if not UPSTREAMS:
         sys.stderr.write("dnsroute: no upstream given\n")
@@ -222,8 +238,10 @@ def main(argv):
 
     udp = _ThreadingUDPServer(("127.0.0.1", PORT), UDPHandler)
     tcp = _ThreadingTCPServer(("127.0.0.1", PORT), TCPHandler)
-    log("listening on 127.0.0.1:%d, upstream=%s, dev=%s%s"
-        % (PORT, ",".join(UPSTREAMS), DEV, " (dry-run)" if DRY_RUN else ""))
+    log("listening on 127.0.0.1:%d, upstream=%s, dev=%s%s%s"
+        % (PORT, ",".join(UPSTREAMS), DEV,
+           ", exclude=" + ",".join(sorted(EXCLUDES)) if EXCLUDES else "",
+           " (dry-run)" if DRY_RUN else ""))
 
     threading.Thread(target=udp.serve_forever, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
