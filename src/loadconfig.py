@@ -24,8 +24,8 @@ import sys
 
 try:
     import tomllib
-except ModuleNotFoundError:  # Python < 3.11
-    sys.stderr.write("config error: reading the config needs Python 3.11+ (tomllib)\n")
+except ModuleNotFoundError:  # tomllib needs 3.11; the project requires >= 3.12
+    sys.stderr.write("config error: reading the config needs Python 3.12+ (tomllib)\n")
     sys.exit(2)
 
 # scalar toml key -> (shell variable, kind)

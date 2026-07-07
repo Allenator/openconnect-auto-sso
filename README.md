@@ -64,7 +64,7 @@ override with `$OC_AUTO_SSO_CONFIG`, or drop a `config.toml` in the repo for dev
 | `server` | string | VPN server hostname or URL. **Required.** |
 | `protocol` | string | openconnect protocol; `""` auto-detects (e.g. `"anyconnect"`, `"gp"`). |
 | `via_vpn` | list | Everything that should go through the VPN, in one list; each entry's shape decides how it's handled (see below). `[]` = full tunnel. |
-| `proxy_port` | int | Loopback port for the DNS-routing proxy (default `45353`); only used when `via_vpn` contains a name. |
+| `proxy_port` | int | Loopback port for the DNS-routing proxy (default `45353`); only used when `via_vpn` contains a name or `@server`. |
 | `allow_incoming` | bool | `true` allows incoming from the VPN (no pf firewall) so iCloud Private Relay keeps working. |
 | `keepalive_host` | string | Host to ping through the tunnel to avoid idle-disconnects. `"@dns"` auto-targets the VPN's own pushed DNS server (recommended); or a specific in-VPN host. `""` = off. |
 | `keepalive_interval` | int | Seconds between keepalive pings (default 30). |
@@ -117,8 +117,9 @@ those lookups to the VPN's own DNS servers and, for **every** IP each answer ret
 a host route out the tunnel device — installed *before* the DNS answer is handed back, so
 even the very first packet takes the tunnel. So a load-balanced or rotating host gets a
 route for whatever IP it actually resolves to — you don't have to know or hardcode its
-addresses. On disconnect the proxy is stopped and the resolver files are removed; the
-injected routes vanish with the tunnel interface.
+addresses. On disconnect the proxy is stopped and the resolver files are removed (a
+reconnect replaces the proxy rather than stacking a second one); the injected routes
+vanish with the tunnel interface.
 
 Two guard rails: the proxy **never routes the VPN gateway's own IP** through the tunnel
 (the gateway carries the tunnel itself — even when the gateway's hostname falls under a
@@ -197,9 +198,10 @@ Environment knobs for the browser helper:
 |--------------------------|----------------------------------------------------|
 | `VPN_BROWSER_SHOW=1`     | always show the window                             |
 | `VPN_BROWSER_DEBUG=1`    | log lifecycle events to stderr                     |
-| `VPN_BROWSER_IDLE_MS`    | idle ms before revealing the window (default 2500) |
-| `VPN_BROWSER_TIMEOUT_MS` | overall safety timeout (default 180000)            |
+| `VPN_BROWSER_IDLE_MS`    | idle ms before revealing the window (default 3500) |
+| `VPN_BROWSER_TIMEOUT_MS` | overall safety timeout (default 300000)            |
 | `OC_AUTO_SSO_CONFIG`     | path to an alternate config file                   |
+| `OC_DUMP`                | dump the server-advertised env vars to this file   |
 
 ## Scope
 

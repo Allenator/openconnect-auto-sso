@@ -32,7 +32,8 @@ via_vpn = []
 # "Secure DNS") bypasses /etc/resolver, so no route is added for it -- for those,
 # put the destination's CIDR in via_vpn instead of (or in addition to) its name.
 
-# Loopback UDP/TCP port for the DNS-routing proxy (only used when a name is listed).
+# Loopback UDP/TCP port for the DNS-routing proxy (only used when a name or
+# @server is listed).
 proxy_port = 45353
 
 # Allow incoming connections from the VPN (vpn-slice -i). true installs no pf
