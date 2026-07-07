@@ -175,6 +175,17 @@ if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUT
     # root's PATH usually excludes Homebrew, so resolve vpn-slice to an abs path.
     VPN_SLICE=$(command -v vpn-slice || true)
     [ -n "$VPN_SLICE" ] || { echo "error: split/DNS options set but vpn-slice not found" >&2; exit 1; }
+    # Name-based routing starts src/dnsroute.py (needs the venv + dnspython) as root
+    # inside the wrapper, where a failure would be silent. Pre-flight it here, in the
+    # user domain, so a broken install fails loudly BEFORE we bring the tunnel up.
+    if [ -n "$PROXY_NAMES" ]; then
+        if [ ! -x "$PROJ/.venv/bin/python" ] || \
+           ! "$PROJ/.venv/bin/python" -c 'import dns.message' 2>/dev/null; then
+            echo "error: DNS-routing (a name in via_vpn) needs the bundled venv with" >&2
+            echo "       dnspython at $PROJ/.venv -- run 'uv sync' in the repo." >&2
+            exit 1
+        fi
+    fi
     # Route through the vpnc-slice wrapper so the DNS-routing proxy and the @server
     # token can use the VPN's pushed CISCO_SPLIT_DNS/CISCO_DEF_DOMAIN/INTERNAL_IP4_DNS
     # (sudo strips our env, so the wrapper's config is baked into this -s string).

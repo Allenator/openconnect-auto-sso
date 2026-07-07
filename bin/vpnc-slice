@@ -37,7 +37,13 @@ while :; do
             case "${reason:-}" in connect|reconnect) env | sort > "$_f" 2>/dev/null || true ;; esac ;;
         --write-dns)  # write the VPN's first pushed DNS server to a file
             _f="$2"; shift 2
-            case "${reason:-}" in connect|reconnect) printf '%s\n' "${INTERNAL_IP4_DNS%% *}" > "$_f" 2>/dev/null || true ;; esac ;;
+            # ${INTERNAL_IP4_DNS:-} guard: the var is optional (a server may push no
+            # IPv4 DNS), and a bare ${INTERNAL_IP4_DNS%% *} would abort under set -u.
+            case "${reason:-}" in
+                connect|reconnect)
+                    _d1=${INTERNAL_IP4_DNS:-}
+                    [ -n "$_d1" ] && printf '%s\n' "${_d1%% *}" > "$_f" 2>/dev/null || true ;;
+            esac ;;
         --proxy)      # DNS-driven auto-routing via the loopback dnsroute proxy
             _names="$2"; _port="$3"; _pidfile="$4"; shift 4
             # Expand @server -> the server-advertised domains; build a space-
@@ -66,24 +72,53 @@ while :; do
             IFS=$_oldifs
             case "${reason:-}" in
                 connect|reconnect)
-                    # On reconnect, don't leave the previous proxy holding the port.
-                    [ -f "$_pidfile" ] && kill "$(cat "$_pidfile")" 2>/dev/null || true
-                    [ -d /etc/resolver ] || mkdir -p /etc/resolver 2>/dev/null || true
-                    for _d in $_domains; do
-                        # Marker comment tags the file as ours, so the connect
-                        # script's startup sweep only ever removes our own files.
-                        printf '%s\nnameserver 127.0.0.1\nport %s\n' "$RESOLVER_MARKER" "$_port" \
-                            > "/etc/resolver/$_d" 2>/dev/null || true
-                    done
-                    echo ">> DNS-routing via VPN for:$_domains (127.0.0.1:$_port)" >&2
-                    # --exclude: never inject a route for the VPN gateway's own IP --
-                    # it is the tunnel's transport peer, and sending it through the
-                    # tunnel would loop the tunnel onto itself.
-                    nohup "$PROJ/.venv/bin/python" "$PROJ/src/dnsroute.py" \
-                        --upstream "$INTERNAL_IP4_DNS" --dev "$TUNDEV" --port "$_port" \
-                        --exclude "${VPNGATEWAY:-}" \
-                        >/dev/null 2>&1 &
-                    echo $! > "$_pidfile" ;;
+                    # Kill any previous proxy and WAIT for it to release the port
+                    # before rebinding -- a straight kill-then-bind races EADDRINUSE
+                    # and the new proxy would die silently (SO_REUSEADDR doesn't
+                    # reliably cover a still-open UDP bind).
+                    if [ -f "$_pidfile" ]; then
+                        _old=$(cat "$_pidfile" 2>/dev/null || true)
+                        [ -n "$_old" ] && kill "$_old" 2>/dev/null || true
+                        _n=0
+                        while [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null && [ "$_n" -lt 30 ]; do
+                            sleep 0.1; _n=$((_n + 1))
+                        done
+                    fi
+                    # These are only unset if the server pushed no IPv4 DNS / no tun
+                    # device; guard them (bare refs would abort under set -u) and skip
+                    # DNS-routing rather than crash the whole vpnc-script pass.
+                    _up=${INTERNAL_IP4_DNS:-}; _dev=${TUNDEV:-}
+                    if [ -z "$_up" ] || [ -z "$_dev" ]; then
+                        echo ">> no VPN DNS/tun device pushed; DNS-routing disabled for:$_domains" >&2
+                    elif [ -z "$_domains" ]; then
+                        echo ">> no domains to DNS-route (@server advertised none); proxy not started" >&2
+                    else
+                        # Start the proxy FIRST, confirm it actually came up, and only
+                        # THEN point /etc/resolver at it -- so a proxy that dies on
+                        # startup (bad port, missing dnspython, lost bind race) never
+                        # leaves resolver files aimed at a dead port. --exclude keeps
+                        # the VPN gateway's own IP off the tunnel (it carries it).
+                        nohup "$PROJ/.venv/bin/python" "$PROJ/src/dnsroute.py" \
+                            --upstream "$_up" --dev "$_dev" --port "$_port" \
+                            --exclude "${VPNGATEWAY:-}" \
+                            >/dev/null 2>&1 &
+                        _pid=$!
+                        sleep 0.3
+                        if kill -0 "$_pid" 2>/dev/null; then
+                            echo "$_pid" > "$_pidfile"
+                            [ -d /etc/resolver ] || mkdir -p /etc/resolver 2>/dev/null || true
+                            for _d in $_domains; do
+                                # Marker tags the file as ours for the startup sweep.
+                                printf '%s\nnameserver 127.0.0.1\nport %s\n' "$RESOLVER_MARKER" "$_port" \
+                                    > "/etc/resolver/$_d" 2>/dev/null || true
+                            done
+                            echo ">> DNS-routing via VPN for:$_domains (127.0.0.1:$_port)" >&2
+                        else
+                            rm -f "$_pidfile" 2>/dev/null || true
+                            echo "WARNING: DNS-routing proxy failed to start (port $_port busy," \
+                                 "invalid, or dnspython missing); DNS-routing disabled." >&2
+                        fi
+                    fi ;;
                 disconnect)
                     [ -f "$_pidfile" ] && kill "$(cat "$_pidfile")" 2>/dev/null || true
                     rm -f "$_pidfile" 2>/dev/null || true

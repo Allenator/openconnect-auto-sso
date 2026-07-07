@@ -56,6 +56,10 @@ def render_scalar(key, kind, val):
     if kind == "int":
         if isinstance(val, bool) or not isinstance(val, int):
             die("'%s' must be an integer" % key)
+        if key == "proxy_port" and not (1 <= val <= 65535):
+            die("'proxy_port' must be a port number 1-65535")
+        if key == "keepalive_interval" and val < 1:
+            die("'keepalive_interval' must be a positive integer (seconds)")
         return str(val)
     # str
     if not isinstance(val, str):
