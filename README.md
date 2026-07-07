@@ -114,10 +114,18 @@ Naming a host or domain does two things at once: its DNS *and* its traffic go th
 VPN. On connect, each name gets a macOS `/etc/resolver/<name>` file pointing at a small
 loopback DNS proxy (`src/dnsroute.py`, started as root by the wrapper). The proxy forwards
 those lookups to the VPN's own DNS servers and, for **every** IP each answer returns, adds
-a host route out the tunnel device. So a load-balanced or rotating host gets a route for
-whatever IP it actually resolves to — you don't have to know or hardcode its addresses. On
-disconnect the proxy is stopped and the resolver files are removed; the injected routes
-vanish with the tunnel interface.
+a host route out the tunnel device — installed *before* the DNS answer is handed back, so
+even the very first packet takes the tunnel. So a load-balanced or rotating host gets a
+route for whatever IP it actually resolves to — you don't have to know or hardcode its
+addresses. On disconnect the proxy is stopped and the resolver files are removed; the
+injected routes vanish with the tunnel interface.
+
+Two guard rails: the proxy **never routes the VPN gateway's own IP** through the tunnel
+(the gateway carries the tunnel itself — even when the gateway's hostname falls under a
+proxied domain, as it typically does); and the connect script **sweeps leftover resolver
+files** at startup (they're tagged with an `# openconnect-auto-sso` marker, so only this
+tool's own files are ever touched) — a straggler from a crashed teardown would otherwise
+point its domains at a proxy that no longer exists.
 
 > **Resolver-bypass caveat.** A route is injected only for lookups that go through the
 > **system resolver**. An app that does its own DoH/DoT — e.g. a browser with "Secure DNS"

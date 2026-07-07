@@ -88,6 +88,38 @@ if [ -r /etc/pf.conf ] && grep -q 'anchor "vpn_slice' /etc/pf.conf 2>/dev/null; 
         echo "  Clean later:  sudo sed -i '' '/anchor \"vpn_slice/d' /etc/pf.conf && sudo pfctl -f /etc/pf.conf" >&2
 fi
 
+# --- sweep leftover /etc/resolver files from a failed teardown ---------------
+# Our resolver files (tagged "# openconnect-auto-sso") point domains at the
+# loopback DNS proxy; if a teardown was missed they outlive the proxy and break
+# every lookup under those domains -- including Phase 1's resolution of $SERVER
+# when it sits under one of them. The marker guarantees we only touch our own.
+_leftover=""
+for _f in /etc/resolver/*; do
+    [ -f "$_f" ] || continue
+    grep -q '^# openconnect-auto-sso' "$_f" 2>/dev/null && _leftover="$_leftover $_f" || true
+done
+if [ -n "$_leftover" ]; then
+    if pgrep -x openconnect >/dev/null 2>&1; then
+        echo "WARNING: an openconnect is already running; leaving its resolver files:$_leftover" >&2
+    else
+        echo "WARNING: leftover DNS resolver files from an earlier session:" >&2
+        for _f in $_leftover; do echo "    $_f" >&2; done
+        echo "  They point those domains at a proxy that is no longer running, so" >&2
+        echo "  lookups under them fail -- and can break this connect." >&2
+        _removed=n
+        if [ -t 0 ]; then
+            printf "  Remove them now (needs sudo)? [Y/n] " >&2
+            read -r _ans || _ans=y
+            case "$_ans" in
+                [nN]*) ;;
+                *) sudo rm -f $_leftover && { echo "  removed." >&2; _removed=y; } ;;
+            esac
+        fi
+        [ "$_removed" = y ] || \
+            echo "  Clean later:  sudo rm$_leftover" >&2
+    fi
+fi
+
 # --- Phase 1: authenticate as the current user (no sudo, no root browser) ----
 echo ">> authenticating to $SERVER" >&2
 authenticate() {
