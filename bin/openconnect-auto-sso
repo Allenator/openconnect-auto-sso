@@ -49,10 +49,12 @@ CALLBACK="${CALLBACK:-localhost:29786}"
 KEEPALIVE_HOST="${KEEPALIVE_HOST:-}"
 KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
 ALLOW_INCOMING="${ALLOW_INCOMING:-0}"
-VPN_DOMAINS="${VPN_DOMAINS:-}"          # split-DNS: domains resolved via the VPN's DNS
+PROXY_NAMES="${PROXY_NAMES:-}"          # DNS names routed via the VPN (proxy + /etc/resolver)
 ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (server-pushed)
 ROUTE_SPLITS="${ROUTE_SPLITS:-0}"       # also add the server's split-include subnets
-KA_DNS_FILE="${TMPDIR:-/tmp}/openconnect-auto-sso.dns.$$"   # keepalive @dns target
+PROXY_PORT="${PROXY_PORT:-45353}"       # loopback port for the DNS-routing proxy
+KA_DNS_FILE="${TMPDIR:-/tmp}/openconnect-auto-sso.dns.$$"     # keepalive @dns target
+PROXY_PIDFILE="${TMPDIR:-/tmp}/openconnect-auto-sso.proxy.$$" # DNS-routing proxy PID
 
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
@@ -129,16 +131,20 @@ fi
 set -- --cookie-on-stdin --servercert "$FINGERPRINT"
 [ -n "$RESOLVE" ] && set -- "$@" --resolve "$RESOLVE"
 [ -n "$PROTOCOL" ] && set -- "$@" --protocol="$PROTOCOL"
-if [ -n "$SPLIT_ROUTES$VPN_DOMAINS" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUTE_SPLITS" = "1" ]; then
+if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUTE_SPLITS" = "1" ]; then
     # root's PATH usually excludes Homebrew, so resolve vpn-slice to an abs path.
     VPN_SLICE=$(command -v vpn-slice || true)
     [ -n "$VPN_SLICE" ] || { echo "error: split/DNS options set but vpn-slice not found" >&2; exit 1; }
-    # Route through the vpnc-slice wrapper so split-DNS domains (incl. the @server
-    # token) can be pulled from the VPN's pushed CISCO_SPLIT_DNS/CISCO_DEF_DOMAIN.
+    # Route through the vpnc-slice wrapper so the DNS-routing proxy and the @server
+    # token can use the VPN's pushed CISCO_SPLIT_DNS/CISCO_DEF_DOMAIN/INTERNAL_IP4_DNS
+    # (sudo strips our env, so the wrapper's config is baked into this -s string).
     vs="$PROJ/bin/vpnc-slice"
     [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env $OC_DUMP"          # diagnostic env dump
     [ "$KEEPALIVE_HOST" = "@dns" ] && vs="$vs --write-dns $KA_DNS_FILE"  # keepalive target
-    vs="$vs $VPN_SLICE ${VPN_DOMAINS:--}"
+    # DNS-driven auto-routing: resolve these names via the VPN's DNS and route each
+    # answered IP through the tunnel (handled by the wrapper + src/dnsroute.py).
+    [ -n "$PROXY_NAMES" ] && vs="$vs --proxy $PROXY_NAMES $PROXY_PORT $PROXY_PIDFILE"
+    vs="$vs $VPN_SLICE"
     # ALLOW_INCOMING=1 drops vpn-slice's pf firewall (keeps iCloud Private Relay working).
     [ "$ALLOW_INCOMING" = "1" ] && vs="$vs -i"
     # Dynamic routes pushed by the VPN (no need to hardcode them):
@@ -168,8 +174,18 @@ if [ -n "$KEEPALIVE_HOST" ]; then
           sleep "$KEEPALIVE_INTERVAL"
       done ) &
     KA_PID=$!
-    trap 'kill "$KA_PID" 2>/dev/null || true; rm -f "$KA_DNS_FILE" 2>/dev/null || true' EXIT
 fi
+
+# Clean up on exit: stop the keepalive pinger and the DNS-routing proxy, and remove
+# their temp files. The vpnc-slice wrapper already tears the proxy down (and removes
+# its /etc/resolver files) on the VPN's disconnect pass; this is belt-and-suspenders
+# for the case where that pass doesn't run (e.g. Phase 2 never fully connected).
+trap '
+    [ -n "${KA_PID:-}" ] && kill "$KA_PID" 2>/dev/null
+    [ -f "$PROXY_PIDFILE" ] && kill "$(cat "$PROXY_PIDFILE" 2>/dev/null)" 2>/dev/null
+    rm -f "$KA_DNS_FILE" "$PROXY_PIDFILE" 2>/dev/null
+    true
+' EXIT
 
 echo ">> connecting tunnel (sudo)" >&2
 printf '%s' "$COOKIE" | sudo openconnect "$@" "$CONNECT_URL"
