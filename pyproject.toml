@@ -5,6 +5,7 @@ description = "Connect to browser-SSO (SAML) VPNs with openconnect: unprivileged
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "dnspython>=2.8.0",
     "pyqt6>=6.11.0",
     "pyqt6-webengine>=6.11.0",
 ]
