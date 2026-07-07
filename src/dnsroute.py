@@ -33,7 +33,13 @@ import threading
 import time
 
 import dns.message
+import dns.rcode
 import dns.rdatatype
+
+try:  # SVCB/HTTPS (type 64/65) ipv4hint/ipv6hint param keys; absent on old dnspython
+    from dns.rdtypes.svcbbase import ParamKey as _SVCB_PARAM
+except Exception:
+    _SVCB_PARAM = None
 
 # --- config (set in main; module globals keep the handlers minimal) ----------
 UPSTREAMS = []      # list of upstream DNS server IPs (tried in order)
@@ -67,15 +73,23 @@ def _recv_exact(sock, n):
 
 
 # --- forwarding --------------------------------------------------------------
+# The reply drives root route injection, so it must be genuinely the answer to
+# our query: connect() the socket (the kernel then drops datagrams from any other
+# source) and require the response transaction ID to match the query's. A fresh
+# ephemeral socket per query means there's no cross-query contamination either.
 def forward_udp(query):
     """Send a bare DNS query to the first responsive upstream; return its reply."""
+    qid = query[:2]
     for up in UPSTREAMS:
         try:
             with socket.socket(_family(up), socket.SOCK_DGRAM) as s:
                 s.settimeout(TIMEOUT)
-                s.sendto(query, (up, 53))
-                resp, _ = s.recvfrom(65535)
-                return resp
+                s.connect((up, 53))
+                s.send(query)
+                resp = s.recv(65535)
+                if resp[:2] == qid:
+                    return resp
+                # txid mismatch: a stray/duplicate packet -- ignore, try next.
         except OSError:
             continue
     return None
@@ -83,6 +97,7 @@ def forward_udp(query):
 
 def forward_tcp(raw):
     """Forward a 2-byte-length-prefixed DNS query over TCP; return the reply."""
+    qid = raw[2:4]
     for up in UPSTREAMS:
         try:
             with socket.socket(_family(up), socket.SOCK_STREAM) as s:
@@ -94,7 +109,7 @@ def forward_tcp(raw):
                     continue
                 (rlen,) = struct.unpack("!H", lp)
                 body = _recv_exact(s, rlen)
-                if body is None:
+                if body is None or body[:2] != qid:
                     continue
                 return lp + body
         except OSError:
@@ -102,13 +117,29 @@ def forward_tcp(raw):
     return None
 
 
+def servfail(query):
+    """Build a SERVFAIL reply to QUERY so the client fails fast (vs. our silence)."""
+    try:
+        resp = dns.message.make_response(dns.message.from_wire(query))
+        resp.set_rcode(dns.rcode.SERVFAIL)
+        return resp.to_wire()
+    except Exception:
+        return None
+
+
 # --- route injection ---------------------------------------------------------
+def _mark_seen(ip):
+    with _SEEN_LOCK:
+        _SEEN.add(ip)
+
+
 def add_route(ip):
     with _SEEN_LOCK:
         if ip in _SEEN:
             return
-        _SEEN.add(ip)
     if ip in EXCLUDES:
+        # Record it so we don't re-log the exclusion on every lookup.
+        _mark_seen(ip)
         log("not routing %s (excluded: the VPN gateway/transport)" % ip)
         return
     if _family(ip) == socket.AF_INET6:
@@ -116,27 +147,61 @@ def add_route(ip):
     else:
         cmd = ["/sbin/route", "-n", "add", "-host", ip, "-interface", DEV]
     if DRY_RUN:
+        _mark_seen(ip)
         log(" ".join(cmd))
         return
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True)
-    except OSError as e:
-        log("route add failed for %s: %s" % (ip, e))
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        # Don't mark _SEEN: a transient failure (e.g. tunnel not fully up yet)
+        # must be retried on the next lookup, not cached as permanently handled.
+        log("route add failed for %s: %s (will retry)" % (ip, e))
         return
-    if res.returncode != 0 and "File exists" not in (res.stderr or ""):
-        log("route add failed for %s: %s" % (ip, (res.stderr or "").strip()))
+    if res.returncode == 0 or "File exists" in (res.stderr or ""):
+        _mark_seen(ip)
+    else:
+        log("route add failed for %s: %s (will retry)" % (ip, (res.stderr or "").strip()))
+
+
+def _svcb_hint_ips(item):
+    """Yield the ipv4hint/ipv6hint addresses of an SVCB/HTTPS record, if any."""
+    if _SVCB_PARAM is None:
+        return
+    try:
+        params = item.params
+    except Exception:
+        return
+    for key in (_SVCB_PARAM.IPV4HINT, _SVCB_PARAM.IPV6HINT):
+        hint = params.get(key)
+        if not hint:
+            continue
+        for addr in getattr(hint, "addresses", ()):
+            yield str(addr)
 
 
 def inject_routes(wire):
-    """Read-only parse of a DNS reply; add a host route per A/AAAA answer IP."""
+    """Read-only parse of a DNS reply; add a host route per answer IP.
+
+    Covers A/AAAA plus the ipv4hint/ipv6hint addresses inside HTTPS/SVCB (type
+    64/65) records -- a client using an SVCB hint (ECH / HappyEyeballs) would
+    otherwise reach a proxied name over the default interface, not the tunnel.
+    """
     try:
         msg = dns.message.from_wire(wire)
     except Exception:
         return
     for rrset in msg.answer:
         for item in rrset:
-            if item.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
-                add_route(item.address)
+            # Never let a single odd record abort injection -- this runs BEFORE the
+            # reply is sent to the client, so an exception here would drop the answer.
+            try:
+                if item.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
+                    add_route(item.address)
+                elif item.rdtype in (dns.rdatatype.HTTPS, dns.rdatatype.SVCB):
+                    for ip in _svcb_hint_ips(item):
+                        add_route(ip)
+            except Exception as e:
+                log("skipping unroutable answer record: %s" % e)
 
 
 # --- servers -----------------------------------------------------------------
@@ -155,15 +220,24 @@ class UDPHandler(socketserver.BaseRequestHandler):
     def handle(self):
         data, sock = self.request
         resp = forward_udp(data)
-        if resp:
-            # Routes go in BEFORE the answer is returned, so the client's very
-            # first packet to a fresh IP already flows through the tunnel
-            # (answer-then-route would let it race out the default interface).
-            inject_routes(resp)
-            try:
-                sock.sendto(resp, self.client_address)
-            except OSError:
-                pass
+        if not resp:
+            # All upstreams down: reply SERVFAIL so the client fails fast instead
+            # of hanging and retrying against our silence.
+            resp = servfail(data)
+            if resp:
+                try:
+                    sock.sendto(resp, self.client_address)
+                except OSError:
+                    pass
+            return
+        # Routes go in BEFORE the answer is returned, so the client's very
+        # first packet to a fresh IP already flows through the tunnel
+        # (answer-then-route would let it race out the default interface).
+        inject_routes(resp)
+        try:
+            sock.sendto(resp, self.client_address)
+        except OSError:
+            pass
 
 
 class TCPHandler(socketserver.BaseRequestHandler):
@@ -177,15 +251,23 @@ class TCPHandler(socketserver.BaseRequestHandler):
         if query is None:
             return
         resp = forward_tcp(lp + query)
-        if resp:
-            # Same ordering as UDP: route first, then answer.
-            if len(resp) >= 2:
-                (rlen,) = struct.unpack("!H", resp[:2])
-                inject_routes(resp[2:2 + rlen])
-            try:
-                sock.sendall(resp)
-            except OSError:
-                pass
+        if not resp:
+            # All upstreams down: SERVFAIL (length-prefixed) so the client fails fast.
+            sf = servfail(query)
+            if sf:
+                try:
+                    sock.sendall(struct.pack("!H", len(sf)) + sf)
+                except OSError:
+                    pass
+            return
+        # Same ordering as UDP: route first, then answer.
+        if len(resp) >= 2:
+            (rlen,) = struct.unpack("!H", resp[:2])
+            inject_routes(resp[2:2 + rlen])
+        try:
+            sock.sendall(resp)
+        except OSError:
+            pass
 
 
 # --- lifecycle ---------------------------------------------------------------

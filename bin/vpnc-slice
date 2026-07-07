@@ -122,8 +122,15 @@ while :; do
                 disconnect)
                     [ -f "$_pidfile" ] && kill "$(cat "$_pidfile")" 2>/dev/null || true
                     rm -f "$_pidfile" 2>/dev/null || true
-                    for _d in $_domains; do
-                        rm -f "/etc/resolver/$_d" 2>/dev/null || true
+                    # Remove OUR resolver files by marker -- the same authority the
+                    # connect script's startup sweep uses -- rather than re-deriving
+                    # domain names from a server env that may differ or be absent on
+                    # the disconnect pass (which would leak @server files pointing at
+                    # the now-dead proxy).
+                    for _f in /etc/resolver/*; do
+                        [ -f "$_f" ] || continue
+                        grep -qxF -- "$RESOLVER_MARKER" "$_f" 2>/dev/null \
+                            && rm -f "$_f" 2>/dev/null || true
                     done ;;
             esac ;;
         *) break ;;

@@ -106,8 +106,10 @@ fi
 # lookup under those domains -- including Phase 1's resolution of $SERVER when it
 # sits under one of them. The marker guarantees we only touch our own.
 _rm_resolver_leftovers() {
-    # $_leftover word-splits into the individual file paths (no spaces in them).
-    sudo rm -f $_leftover && echo "  removed." >&2
+    # $_leftover intentionally word-splits into the individual paths; `set -f`
+    # (in a subshell, so it doesn't leak) stops those paths being re-globbed --
+    # a resolver filename could contain a shell glob metacharacter.
+    ( set -f; sudo rm -f $_leftover ) && echo "  removed." >&2
 }
 _leftover=""
 for _f in /etc/resolver/*; do
@@ -189,13 +191,17 @@ if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUT
     # Route through the vpnc-slice wrapper so the DNS-routing proxy and the @server
     # token can use the VPN's pushed CISCO_SPLIT_DNS/CISCO_DEF_DOMAIN/INTERNAL_IP4_DNS
     # (sudo strips our env, so the wrapper's config is baked into this -s string).
-    vs="$PROJ/bin/vpnc-slice"
-    [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env $OC_DUMP"          # diagnostic env dump
-    [ "$KEEPALIVE_HOST" = "@dns" ] && vs="$vs --write-dns $KA_DNS_FILE"  # keepalive target
+    # openconnect runs this whole -s string via `/bin/sh -c`, which re-splits it on
+    # spaces, so PATH-valued fields are single-quoted to survive a space in $PROJ or
+    # $TMPDIR. The unquoted fields (PROXY_NAMES/PROXY_PORT/SPLIT_ROUTES) are validated
+    # by loadconfig to contain no spaces or shell metacharacters.
+    vs="'$PROJ/bin/vpnc-slice'"
+    [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env '$OC_DUMP'"        # diagnostic env dump
+    [ "$KEEPALIVE_HOST" = "@dns" ] && vs="$vs --write-dns '$KA_DNS_FILE'"  # keepalive target
     # DNS-driven auto-routing: resolve these names via the VPN's DNS and route each
     # answered IP through the tunnel (handled by the wrapper + src/dnsroute.py).
-    [ -n "$PROXY_NAMES" ] && vs="$vs --proxy $PROXY_NAMES $PROXY_PORT $PROXY_PIDFILE"
-    vs="$vs $VPN_SLICE"
+    [ -n "$PROXY_NAMES" ] && vs="$vs --proxy $PROXY_NAMES $PROXY_PORT '$PROXY_PIDFILE'"
+    vs="$vs '$VPN_SLICE'"
     # ALLOW_INCOMING=1 drops vpn-slice's pf firewall (keeps iCloud Private Relay working).
     [ "$ALLOW_INCOMING" = "1" ] && vs="$vs -i"
     # Dynamic routes pushed by the VPN (no need to hardcode them):
@@ -227,13 +233,13 @@ if [ -n "$KEEPALIVE_HOST" ]; then
     KA_PID=$!
 fi
 
-# Clean up on exit: stop the keepalive pinger and the DNS-routing proxy, and remove
-# their temp files. The vpnc-slice wrapper already tears the proxy down (and removes
-# its /etc/resolver files) on the VPN's disconnect pass; this is belt-and-suspenders
-# for the case where that pass doesn't run (e.g. Phase 2 never fully connected).
-# Deliberately does NOT touch /etc/resolver files: they are root-owned and this
-# trap runs unprivileged (prompting for sudo inside a trap would be worse); the
-# startup sweep above mops up anything the wrapper left behind.
+# Clean up on exit: stop the keepalive pinger and remove our temp files. The
+# DNS-routing proxy is started as ROOT by the wrapper, so an unprivileged kill from
+# this trap can't reap it (EPERM, silently swallowed) -- it is torn down by the
+# wrapper's disconnect pass, and failing that by the proxy's own device watchdog
+# (~15s after the utun disappears). We still issue the kill (it works in the rare
+# case the proxy is ours to signal) and remove the pidfile. /etc/resolver files are
+# left to the startup sweep (root-owned; prompting for sudo inside a trap is worse).
 trap '
     [ -n "${KA_PID:-}" ] && kill "$KA_PID" 2>/dev/null || true
     [ -f "$PROXY_PIDFILE" ] && kill "$(cat "$PROXY_PIDFILE" 2>/dev/null)" 2>/dev/null || true
