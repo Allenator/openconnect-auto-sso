@@ -19,6 +19,7 @@ how it's handled:
     anything else (a name)-> a DNS name: /etc/resolver/<name> -> proxy    -> PROXY_NAMES
 """
 import ipaddress
+import re
 import shlex
 import sys
 
@@ -70,6 +71,20 @@ def is_ip_or_cidr(entry):
         return False
 
 
+# A DNS name (RFC 1123 host/domain): dot-separated labels of letters/digits/hyphen,
+# each 1-63 chars, no leading/trailing hyphen, total <= 253. This is deliberately
+# strict: a via_vpn name becomes an /etc/resolver/<name> path written as root AND is
+# expanded (unquoted) into the vpnc-script -s string that openconnect runs via
+# `/bin/sh -c` as root -- so anything outside this set (shell metacharacters, '/',
+# '..', spaces) must never get through. Rejecting it here is the single gate.
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+_HOSTNAME_RE = re.compile(r"^%s(?:\.%s)*$" % (_LABEL, _LABEL))
+
+
+def is_hostname(entry):
+    return len(entry) <= 253 and bool(_HOSTNAME_RE.match(entry))
+
+
 def classify_via_vpn(val):
     """Split via_vpn into PROXY_NAMES / SPLIT_ROUTES / ROUTE_INTERNAL / ROUTE_SPLITS."""
     if isinstance(val, str):
@@ -92,10 +107,21 @@ def classify_via_vpn(val):
             route_splits = True
         elif entry.startswith("@"):
             die("unknown via_vpn token '%s' (expected @server, @internal, @splits)" % entry)
-        elif entry.startswith("%") or is_ip_or_cidr(entry):
-            split_routes.append(entry)     # vpn-slice static route ('%' = exclude)
-        else:
+        elif entry.startswith("%"):
+            if not is_ip_or_cidr(entry[1:]):
+                die("invalid via_vpn exclude '%s' (expected %%IP or %%CIDR)" % entry)
+            split_routes.append(entry)     # vpn-slice exclude
+        elif is_ip_or_cidr(entry):
+            split_routes.append(entry)     # vpn-slice static route
+        elif is_hostname(entry):
             proxy_names.append(entry)      # a DNS name -> /etc/resolver + proxy
+        else:
+            # Not a token, IP/CIDR, %exclude, or valid hostname. Reject loudly --
+            # never silently treat a typo'd subnet ("10.0.0/8") or a metacharacter-
+            # bearing string as a proxied "name" (it would yield an unwritable
+            # resolver path and, unquoted in the -s string, run as root).
+            die("invalid via_vpn entry '%s' (expected a hostname, IP/CIDR, "
+                "%%IP/%%CIDR exclude, or @server/@internal/@splits)" % entry)
     return proxy_names, split_routes, route_internal, route_splits
 
 
