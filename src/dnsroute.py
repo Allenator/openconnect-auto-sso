@@ -7,7 +7,7 @@ to the VPN's own DNS server(s) and, for every A/AAAA answer, adds a host route o
 the tunnel device -- so a name scoped to the VPN is not just resolved via the VPN
 but actually *reachable* over it, even when it load-balances across rotating IPs.
 
-    dnsroute.py --upstream IP[,IP] --dev TUNDEV --port P [--dry-run]
+    dnsroute.py --upstream "IP[,| IP]..." --dev TUNDEV --port P [--dry-run]
 
 It is deliberately minimal and loopback-only: it binds 127.0.0.1:<port> (UDP and
 TCP), forwards the raw query bytes to the first responsive upstream (port 53),
@@ -18,6 +18,7 @@ and SIGTERM exits cleanly.
 """
 import argparse
 import os
+import re
 import signal
 import socket
 import socketserver
@@ -201,14 +202,15 @@ def main(argv):
     global UPSTREAMS, DEV, PORT, DRY_RUN
     ap = argparse.ArgumentParser(description="loopback DNS proxy that routes answers via the VPN")
     ap.add_argument("--upstream", required=True,
-                    help="VPN DNS server IP(s), comma-separated")
+                    help="VPN DNS server IP(s), separated by commas or whitespace "
+                         "(the wrapper passes INTERNAL_IP4_DNS verbatim)")
     ap.add_argument("--dev", required=True, help="tunnel device (e.g. utun4)")
     ap.add_argument("--port", required=True, type=int, help="loopback port to listen on")
     ap.add_argument("--dry-run", action="store_true",
                     help="log route commands instead of running them")
     args = ap.parse_args(argv[1:])
 
-    UPSTREAMS = [x.strip() for x in args.upstream.split(",") if x.strip()]
+    UPSTREAMS = [x for x in re.split(r"[,\s]+", args.upstream.strip()) if x]
     DEV = args.dev
     PORT = args.port
     DRY_RUN = args.dry_run
