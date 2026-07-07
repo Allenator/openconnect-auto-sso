@@ -31,7 +31,7 @@ from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
 from PyQt6.QtNetwork import QNetworkCookie
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import QUrl, QTimer
+from PyQt6.QtCore import QUrl, QTimer, QStandardPaths
 
 APP_NAME = "openconnect-auto-sso"
 
@@ -96,16 +96,31 @@ def main(argv):
                   file=sys.stderr, flush=True)
 
     app = QApplication([argv[0]])
-    app.setApplicationName(APP_NAME)      # stable persistent-storage path
-    app.setOrganizationName(APP_NAME)
+    app.setApplicationName(APP_NAME)
+    # Deliberately NO setOrganizationName: with an org name set, Qt derives the
+    # profile path as <org>/<app>/... -- i.e. a same-name-nested
+    # openconnect-auto-sso/openconnect-auto-sso/... We pin the storage path
+    # explicitly below instead of relying on that derivation.
     # Start as a background (accessory) app so nothing appears while hidden.
     set_activation_policy(app, 0 if show_always else 1)
 
     global _profile
     _profile = QWebEngineProfile(profile_name)     # named -> on-disk
+    # Pin the on-disk location to a flat <appdata>/<APP_NAME>/QtWebEngine/<profile>
+    # so cookie persistence doesn't depend on Qt's app/org-name path derivation
+    # (which nests, and could shift across Qt versions and silently orphan the
+    # saved session). GenericDataLocation is the app/org-independent base
+    # (~/Library/Application Support on macOS, ~/.local/share on Linux).
+    base = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.GenericDataLocation)
+    storage = os.path.join(base, APP_NAME, "QtWebEngine", profile_name)
+    os.makedirs(storage, exist_ok=True)
+    _profile.setPersistentStoragePath(storage)
+    _profile.setCachePath(storage)
     _profile.setPersistentCookiesPolicy(
         QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
     )
+    log("profile storage:", storage)
 
     view = QWebEngineView()
     view.setPage(QWebEnginePage(_profile, view))
