@@ -1,19 +1,30 @@
 #!/bin/sh
 # vpnc-script wrapper for openconnect + vpn-slice.
 #
-# Expands the split-DNS domain spec (the token @server pulls the server-pushed
-# CISCO_SPLIT_DNS / CISCO_DEF_DOMAIN, which openconnect sets in our environment)
-# and hands off to vpn-slice with --domains-vpn-dns filled in dynamically.
-#
-#   usage: vpnc-slice <vpn-slice-path> <domain-spec|-> [vpn-slice args...]
-#
-# openconnect invokes this with reason=... and the CISCO_*/INTERNAL_IP4_* env
+# Consumes optional leading directives (baked in by the connect script), then
+# execs vpn-slice with the remaining args. sudo strips the connect script's
+# environment, so all wrapper config arrives as these directive ARGS -- never via
+# env. openconnect invokes this with reason=... and the CISCO_*/INTERNAL_IP4_* env
 # vars set; those pass through to vpn-slice unchanged via exec.
+#
+#   usage: vpnc-slice [directives...] <vpn-slice-path> [vpn-slice args...]
+#
+# Directives (each acts only once openconnect has populated the environment):
+#   --dump-env FILE             dump the server-advertised environment to FILE
+#   --write-dns FILE            write the VPN's first pushed DNS server to FILE
+#   --proxy NAMES PORT PIDFILE  DNS-driven auto-routing: for each name in NAMES
+#                               (comma-separated; the token @server expands to the
+#                               server-advertised domains CISCO_SPLIT_DNS /
+#                               CISCO_DEF_DOMAIN) write /etc/resolver/<name> pointing
+#                               at 127.0.0.1:PORT and start src/dnsroute.py, so those
+#                               names resolve via the VPN's DNS and each answered IP
+#                               gets a host route through the tunnel. Torn down on
+#                               disconnect (kill PIDFILE + remove the resolver files).
 set -eu
 
-# Optional leading directives (consumed before the vpn-slice args); the connect
-# script uses them for diagnostics and keepalive auto-config. Both act only on the
-# connect pass, once openconnect has populated the CISCO_*/INTERNAL_IP4_* env.
+# The wrapper lives at $PROJ/bin/vpnc-slice, so $PROJ is two dirs up from $0.
+PROJ=$(cd "$(dirname "$0")/.." && pwd)
+
 while :; do
     case "${1:-}" in
         --dump-env)   # dump the full server-advertised environment to a file
@@ -22,36 +33,44 @@ while :; do
         --write-dns)  # write the VPN's first pushed DNS server to a file
             _f="$2"; shift 2
             case "${reason:-}" in connect|reconnect) printf '%s\n' "${INTERNAL_IP4_DNS%% *}" > "$_f" 2>/dev/null || true ;; esac ;;
+        --proxy)      # DNS-driven auto-routing via the loopback dnsroute proxy
+            _names="$2"; _port="$3"; _pidfile="$4"; shift 4
+            # Expand @server -> the server-advertised domains; build a space-
+            # separated list of the concrete names to resolve via the VPN.
+            _domains=""
+            _oldifs=$IFS; IFS=,
+            for _n in $_names; do
+                if [ "$_n" = "@server" ]; then
+                    for _s in ${CISCO_SPLIT_DNS:-${CISCO_DEF_DOMAIN:-}}; do
+                        [ -n "$_s" ] && _domains="$_domains $_s"
+                    done
+                else
+                    [ -n "$_n" ] && _domains="$_domains $_n"
+                fi
+            done
+            IFS=$_oldifs
+            case "${reason:-}" in
+                connect|reconnect)
+                    [ -d /etc/resolver ] || mkdir -p /etc/resolver 2>/dev/null || true
+                    for _d in $_domains; do
+                        printf 'nameserver 127.0.0.1\nport %s\n' "$_port" \
+                            > "/etc/resolver/$_d" 2>/dev/null || true
+                    done
+                    echo ">> DNS-routing via VPN for:$_domains (127.0.0.1:$_port)" >&2
+                    nohup "$PROJ/.venv/bin/python" "$PROJ/src/dnsroute.py" \
+                        --upstream "$INTERNAL_IP4_DNS" --dev "$TUNDEV" --port "$_port" \
+                        >/dev/null 2>&1 &
+                    echo $! > "$_pidfile" ;;
+                disconnect)
+                    [ -f "$_pidfile" ] && kill "$(cat "$_pidfile")" 2>/dev/null || true
+                    rm -f "$_pidfile" 2>/dev/null || true
+                    for _d in $_domains; do
+                        rm -f "/etc/resolver/$_d" 2>/dev/null || true
+                    done ;;
+            esac ;;
         *) break ;;
     esac
 done
 
-vpn_slice="$1"; spec="$2"; shift 2
-[ "$spec" = "-" ] && spec=""
-
-# comma-separated spec -> space-separated words, expanding @server from the env
-raw=""
-for d in $(printf '%s' "$spec" | tr ',' ' '); do
-    if [ "$d" = "@server" ]; then
-        echo ">> server domains: split-dns='${CISCO_SPLIT_DNS:-}' def-domain='${CISCO_DEF_DOMAIN:-}'" >&2
-        raw="$raw $(printf '%s' "${CISCO_SPLIT_DNS:-${CISCO_DEF_DOMAIN:-}}" | tr ',' ' ')"
-    else
-        raw="$raw $d"
-    fi
-done
-
-# de-duplicate into a comma-separated list
-domains=""
-for d in $raw; do
-    case ",$domains," in
-        *",$d,"*) ;;
-        *) domains="${domains:+$domains,}$d" ;;
-    esac
-done
-
-if [ -n "$domains" ]; then
-    echo ">> split-DNS via VPN for: $domains" >&2
-    exec "$vpn_slice" --domains-vpn-dns "$domains" "$@"
-else
-    exec "$vpn_slice" "$@"
-fi
+vpn_slice="$1"; shift
+exec "$vpn_slice" "$@"
