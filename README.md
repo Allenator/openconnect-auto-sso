@@ -25,7 +25,7 @@ Phase 1  (as you, no sudo)
     → prints COOKIE / CONNECT_URL / FINGERPRINT / RESOLVE
 
 Phase 2  (sudo, no browser)
-  echo "$COOKIE" | sudo openconnect --cookie-on-stdin --setuid $USER … <CONNECT_URL>
+  echo "$COOKIE" | sudo openconnect --cookie-on-stdin … <CONNECT_URL>
     → builds the tunnel from that cookie
 ```
 
