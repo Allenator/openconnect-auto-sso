@@ -28,6 +28,7 @@ set -eu
 
 # The wrapper lives at $PROJ/bin/vpnc-slice, so $PROJ is two dirs up from $0.
 PROJ=$(cd "$(dirname "$0")/.." && pwd)
+. "$PROJ/lib/common.sh"   # RESOLVER_MARKER (shared with the connect script's sweep)
 
 while :; do
     case "${1:-}" in
@@ -61,7 +62,7 @@ while :; do
                     for _d in $_domains; do
                         # Marker comment tags the file as ours, so the connect
                         # script's startup sweep only ever removes our own files.
-                        printf '# openconnect-auto-sso\nnameserver 127.0.0.1\nport %s\n' "$_port" \
+                        printf '%s\nnameserver 127.0.0.1\nport %s\n' "$RESOLVER_MARKER" "$_port" \
                             > "/etc/resolver/$_d" 2>/dev/null || true
                     done
                     echo ">> DNS-routing via VPN for:$_domains (127.0.0.1:$_port)" >&2

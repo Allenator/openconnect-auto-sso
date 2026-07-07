@@ -16,6 +16,7 @@ while [ -L "$src" ]; do
     case $src in /*) ;; *) src=$dir/$src ;; esac
 done
 PROJ=$(cd "$(dirname "$src")/.." && pwd)
+. "$PROJ/lib/common.sh"   # RESOLVER_MARKER (shared with the root-side wrapper)
 
 # --- load configuration ------------------------------------------------------
 # Precedence: $OC_AUTO_SSO_CONFIG, then the standard external location
@@ -59,44 +60,59 @@ PROXY_PIDFILE="${TMPDIR:-/tmp}/openconnect-auto-sso.proxy.$$" # DNS-routing prox
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
 
-# --- warn about leaked vpn-slice pf anchors --------------------------------
+# --- startup guards for leftovers from failed teardowns ----------------------
+# Shared prompt tail: on a tty, ask QUESTION (default answer DEFAULT) and run
+# FIX_FN on yes; if the fix didn't run (no tty, declined, failed), print the
+# manual LATER_HINT. Always returns 0.
+#   _offer_sudo_fix QUESTION DEFAULT(y|n) LATER_HINT FIX_FN
+_offer_sudo_fix() {
+    _q=$1; _def=$2; _later=$3; _fn=$4
+    _fixed=n
+    if [ -t 0 ]; then
+        [ "$_def" = y ] && _yn='[Y/n]' || _yn='[y/N]'
+        printf "  %s (needs sudo)? %s " "$_q" "$_yn" >&2
+        read -r _ans || _ans=$_def
+        case "$_ans" in [yY]*) _do=y ;; [nN]*) _do=n ;; *) _do=$_def ;; esac
+        [ "$_do" = y ] && "$_fn" && _fixed=y || true
+    fi
+    [ "$_fixed" = y ] || echo "  Clean later:  $_later" >&2
+}
+
 # vpn-slice's "block incoming" firewall appends an anchor to /etc/pf.conf and can
 # fail to remove it on teardown. The leftover reloads on every boot and keeps
 # iCloud Private Relay disabled even with no VPN connected. Warn (and offer to fix).
+_fix_pf_anchor() {
+    if sudo cp /etc/pf.conf /etc/pf.conf.bak &&
+       sudo sed -i '' '/anchor "vpn_slice/d' /etc/pf.conf &&
+       sudo pfctl -f /etc/pf.conf 2>/dev/null; then
+        echo "  cleaned (backup at /etc/pf.conf.bak)." >&2
+    else
+        echo "  cleanup failed; remove the line manually." >&2
+        return 1
+    fi
+}
 if [ -r /etc/pf.conf ] && grep -q 'anchor "vpn_slice' /etc/pf.conf 2>/dev/null; then
     echo "WARNING: leftover vpn-slice firewall anchor in /etc/pf.conf:" >&2
     grep -n 'anchor "vpn_slice' /etc/pf.conf | sed 's/^/    /' >&2
     echo "  It persists across reboots and can keep iCloud Private Relay off even" >&2
     echo "  with no VPN connected (a vpn-slice teardown bug)." >&2
-    _cleaned=n
-    if [ -t 0 ]; then
-        printf "  Remove it now (needs sudo)? [y/N] " >&2
-        read -r _ans || _ans=n
-        case "$_ans" in
-            [yY]*)
-                if sudo cp /etc/pf.conf /etc/pf.conf.bak &&
-                   sudo sed -i '' '/anchor "vpn_slice/d' /etc/pf.conf &&
-                   sudo pfctl -f /etc/pf.conf 2>/dev/null; then
-                    echo "  cleaned (backup at /etc/pf.conf.bak)." >&2
-                    _cleaned=y
-                else
-                    echo "  cleanup failed; remove the line manually." >&2
-                fi ;;
-        esac
-    fi
-    [ "$_cleaned" = y ] || \
-        echo "  Clean later:  sudo sed -i '' '/anchor \"vpn_slice/d' /etc/pf.conf && sudo pfctl -f /etc/pf.conf" >&2
+    _offer_sudo_fix "Remove it now" n \
+        "sudo sed -i '' '/anchor \"vpn_slice/d' /etc/pf.conf && sudo pfctl -f /etc/pf.conf" \
+        _fix_pf_anchor
 fi
 
-# --- sweep leftover /etc/resolver files from a failed teardown ---------------
-# Our resolver files (tagged "# openconnect-auto-sso") point domains at the
-# loopback DNS proxy; if a teardown was missed they outlive the proxy and break
-# every lookup under those domains -- including Phase 1's resolution of $SERVER
-# when it sits under one of them. The marker guarantees we only touch our own.
+# Our resolver files (first line: $RESOLVER_MARKER) point domains at the loopback
+# DNS proxy; if a teardown was missed they outlive the proxy and break every
+# lookup under those domains -- including Phase 1's resolution of $SERVER when it
+# sits under one of them. The marker guarantees we only touch our own.
+_rm_resolver_leftovers() {
+    # $_leftover word-splits into the individual file paths (no spaces in them).
+    sudo rm -f $_leftover && echo "  removed." >&2
+}
 _leftover=""
 for _f in /etc/resolver/*; do
     [ -f "$_f" ] || continue
-    grep -q '^# openconnect-auto-sso' "$_f" 2>/dev/null && _leftover="$_leftover $_f" || true
+    grep -qxF -- "$RESOLVER_MARKER" "$_f" 2>/dev/null && _leftover="$_leftover $_f" || true
 done
 if [ -n "$_leftover" ]; then
     if pgrep -x openconnect >/dev/null 2>&1; then
@@ -106,17 +122,9 @@ if [ -n "$_leftover" ]; then
         for _f in $_leftover; do echo "    $_f" >&2; done
         echo "  They point those domains at a proxy that is no longer running, so" >&2
         echo "  lookups under them fail -- and can break this connect." >&2
-        _removed=n
-        if [ -t 0 ]; then
-            printf "  Remove them now (needs sudo)? [Y/n] " >&2
-            read -r _ans || _ans=y
-            case "$_ans" in
-                [nN]*) ;;
-                *) sudo rm -f $_leftover && { echo "  removed." >&2; _removed=y; } ;;
-            esac
-        fi
-        [ "$_removed" = y ] || \
-            echo "  Clean later:  sudo rm$_leftover" >&2
+        # Default Yes (unlike the pf guard): the marker proves they're ours, no
+        # openconnect is running, and keeping them breaks DNS machine-wide.
+        _offer_sudo_fix "Remove them now" y "sudo rm$_leftover" _rm_resolver_leftovers
     fi
 fi
 
@@ -212,6 +220,9 @@ fi
 # their temp files. The vpnc-slice wrapper already tears the proxy down (and removes
 # its /etc/resolver files) on the VPN's disconnect pass; this is belt-and-suspenders
 # for the case where that pass doesn't run (e.g. Phase 2 never fully connected).
+# Deliberately does NOT touch /etc/resolver files: they are root-owned and this
+# trap runs unprivileged (prompting for sudo inside a trap would be worse); the
+# startup sweep above mops up anything the wrapper left behind.
 trap '
     [ -n "${KA_PID:-}" ] && kill "$KA_PID" 2>/dev/null || true
     [ -f "$PROXY_PIDFILE" ] && kill "$(cat "$PROXY_PIDFILE" 2>/dev/null)" 2>/dev/null || true

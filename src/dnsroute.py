@@ -38,7 +38,6 @@ import dns.rdatatype
 # --- config (set in main; module globals keep the handlers minimal) ----------
 UPSTREAMS = []      # list of upstream DNS server IPs (tried in order)
 DEV = ""            # tunnel device to route answered IPs through (e.g. utun4)
-PORT = 0            # loopback port to listen on
 EXCLUDES = set()    # IPs never to route (the VPN gateway -- routing it would loop the tunnel)
 DRY_RUN = False     # log route commands instead of running them
 TIMEOUT = 3.0       # per-upstream forward timeout (seconds)
@@ -104,7 +103,7 @@ def forward_tcp(raw):
 
 
 # --- route injection ---------------------------------------------------------
-def add_route(ip, inet6):
+def add_route(ip):
     with _SEEN_LOCK:
         if ip in _SEEN:
             return
@@ -112,7 +111,7 @@ def add_route(ip, inet6):
     if ip in EXCLUDES:
         log("not routing %s (excluded: the VPN gateway/transport)" % ip)
         return
-    if inet6:
+    if _family(ip) == socket.AF_INET6:
         cmd = ["/sbin/route", "-n", "add", "-inet6", ip, "-interface", DEV]
     else:
         cmd = ["/sbin/route", "-n", "add", "-host", ip, "-interface", DEV]
@@ -136,10 +135,8 @@ def inject_routes(wire):
         return
     for rrset in msg.answer:
         for item in rrset:
-            if item.rdtype == dns.rdatatype.A:
-                add_route(item.address, inet6=False)
-            elif item.rdtype == dns.rdatatype.AAAA:
-                add_route(item.address, inet6=True)
+            if item.rdtype in (dns.rdatatype.A, dns.rdatatype.AAAA):
+                add_route(item.address)
 
 
 # --- servers -----------------------------------------------------------------
@@ -211,7 +208,7 @@ def _on_term(signum, frame):
 
 
 def main(argv):
-    global UPSTREAMS, DEV, PORT, DRY_RUN, EXCLUDES
+    global UPSTREAMS, DEV, DRY_RUN, EXCLUDES
     ap = argparse.ArgumentParser(description="loopback DNS proxy that routes answers via the VPN")
     ap.add_argument("--upstream", required=True,
                     help="VPN DNS server IP(s), separated by commas or whitespace "
@@ -227,7 +224,7 @@ def main(argv):
 
     UPSTREAMS = [x for x in re.split(r"[,\s]+", args.upstream.strip()) if x]
     DEV = args.dev
-    PORT = args.port
+    port = args.port
     EXCLUDES = {x for x in re.split(r"[,\s]+", args.exclude.strip()) if x}
     DRY_RUN = args.dry_run
     if not UPSTREAMS:
@@ -236,10 +233,10 @@ def main(argv):
 
     signal.signal(signal.SIGTERM, _on_term)
 
-    udp = _ThreadingUDPServer(("127.0.0.1", PORT), UDPHandler)
-    tcp = _ThreadingTCPServer(("127.0.0.1", PORT), TCPHandler)
+    udp = _ThreadingUDPServer(("127.0.0.1", port), UDPHandler)
+    tcp = _ThreadingTCPServer(("127.0.0.1", port), TCPHandler)
     log("listening on 127.0.0.1:%d, upstream=%s, dev=%s%s%s"
-        % (PORT, ",".join(UPSTREAMS), DEV,
+        % (port, ",".join(UPSTREAMS), DEV,
            ", exclude=" + ",".join(sorted(EXCLUDES)) if EXCLUDES else "",
            " (dry-run)" if DRY_RUN else ""))
 
