@@ -181,10 +181,9 @@ fi
 # its /etc/resolver files) on the VPN's disconnect pass; this is belt-and-suspenders
 # for the case where that pass doesn't run (e.g. Phase 2 never fully connected).
 trap '
-    [ -n "${KA_PID:-}" ] && kill "$KA_PID" 2>/dev/null
-    [ -f "$PROXY_PIDFILE" ] && kill "$(cat "$PROXY_PIDFILE" 2>/dev/null)" 2>/dev/null
-    rm -f "$KA_DNS_FILE" "$PROXY_PIDFILE" 2>/dev/null
-    true
+    [ -n "${KA_PID:-}" ] && kill "$KA_PID" 2>/dev/null || true
+    [ -f "$PROXY_PIDFILE" ] && kill "$(cat "$PROXY_PIDFILE" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$KA_DNS_FILE" "$PROXY_PIDFILE" 2>/dev/null || true
 ' EXIT
 
 echo ">> connecting tunnel (sudo)" >&2
