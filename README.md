@@ -46,7 +46,7 @@ instant the flow reaches openconnect's `localhost:29786` loopback callback. It s
 
 ```sh
 git clone <this-repo> && cd openconnect-auto-sso
-uv sync             # fetch the PyQt6 helper's dependencies
+uv sync             # fetch the browser helper's deps (+ dev tools like pytest; --no-dev to skip)
 ./install.sh        # symlink commands into ~/.local/bin AND seed the config
 # then edit ~/.config/openconnect-auto-sso/config.toml (SERVER, etc.)
 ```
