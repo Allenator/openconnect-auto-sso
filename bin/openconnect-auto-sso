@@ -56,8 +56,9 @@ ROUTE_SPLITS="${ROUTE_SPLITS:-0}"       # also add the server's split-include su
 PROXY_PORT="${PROXY_PORT:-45353}"       # loopback port for the DNS-routing proxy
 KA_DNS_FILE="${TMPDIR:-/tmp}/openconnect-auto-sso.dns.$$"     # keepalive @dns target
 # The proxy PID file drives a ROOT kill in the wrapper (it SIGTERMs the pid it holds),
-# so it lives in root-only /var/run: a user-writable TMPDIR path would let the tunnel's
-# own user seed a victim PID for root to signal. The wrapper (root) writes it.
+# so it lives in /var/run (root:daemon, 0775): a user-writable TMPDIR path would let the
+# tunnel's own user seed a victim PID for root to signal, and the invoking user is not in
+# group daemon so cannot write here. Only the wrapper (root) reads and writes it.
 PROXY_PIDFILE="/var/run/openconnect-auto-sso.proxy.$$"       # DNS-routing proxy PID
 
 # The SSO browser helper (spawned by openconnect) reads these from the env.
@@ -272,17 +273,17 @@ if [ -n "$KEEPALIVE_HOST" ]; then
     KA_PID=$!
 fi
 
-# Clean up on exit: stop the keepalive pinger and remove our temp files. The
-# DNS-routing proxy is started as ROOT by the wrapper, so an unprivileged kill from
-# this trap can't reap it (EPERM, silently swallowed) -- it is torn down by the
-# wrapper's disconnect pass, and failing that by the proxy's own device watchdog
-# (~15s after the utun disappears). We still issue the kill (it works in the rare
-# case the proxy is ours to signal) and remove the pidfile. /etc/resolver files are
-# left to the startup sweep (root-owned; prompting for sudo inside a trap is worse).
+# Clean up on exit: stop the keepalive pinger and remove the keepalive temp file. The
+# DNS-routing proxy and its pidfile are owned by ROOT (the wrapper starts the proxy and
+# writes the pidfile under /var/run), so this unprivileged trap can neither signal the
+# proxy nor unlink the pidfile -- both are left to the wrapper's disconnect pass, and
+# failing that (a hard kill with no disconnect) to the proxy's own device watchdog (~15s
+# after the utun disappears), with the /var/run pidfile reclaimed at the next reboot.
+# /etc/resolver files are likewise root-owned and left to the startup sweep (prompting
+# for sudo inside a trap is worse).
 trap '
     [ -n "${KA_PID:-}" ] && kill "$KA_PID" 2>/dev/null || true
-    [ -f "$PROXY_PIDFILE" ] && kill "$(cat "$PROXY_PIDFILE" 2>/dev/null)" 2>/dev/null || true
-    rm -f "$KA_DNS_FILE" "$PROXY_PIDFILE" 2>/dev/null || true
+    rm -f "$KA_DNS_FILE" 2>/dev/null || true
 ' EXIT
 
 echo ">> connecting tunnel (sudo)" >&2

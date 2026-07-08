@@ -25,7 +25,16 @@
 #   install --once   connect once at login, do NOT auto-reconnect
 set -eu
 
-proj=$(cd "$(dirname "$0")" && pwd)
+# $proj locates lib/common.sh AND the libexec/vpn-teardown helper this script installs as
+# root with a NOPASSWD rule -- so it selects the SOURCE of a passwordless-root binary and
+# must NOT come from the ambient environment during a real install. Always derive it from
+# $0; honor the OC_PROJ override only when sourced by the test harness (OC_INSTALL_TEST=1),
+# so a stray/poisoned OC_PROJ in the installer's env can't redirect it.
+if [ "${OC_INSTALL_TEST:-}" = 1 ]; then
+    proj="${OC_PROJ:-$(cd "$(dirname "$0")" && pwd)}"
+else
+    proj=$(cd "$(dirname "$0")" && pwd)
+fi
 . "$proj/lib/common.sh"   # LIBEXEC_DIR, TEARDOWN_BIN (single owner of the paths)
 label="openconnect-auto-sso"
 plist="$HOME/Library/LaunchAgents/$label.plist"
@@ -41,13 +50,57 @@ user=$(id -un)
 find_bin() { command -v "$1" 2>/dev/null; }
 xml_escape() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 
-# True if $1 is a safe home for a NOPASSWD-granted root binary: root-owned and NOT
-# group/other-writable. A helper in a user-writable dir could be swapped for arbitrary
-# root code, hijacking the grant -- so we verify the install path before trusting it.
+# True if $1 is a safe home for a NOPASSWD-granted root binary: a real directory (not
+# a symlink), root-owned, and NOT group/other-writable. A helper reachable through a
+# user-writable OR symlinked path component could be swapped for arbitrary root code,
+# hijacking the grant. `stat -f` is lstat (no -L), so it reports a symlink as mode
+# `l...`, which we reject -- otherwise the writer (`install -d`) would follow the link
+# to an unchecked target.
 dir_is_safe() {
     _st=$(stat -f '%u %Sp' "$1" 2>/dev/null) || return 1
-    [ "${_st%% *}" = 0 ] || return 1                          # root-owned?
-    case "${_st#* }" in ?????w*|????????w*) return 1 ;; esac  # group/other writable?
+    _uid=${_st%% *}; _mode=${_st#* }
+    [ "$_uid" = 0 ] || return 1                    # root-owned?
+    case "$_mode" in
+        l*)                 return 1 ;;            # symlink -> install -d follows it elsewhere
+        ?????w*|????????w*) return 1 ;;            # group- or other-writable
+    esac
+    return 0
+}
+
+# Verify EVERY existing component of directory path $1 (from / down to the leaf) is a
+# safe home for a NOPASSWD-granted root binary -- else it could be swapped for attacker
+# code, hijacking the grant. A single loose or symlinked ancestor is enough, since
+# unlink/rename is governed by the *parent's* write bit, not the leaf's. Deriving the
+# chain from the path (rather than a hardcoded pair) keeps it from drifting off the
+# real install location. Returns 0 if all-safe; prints the offender and returns 1 if not.
+verify_safe_ancestors() {
+    # Fail closed on a non-absolute (or empty) path -- the walk below assumes a leading /.
+    case $1 in
+        /*) ;;
+        *)  echo "error: refusing to install under non-absolute path '$1'" >&2; return 1 ;;
+    esac
+    # Walk every existing component from / to the leaf and emit the first unsafe one. Run
+    # the IFS/glob-sensitive split in a SUBSHELL: `set -f` stops each segment being
+    # pathname-expanded (a stray glob char would otherwise validate the wrong paths) and
+    # IFS=/ splits on separators -- both scoped to the subshell so the parent's options are
+    # untouched. dir_is_safe is a function, so it's available here.
+    _bad=$(
+        set -f; IFS=/
+        _acc=""
+        for _seg in $1; do
+            [ -n "$_seg" ] || continue          # skip the empty leading segment
+            _acc="$_acc/$_seg"
+            # -e follows symlinks, -L catches a dangling one; either must be vetted because
+            # `install -d` writes through whatever the path resolves to.
+            { [ -e "$_acc" ] || [ -L "$_acc" ]; } || continue
+            dir_is_safe "$_acc" || { printf '%s' "$_acc"; break; }
+        done
+    )
+    if [ -n "$_bad" ]; then
+        echo "error: $_bad is not root-owned, is group/other-writable, or is a" >&2
+        echo "       symlink; refusing to install a passwordless-root helper under it." >&2
+        return 1
+    fi
     return 0
 }
 
@@ -64,16 +117,10 @@ do_install() {
     oc=$(find_bin openconnect) || { echo "error: openconnect not on PATH" >&2; exit 1; }
     [ -f "$teardown_src" ] || { echo "error: $teardown_src missing" >&2; exit 1; }
 
-    # The teardown helper gets a NOPASSWD rule, so its directory must be root-owned and
-    # not user-writable -- else it could be swapped for attacker code, hijacking the
-    # grant. Verify the install path and its existing ancestors before trusting it.
-    for _d in /usr/local "$libexecdir"; do
-        if [ -e "$_d" ] && ! dir_is_safe "$_d"; then
-            echo "error: $_d is not root-owned or is group/other-writable; refusing to" >&2
-            echo "       install a passwordless-root helper under it." >&2
-            exit 1
-        fi
-    done
+    # The teardown helper gets a NOPASSWD rule, so every existing component of its
+    # install path must be a safe directory (root-owned, NOT group/other-writable, not a
+    # symlink) -- else it could be swapped for attacker code, hijacking the grant.
+    verify_safe_ancestors "$libexecdir" || exit 1
 
     # Propagate a custom config location to the agent, so it resolves the SAME config
     # this precheck validates (the agent otherwise gets only PATH+HOME -> could resolve
@@ -245,9 +292,16 @@ do_status() {
     [ -f "$log" ] && echo "log:         $log" || echo "log:         (none yet) $log"
 }
 
-case "${1:-install}" in
-    install)   do_install "${2:-}" ;;
-    uninstall) do_uninstall ;;
-    status)    do_status ;;
-    *) echo "usage: $0 [install [--once] | uninstall | status]" >&2; exit 2 ;;
-esac
+# The test harness sources this file to exercise dir_is_safe / verify_safe_ancestors in
+# isolation; OC_INSTALL_TEST=1 skips the subcommand dispatch so sourcing has no side
+# effects. Guard the dispatch with `if` rather than a top-level `return` -- `return` is
+# invalid in an executed script and, under dash, a stray OC_INSTALL_TEST=1 in the env
+# would make it silently exit without installing.
+if [ "${OC_INSTALL_TEST:-}" != 1 ]; then
+    case "${1:-install}" in
+        install)   do_install "${2:-}" ;;
+        uninstall) do_uninstall ;;
+        status)    do_status ;;
+        *) echo "usage: $0 [install [--once] | uninstall | status]" >&2; exit 2 ;;
+    esac
+fi

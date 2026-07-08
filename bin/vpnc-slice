@@ -26,18 +26,39 @@
 #                               down on disconnect (kill PIDFILE + remove the files).
 set -eu
 
-# The wrapper lives at $PROJ/bin/vpnc-slice, so $PROJ is two dirs up from $0.
-PROJ=$(cd "$(dirname "$0")/.." && pwd)
+# This wrapper always runs as ROOT in production (the vpnc-script under sudo openconnect).
+# $PROJ (two dirs up from $0) locates lib/common.sh + the venv; $RESOLVER_DIR is where the
+# macOS scoped-resolver files live. Both carry test-only overrides (OC_PROJ / RESOLVER_DIR)
+# so the functions can be unit-tested when sourced as the non-root user -- but we IGNORE
+# them when running as root, so nothing on the privileged path (root-sourced common.sh,
+# root-run dnsroute.py, root-written resolver files) can be redirected by a leaked env var,
+# independent of any sudoers env_keep. (Sudo also strips the env; this is defense in depth.)
+if [ "$(id -u)" = 0 ]; then
+    PROJ=$(cd "$(dirname "$0")/.." && pwd)
+    RESOLVER_DIR=/etc/resolver
+else
+    PROJ="${OC_PROJ:-$(cd "$(dirname "$0")/.." && pwd)}"
+    RESOLVER_DIR="${RESOLVER_DIR:-/etc/resolver}"
+fi
 . "$PROJ/lib/common.sh"   # RESOLVER_MARKER (shared with the connect script's sweep)
 
 # Remove the /etc/resolver files that are OURS (marker) AND for THIS proxy's port
 # ($_port). Port-scoping means tearing down one tunnel never deletes another
 # tunnel's resolver files (a second tunnel necessarily uses a different port).
+#
+# With no argument: removes ALL our-port files (teardown / no-proxy paths). With a
+# space-padded " d1 d2 " keep-list ($1): removes only our-port files whose domain is
+# NOT in it -- used on the success path to drop domains a reconnect no longer routes,
+# without disturbing (and momentarily un-resolving) the ones we just (re)wrote.
 _sweep_our_resolvers() {
-    for _rf in /etc/resolver/*; do
+    _keep=${1:-}
+    for _rf in "$RESOLVER_DIR"/*; do
         [ -f "$_rf" ] || continue
         grep -qxF -- "$RESOLVER_MARKER" "$_rf" 2>/dev/null || continue
-        grep -qxF "port $_port" "$_rf" 2>/dev/null || continue
+        grep -qxF -- "port $_port" "$_rf" 2>/dev/null || continue
+        if [ -n "$_keep" ]; then
+            case "$_keep" in *" ${_rf##*/} "*) continue ;; esac  # still current -- keep
+        fi
         rm -f "$_rf" 2>/dev/null || true
     done
 }
@@ -123,16 +144,26 @@ _proxy_connect() {
     fi
     # Guard the pidfile write (|| true): a failed write must not abort the pass.
     echo "$_pid" > "$_pidfile" 2>/dev/null || true
-    [ -d /etc/resolver ] || mkdir -p /etc/resolver 2>/dev/null || true
+    [ -d "$RESOLVER_DIR" ] || mkdir -p "$RESOLVER_DIR" 2>/dev/null || true
     for _d in $_domains; do
         # Marker + port tag the file as ours for this proxy.
         printf '%s\nnameserver 127.0.0.1\nport %s\n' "$RESOLVER_MARKER" "$_port" \
-            > "/etc/resolver/$_d" 2>/dev/null || true
+            > "$RESOLVER_DIR/$_d" 2>/dev/null || true
     done
+    # Drop our-port resolver files for domains no longer in the set (e.g. a reconnect
+    # where @server advertised fewer domains than last time). The current domains were
+    # just (re)written above, so passing them as the keep-list means retained names
+    # never lose their file -- only the dropped ones are removed, no resolution gap.
+    _sweep_our_resolvers " $_domains "
     echo ">> DNS-routing via VPN for:$_domains (127.0.0.1:$_port)" >&2
     rm -f "$_ready" 2>/dev/null || true
 }
 
+# The test harness sources this file to exercise the functions above in isolation;
+# OC_VPNC_SLICE_TEST=1 skips the directive loop + exec so sourcing has no side effects.
+# Guard the body with `if` rather than a top-level `return` (invalid when the script is
+# executed, and a swallowed error under set -e).
+if [ "${OC_VPNC_SLICE_TEST:-}" != 1 ]; then
 while :; do
     case "${1:-}" in
         --dump-env)   # dump the full server-advertised environment to a file
@@ -166,3 +197,4 @@ done
 
 vpn_slice="$1"; shift
 exec "$vpn_slice" "$@"
+fi

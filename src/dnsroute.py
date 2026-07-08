@@ -16,10 +16,14 @@ TCP), forwards the raw query bytes to the first responsive upstream (port 53),
 returns the response verbatim, and only *reads* the response to inject /32|/128
 interface routes -- never the default route, and never an --exclude'd IP (the
 wrapper passes the VPN gateway there: routing the tunnel's own transport peer
-through the tunnel would loop it). Routes are installed *before* the DNS answer
-is returned, so even the client's first packet takes the tunnel. Injected interface routes vanish with
-the utun, so there is no route teardown; a watchdog exits when the device is gone,
-and SIGTERM exits cleanly.
+through the tunnel would loop it). For the first query to reach a fresh IP the route
+is installed *before* that query's answer is returned, so the client's first packet
+takes the tunnel. (A concurrent duplicate query for the same still-in-flight IP is
+answered immediately, without waiting for that route to land -- an accepted trade to
+avoid blocking followers or forking a duplicate route -- so its first packet may briefly
+race out the default interface until the leader's route lands.) Injected interface routes
+vanish with the utun, so there is no route teardown; a watchdog exits when the device is
+gone, and SIGTERM exits cleanly.
 """
 import argparse
 import os
@@ -52,10 +56,14 @@ WATCHDOG_INTERVAL = 15.0
 
 _SEEN = set()                 # IPs we've already added a route for
 _FAILS = {}                   # ip -> monotonic time of last failed route-add (backoff)
+_INFLIGHT = set()             # IPs whose route-add is in progress (lock released, not yet resolved)
 _SEEN_LOCK = threading.Lock()
-RETRY_COOLDOWN = 3.0          # don't re-fork /sbin/route for a failing IP more than
-                              # once per this -- bounds churn WITHOUT ever giving up,
-                              # so a transient bring-up failure still routes later.
+RETRY_COOLDOWN = 3.0          # after a FAILED add, don't re-fork /sbin/route for that IP
+                              # more than once per this -- bounds churn WITHOUT ever
+                              # giving up, so a transient bring-up failure still routes
+                              # later. (Concurrent duplicate forks are prevented by
+                              # _INFLIGHT, not this: the cooldown is shorter than the
+                              # 5s route timeout and is recorded only after the call.)
 # servfail_or_silence backstop: stay silent (let the client retry into success)
 # until we've forwarded at least once (the VPN-DNS route is proven up) OR this many
 # seconds elapse for a tunnel that never comes up; then SERVFAIL fast.
@@ -177,39 +185,47 @@ def _record_failure(ip):
 
 def add_route(ip):
     with _SEEN_LOCK:
-        if ip in _SEEN:
-            return
+        if ip in _SEEN or ip in _INFLIGHT:
+            return               # already routed, or another thread is adding it now
         # Back off after a failure so a hard-to-route IP doesn't re-fork /sbin/route
         # on every lookup -- but NEVER permanently give up, so a transient bring-up
         # failure still routes once the tunnel settles.
         _last = _FAILS.get(ip)
         if _last is not None and (time.monotonic() - _last) < RETRY_COOLDOWN:
             return
-    if ip in EXCLUDES:
-        # Record it so we don't re-log the exclusion on every lookup.
-        _mark_seen(ip)
-        log("not routing %s (excluded: the VPN gateway/transport)" % ip)
-        return
-    if _family(ip) == socket.AF_INET6:
-        cmd = ["/sbin/route", "-n", "add", "-inet6", ip, "-interface", DEV]
-    else:
-        cmd = ["/sbin/route", "-n", "add", "-host", ip, "-interface", DEV]
-    if DRY_RUN:
-        _mark_seen(ip)
-        log(" ".join(cmd))
-        return
+        # Claim the IP BEFORE releasing the lock and forking route: the handler is
+        # threaded, so without this every concurrent lookup for the same fresh (or
+        # still-failing) IP would fork its own /sbin/route. Released in finally.
+        _INFLIGHT.add(ip)
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        _record_failure(ip)
-        log("route add failed for %s: %s (will retry after cooldown)" % (ip, e))
-        return
-    if res.returncode == 0 or "File exists" in (res.stderr or ""):
-        _mark_seen(ip)
-    else:
-        _record_failure(ip)
-        log("route add failed for %s: %s (will retry after cooldown)"
-            % (ip, (res.stderr or "").strip()))
+        if ip in EXCLUDES:
+            # Record it so we don't re-log the exclusion on every lookup.
+            _mark_seen(ip)
+            log("not routing %s (excluded: the VPN gateway/transport)" % ip)
+            return
+        if _family(ip) == socket.AF_INET6:
+            cmd = ["/sbin/route", "-n", "add", "-inet6", ip, "-interface", DEV]
+        else:
+            cmd = ["/sbin/route", "-n", "add", "-host", ip, "-interface", DEV]
+        if DRY_RUN:
+            _mark_seen(ip)
+            log(" ".join(cmd))
+            return
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            _record_failure(ip)
+            log("route add failed for %s: %s (will retry after cooldown)" % (ip, e))
+            return
+        if res.returncode == 0 or "File exists" in (res.stderr or ""):
+            _mark_seen(ip)
+        else:
+            _record_failure(ip)
+            log("route add failed for %s: %s (will retry after cooldown)"
+                % (ip, (res.stderr or "").strip()))
+    finally:
+        with _SEEN_LOCK:
+            _INFLIGHT.discard(ip)
 
 
 def _svcb_hint_ips(item):
@@ -272,7 +288,9 @@ class UDPHandler(socketserver.BaseRequestHandler):
         if resp:
             # Routes go in BEFORE the answer is returned, so the client's very first
             # packet to a fresh IP already flows through the tunnel (answer-then-route
-            # would let it race out the default interface).
+            # would let it race out the default interface). Exception: a concurrent
+            # duplicate query whose IP another thread is already routing (_INFLIGHT)
+            # returns without waiting, so its answer can precede that route.
             inject_routes(resp)
         else:
             resp = servfail_or_silence(data)   # SERVFAIL fast, unless connect window
@@ -296,7 +314,8 @@ class TCPHandler(socketserver.BaseRequestHandler):
             return
         resp = forward_tcp(lp + query)
         if resp:
-            # Same ordering as UDP: route first, then answer.
+            # Same ordering as UDP: route first, then answer (incl. the _INFLIGHT
+            # follower exception noted there).
             if len(resp) >= 2:
                 (rlen,) = struct.unpack("!H", resp[:2])
                 inject_routes(resp[2:2 + rlen])
