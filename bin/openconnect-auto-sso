@@ -16,11 +16,7 @@ while [ -L "$src" ]; do
     case $src in /*) ;; *) src=$dir/$src ;; esac
 done
 PROJ=$(cd "$(dirname "$src")/.." && pwd)
-. "$PROJ/lib/common.sh"   # RESOLVER_MARKER (shared with the root-side wrapper)
-
-# Root-owned teardown helper (installed + scoped-NOPASSWD by install-autostart.sh).
-# Used both to sweep stale resolver files at startup and to disconnect on logout.
-TEARDOWN_BIN=/usr/local/libexec/openconnect-auto-sso/vpn-teardown
+. "$PROJ/lib/common.sh"   # RESOLVER_MARKER, TEARDOWN_BIN (shared with the installer)
 
 # --- load configuration ------------------------------------------------------
 # Precedence: $OC_AUTO_SSO_CONFIG, then the standard external location
@@ -245,17 +241,9 @@ if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUT
     [ "$ROUTE_SPLITS" = "1" ] && vs="$vs -S"          # server split-includes
     [ -n "$SPLIT_ROUTES" ] && vs="$vs $SPLIT_ROUTES"  # your explicit subnets
     set -- "$@" -s "$vs"
-else
-    # Full tunnel (no split/DNS options). Still route through our wrapper -- with
-    # openconnect's OWN default vpnc-script as the exec target -- so the wrapper
-    # records openconnect's PID for a clean teardown on logout. Only when that
-    # default script is found and executable, so we never break routing otherwise
-    # (then openconnect uses the same default directly, just without PID recording).
-    _def=$("$OPENCONNECT" --help 2>&1 | sed -n 's/.*default: "\(.*\)".*/\1/p' | head -1)
-    if [ -n "$_def" ] && [ -x "$_def" ]; then
-        set -- "$@" -s "$(_shq "$PROJ/bin/vpnc-slice") $(_shq "$_def")"
-    fi
 fi
+# Full tunnel (no split/DNS options) needs no -s: openconnect uses its own default
+# vpnc-script. Clean teardown still works -- vpn-teardown finds openconnect by name.
 
 # Optional keepalive: some servers drop an idle tunnel. Ping a host *inside* the
 # VPN periodically so a little traffic keeps flowing. The subshell watches the

@@ -53,7 +53,7 @@ _proxy_domains() {
             for _s in ${CISCO_SPLIT_DNS:-${CISCO_DEF_DOMAIN:-}}; do
                 [ -n "$_s" ] || continue
                 case "$_s" in
-                    *[!A-Za-z0-9.-]*|*..*|.*|-*)
+                    *[!A-Za-z0-9._-]*|*..*|.*|-*)
                         echo ">> ignoring unsafe server-pushed domain: $_s" >&2 ;;
                     *) _domains="$_domains $_s" ;;
                 esac
@@ -79,19 +79,23 @@ _proxy_connect() {
             sleep 0.1; _i=$((_i + 1))
         done
     fi
-    # Clean slate: drop our (this-port) resolver files up front; rewritten below only
-    # if a new proxy binds, so a skipped/failed start never leaves a dead-port file.
-    _sweep_our_resolvers
     _proxy_domains
+    # NOTE: do NOT sweep resolver files up front. On a normal reconnect the old files
+    # (same marker+port) stay valid across the brief kill/rebind gap, so lookups fail
+    # CLOSED (retry into the VPN once the new proxy binds the same port) instead of
+    # falling through to the default resolver -- which would leak a split-brain name
+    # out the default interface. We sweep ONLY when we won't have a working proxy.
 
     # These are unset only if the server pushed no IPv4 DNS / no tun device; guard
     # them (bare refs abort under set -u) and skip DNS-routing rather than crash.
     _up=${INTERNAL_IP4_DNS:-}; _dev=${TUNDEV:-}
     if [ -z "$_up" ] || [ -z "$_dev" ]; then
+        _sweep_our_resolvers   # no proxy coming up -> don't leave dead-port files
         echo ">> no VPN DNS/tun device pushed; DNS-routing disabled for:$_domains" >&2
         return 0
     fi
     if [ -z "$_domains" ]; then
+        _sweep_our_resolvers
         echo ">> no domains to DNS-route (@server advertised none); proxy not started" >&2
         return 0
     fi
@@ -112,6 +116,7 @@ _proxy_connect() {
     if [ ! -f "$_ready" ]; then
         kill "$_pid" 2>/dev/null || true
         rm -f "$_pidfile" 2>/dev/null || true
+        _sweep_our_resolvers   # no working proxy -> remove any dead-port files
         echo "WARNING: DNS-routing proxy failed to bind 127.0.0.1:$_port" \
              "(port busy, invalid, or dnspython missing); DNS-routing disabled." >&2
         return 0
@@ -158,16 +163,6 @@ while :; do
         *) break ;;
     esac
 done
-
-# Record openconnect's own PID (it exports VPNPID to the vpnc-script) to a root-owned
-# file so the privileged vpn-teardown helper can cleanly stop the tunnel on
-# logout/uninstall. Runs for every reason, independent of the directives above.
-case "${reason:-}" in
-    connect|reconnect)
-        [ -n "${VPNPID:-}" ] && printf '%s\n' "$VPNPID" > "$VPNPID_FILE" 2>/dev/null || true ;;
-    disconnect)
-        rm -f "$VPNPID_FILE" 2>/dev/null || true ;;
-esac
 
 vpn_slice="$1"; shift
 exec "$vpn_slice" "$@"

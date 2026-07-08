@@ -15,8 +15,9 @@
 # openconnect runs a vpnc-script (its -s option) as root -- so it can run arbitrary
 # commands as root. Any process running as you can then reach root without a
 # prompt. Enable this only if you accept that trade for hands-off auto-connect.
-# (The teardown helper is deliberately root-owned + self-contained, so its own
-# NOPASSWD grant does NOT widen this -- it can't be pointed at attacker code.)
+# (The teardown helper is deliberately root-owned + self-contained, and install
+# verifies its directory isn't user-writable, so its own NOPASSWD grant does NOT
+# widen this -- it can't be pointed at attacker code.)
 # Undo everything with: ./install-autostart.sh uninstall
 #
 # Usage: ./install-autostart.sh [install [--once] | uninstall | status]
@@ -25,20 +26,30 @@
 set -eu
 
 proj=$(cd "$(dirname "$0")" && pwd)
+. "$proj/lib/common.sh"   # LIBEXEC_DIR, TEARDOWN_BIN (single owner of the paths)
 label="openconnect-auto-sso"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 sudoers="/etc/sudoers.d/openconnect-auto-sso"
 log="$HOME/Library/Logs/openconnect-auto-sso.log"
 connect="$proj/bin/openconnect-auto-sso"
-libexecdir="/usr/local/libexec/openconnect-auto-sso"
+libexecdir="$LIBEXEC_DIR"
+teardown_bin="$TEARDOWN_BIN"
 teardown_src="$proj/libexec/vpn-teardown"
-teardown_bin="$libexecdir/vpn-teardown"
-vpnpid="/var/run/openconnect-auto-sso.vpnpid"
 uid=$(id -u)
 user=$(id -un)
 
 find_bin() { command -v "$1" 2>/dev/null; }
 xml_escape() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
+
+# True if $1 is a safe home for a NOPASSWD-granted root binary: root-owned and NOT
+# group/other-writable. A helper in a user-writable dir could be swapped for arbitrary
+# root code, hijacking the grant -- so we verify the install path before trusting it.
+dir_is_safe() {
+    _st=$(stat -f '%u %Sp' "$1" 2>/dev/null) || return 1
+    [ "${_st%% *}" = 0 ] || return 1                          # root-owned?
+    case "${_st#* }" in ?????w*|????????w*) return 1 ;; esac  # group/other writable?
+    return 0
+}
 
 do_install() {
     [ -x "$connect" ] || { echo "error: $connect not found/executable" >&2; exit 1; }
@@ -52,6 +63,28 @@ do_install() {
     fi
     oc=$(find_bin openconnect) || { echo "error: openconnect not on PATH" >&2; exit 1; }
     [ -f "$teardown_src" ] || { echo "error: $teardown_src missing" >&2; exit 1; }
+
+    # The teardown helper gets a NOPASSWD rule, so its directory must be root-owned and
+    # not user-writable -- else it could be swapped for attacker code, hijacking the
+    # grant. Verify the install path and its existing ancestors before trusting it.
+    for _d in /usr/local "$libexecdir"; do
+        if [ -e "$_d" ] && ! dir_is_safe "$_d"; then
+            echo "error: $_d is not root-owned or is group/other-writable; refusing to" >&2
+            echo "       install a passwordless-root helper under it." >&2
+            exit 1
+        fi
+    done
+
+    # Propagate a custom config location to the agent, so it resolves the SAME config
+    # this precheck validates (the agent otherwise gets only PATH+HOME -> could resolve
+    # a different, missing config and fail-loop).
+    _cfg_env=""
+    for _v in OC_AUTO_SSO_CONFIG XDG_CONFIG_HOME; do
+        eval "_val=\${$_v:-}"
+        [ -n "$_val" ] && _cfg_env="$_cfg_env
+        <key>$_v</key>
+        <string>$(xml_escape "$_val")</string>"
+    done
 
     # launchd's default PATH is minimal (no Homebrew); the tool needs openconnect /
     # uv / vpn-slice. Build a PATH covering wherever they live.
@@ -96,7 +129,7 @@ do_install() {
         <key>PATH</key>
         <string>$(xml_escape "$apath")</string>
         <key>HOME</key>
-        <string>$(xml_escape "$HOME")</string>
+        <string>$(xml_escape "$HOME")</string>$_cfg_env
     </dict>
     <key>StandardOutPath</key>
     <string>$(xml_escape "$log")</string>
@@ -118,23 +151,24 @@ PLIST
         [ "$_did_plist" = y ] && rm -f "$plist" 2>/dev/null || true
         [ "$_did_sudoers" = y ] && sudo rm -f "$sudoers" 2>/dev/null || true
         [ "$_did_libexec" = y ] && sudo rm -rf "$libexecdir" 2>/dev/null || true
-        rm -f "$ptmp" 2>/dev/null || true
+        rm -f "$ptmp" "${stmp:-}" 2>/dev/null || true
     ' EXIT
 
     echo ">> installing the root teardown helper + sudoers rule (password once)..."
     # Root-owned teardown helper -- so its NOPASSWD grant can't be hijacked by
     # editing a user-writable file. Install it BEFORE the rule that references it.
     sudo install -d -o root -g wheel -m 0755 "$libexecdir"
+    _did_libexec=y     # created the dir -> roll it back even if the copy below fails
     sudo install -o root -g wheel -m 0755 "$teardown_src" "$teardown_bin"
-    _did_libexec=y
     echo "   $teardown_bin"
 
     # Two scoped NOPASSWD lines: openconnect (bring the tunnel up) and the teardown
-    # helper (stop it cleanly on logout/uninstall).
+    # helper (stop it cleanly on logout/uninstall). The teardown line pins its args to
+    # the two intended forms, so a future flag/bug isn't auto-exposed to callers.
     stmp=$(mktemp)
     printf '# openconnect-auto-sso: passwordless sudo for the tunnel (up + teardown).\n' > "$stmp"
     printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$oc" >> "$stmp"
-    printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$teardown_bin" >> "$stmp"
+    printf '%s ALL=(root) NOPASSWD: %s "", %s --sweep\n' "$user" "$teardown_bin" "$teardown_bin" >> "$stmp"
     if ! sudo visudo -cf "$stmp" >/dev/null 2>&1; then
         echo "error: sudoers syntax check failed; not installing" >&2
         rm -f "$stmp"; exit 1
@@ -164,20 +198,22 @@ PLIST
 }
 
 do_uninstall() {
-    # Cleanly stop a running tunnel via the helper FIRST (while its NOPASSWD rule
-    # still exists), so uninstall doesn't strand a root openconnect. Do this before
-    # bootout so the agent's KeepAlive can't relaunch a fresh connect in the gap.
+    # Stop the AGENT first so its KeepAlive can't relaunch a fresh connect: bootout
+    # sends the connect script SIGTERM, whose trap disconnects the tunnel cleanly via
+    # the helper (its NOPASSWD rule is still present). Then a belt-and-suspenders
+    # teardown catches any tunnel the trap didn't (e.g. a manual connect) BEFORE we
+    # remove the helper + rule. (Doing teardown first would let KeepAlive relaunch in
+    # the gap before bootout.)
+    launchctl bootout "gui/$uid/$label" 2>/dev/null \
+        || launchctl unload "$plist" 2>/dev/null || true
     if [ -x "$teardown_bin" ]; then
         echo ">> stopping any running tunnel (clean disconnect)..."
         sudo "$teardown_bin" 2>/dev/null || true
     fi
-    launchctl bootout "gui/$uid/$label" 2>/dev/null \
-        || launchctl unload "$plist" 2>/dev/null || true
     if [ -f "$plist" ]; then rm -f "$plist" && echo "removed $plist"; fi
     if [ -e "$libexecdir" ]; then
         sudo rm -rf "$libexecdir" && echo "removed $libexecdir" || true
     fi
-    sudo rm -f "$vpnpid" 2>/dev/null || true
     if [ -f "$sudoers" ]; then
         echo ">> removing sudoers rule (asks for your password)..."
         # Check the removal explicitly: a failed `sudo rm` in an `&&` chain would be
@@ -204,7 +240,8 @@ do_status() {
     fi
     [ -f "$sudoers" ] && echo "sudoers:     $sudoers (present)" || echo "sudoers:     (not installed)"
     [ -x "$teardown_bin" ] && echo "teardown:    $teardown_bin (present)" || echo "teardown:    (not installed)"
-    [ -f "$vpnpid" ] && echo "tunnel pid:  $(cat "$vpnpid" 2>/dev/null) (connected)" || echo "tunnel pid:  (not connected)"
+    _tp=$(pgrep -x openconnect 2>/dev/null | tr '\n' ' ')
+    [ -n "$_tp" ] && echo "tunnel:      openconnect $_tp (connected)" || echo "tunnel:      (not connected)"
     [ -f "$log" ] && echo "log:         $log" || echo "log:         (none yet) $log"
 }
 

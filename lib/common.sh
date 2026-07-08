@@ -7,9 +7,8 @@
 # match). Writer and sweeper MUST agree, so it is defined only here.
 RESOLVER_MARKER='# openconnect-auto-sso'
 
-# Root-owned file holding the running openconnect's PID (its VPNPID, recorded by
-# the wrapper on connect). The privileged vpn-teardown helper reads it to stop the
-# tunnel cleanly on logout/uninstall. NOTE: libexec/vpn-teardown hardcodes this
-# same literal -- it must NOT source this (user-writable) file while running as
-# root -- so keep the two in sync.
-VPNPID_FILE='/var/run/openconnect-auto-sso.vpnpid'
+# Where install-autostart.sh installs the root-owned teardown helper, and where the
+# connect script + installer reference it. Single owner so the connect script's
+# invocation, the installer's copy, and the sudoers rule can't drift apart.
+LIBEXEC_DIR='/usr/local/libexec/openconnect-auto-sso'
+TEARDOWN_BIN="$LIBEXEC_DIR/vpn-teardown"
