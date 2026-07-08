@@ -3,9 +3,10 @@
 
 Started as root by the vpnc-slice wrapper on connect. macOS `/etc/resolver/<name>`
 files point selected domains at `127.0.0.1:<port>`; this proxy forwards each query
-to the VPN's own DNS server(s) and, for every A/AAAA answer, adds a host route out
-the tunnel device -- so a name scoped to the VPN is not just resolved via the VPN
-but actually *reachable* over it, even when it load-balances across rotating IPs.
+to the VPN's own DNS server(s) and, for every A/AAAA answer (plus the ipv4hint/
+ipv6hint addresses in HTTPS/SVCB records), adds a host route out the tunnel device
+-- so a name scoped to the VPN is not just resolved via the VPN but actually
+*reachable* over it, even when it load-balances across rotating IPs.
 
     dnsroute.py --upstream "IP[,| IP]..." --dev TUNDEV --port P \
                 [--exclude "IP..."] [--dry-run]
@@ -85,13 +86,21 @@ def forward_udp(query):
     for up in UPSTREAMS:
         try:
             with socket.socket(_family(up), socket.SOCK_DGRAM) as s:
-                s.settimeout(TIMEOUT)
                 s.connect((up, 53))
                 s.send(query)
-                resp = s.recv(65535)
-                if resp[:2] == qid:
-                    return resp
-                # txid mismatch: a stray/duplicate packet -- ignore, try next.
+                # Read until a reply whose transaction ID matches ours, draining any
+                # stray/duplicate/out-of-order datagram rather than abandoning the
+                # upstream on the first mismatch. Bounded by TIMEOUT total so a flood
+                # of wrong-txid packets can't hang the query.
+                end = time.monotonic() + TIMEOUT
+                while True:
+                    remaining = end - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    s.settimeout(remaining)
+                    resp = s.recv(65535)
+                    if resp[:2] == qid:
+                        return resp
         except OSError:
             continue
     return None
@@ -241,20 +250,16 @@ class UDPHandler(socketserver.BaseRequestHandler):
     def handle(self):
         data, sock = self.request
         resp = forward_udp(data)
-        if not resp:
-            # All upstreams down: reply SERVFAIL so the client fails fast instead
-            # of hanging and retrying against our silence.
+        if resp:
+            # Routes go in BEFORE the answer is returned, so the client's very first
+            # packet to a fresh IP already flows through the tunnel (answer-then-route
+            # would let it race out the default interface).
+            inject_routes(resp)
+        else:
+            # All upstreams down: SERVFAIL so the client fails fast, not on silence.
             resp = servfail(data)
-            if resp:
-                try:
-                    sock.sendto(resp, self.client_address)
-                except OSError:
-                    pass
+        if not resp:
             return
-        # Routes go in BEFORE the answer is returned, so the client's very
-        # first packet to a fresh IP already flows through the tunnel
-        # (answer-then-route would let it race out the default interface).
-        inject_routes(resp)
         try:
             sock.sendto(resp, self.client_address)
         except OSError:
@@ -272,19 +277,17 @@ class TCPHandler(socketserver.BaseRequestHandler):
         if query is None:
             return
         resp = forward_tcp(lp + query)
-        if not resp:
+        if resp:
+            # Same ordering as UDP: route first, then answer.
+            if len(resp) >= 2:
+                (rlen,) = struct.unpack("!H", resp[:2])
+                inject_routes(resp[2:2 + rlen])
+        else:
             # All upstreams down: SERVFAIL (length-prefixed) so the client fails fast.
             sf = servfail(query)
-            if sf:
-                try:
-                    sock.sendall(struct.pack("!H", len(sf)) + sf)
-                except OSError:
-                    pass
+            resp = struct.pack("!H", len(sf)) + sf if sf else None
+        if not resp:
             return
-        # Same ordering as UDP: route first, then answer.
-        if len(resp) >= 2:
-            (rlen,) = struct.unpack("!H", resp[:2])
-            inject_routes(resp[2:2 + rlen])
         try:
             sock.sendall(resp)
         except OSError:

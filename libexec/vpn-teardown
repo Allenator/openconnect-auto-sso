@@ -4,19 +4,41 @@
 # install-autostart.sh copies this to a ROOT-OWNED path
 # (/usr/local/libexec/openconnect-auto-sso/vpn-teardown, root:wheel 0755) and grants
 # it a scoped NOPASSWD sudoers rule, so the user-domain connect script can trigger a
-# clean disconnect on logout/uninstall WITHOUT being able to run arbitrary code as
+# clean disconnect / heal stale state WITHOUT being able to run arbitrary code as
 # root (unlike NOPASSWD on openconnect itself). For that boundary to hold this helper
-# must stay SELF-CONTAINED: it reads only a root-owned pidfile and never sources or
-# executes any user-writable file.
+# must stay SELF-CONTAINED: it reads only root-owned/OS state and never sources or
+# executes any user-writable file, and it only ever removes files that carry our
+# own marker.
 #
-# openconnect runs as root and, on SIGTERM, runs its disconnect vpnc-script pass
-# (restoring routes/DNS, removing /etc/resolver files, stopping dnsroute). We send
-# that signal to the recorded PID and wait for it to finish.
+# Modes:
+#   (default)   stop the running tunnel: SIGTERM the recorded openconnect PID so it
+#               runs its own disconnect vpnc-script pass (restore routes/DNS, remove
+#               /etc/resolver files, stop dnsroute), then wait for it to exit.
+#   --sweep     heal after a crash/hard-kill that skipped that disconnect pass:
+#               remove our leftover /etc/resolver files so a stale one can't block
+#               the next connect's DNS. No-op if a tunnel is currently up.
 set -eu
 
-# Must match lib/common.sh VPNPID_FILE (hardcoded here because a root helper must
-# not source the user-writable lib/common.sh).
+# Must match lib/common.sh VPNPID_FILE and RESOLVER_MARKER (hardcoded here because a
+# root helper must not source the user-writable lib/common.sh).
 PIDFILE=/var/run/openconnect-auto-sso.vpnpid
+MARKER='# openconnect-auto-sso'
+
+do_sweep() {
+    # Only when nothing is connected -- never yank a live tunnel's resolver files.
+    pgrep -x openconnect >/dev/null 2>&1 && return 0
+    for _rf in /etc/resolver/*; do
+        [ -f "$_rf" ] || continue
+        IFS= read -r _first < "$_rf" 2>/dev/null || continue
+        [ "$_first" = "$MARKER" ] && rm -f "$_rf" 2>/dev/null || true
+    done
+}
+
+case "${1:-}" in
+    --sweep) do_sweep; exit 0 ;;
+    '')      ;;                              # default: stop the tunnel
+    *)       echo "usage: vpn-teardown [--sweep]" >&2; exit 2 ;;
+esac
 
 [ -f "$PIDFILE" ] || exit 0                       # not connected: nothing to do
 pid=$(cat "$PIDFILE" 2>/dev/null || true)

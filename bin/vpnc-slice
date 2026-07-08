@@ -58,32 +58,30 @@ while :; do
             esac ;;
         --proxy)      # DNS-driven auto-routing via the loopback dnsroute proxy
             _names="$2"; _port="$3"; _pidfile="$4"; shift 4
-            # Expand @server -> the server-advertised domains; build a space-
-            # separated list of the concrete names to resolve via the VPN.
-            # Build the concrete domain list. Names from $_names (the config) were
-            # already validated by loadconfig, but @server expands to domains the
-            # SERVER pushes (CISCO_SPLIT_DNS) -- untrusted input that becomes an
-            # /etc/resolver/<name> path written as root. Reject any that isn't a
-            # plain DNS name so a hostile server can't traverse out of /etc/resolver.
-            _domains=""
-            _oldifs=$IFS; IFS=,
-            for _n in $_names; do
-                if [ "$_n" = "@server" ]; then
-                    for _s in ${CISCO_SPLIT_DNS:-${CISCO_DEF_DOMAIN:-}}; do
-                        [ -n "$_s" ] || continue
-                        case "$_s" in
-                            *[!A-Za-z0-9.-]*|*..*|.*|-*)
-                                echo ">> ignoring unsafe server-pushed domain: $_s" >&2 ;;
-                            *) _domains="$_domains $_s" ;;
-                        esac
-                    done
-                else
-                    [ -n "$_n" ] && _domains="$_domains $_n"
-                fi
-            done
-            IFS=$_oldifs
             case "${reason:-}" in
                 connect|reconnect)
+                    # Expand @server -> the SERVER-pushed domains (CISCO_SPLIT_DNS) and
+                    # build the concrete name list. @server input is untrusted, so
+                    # reject any that isn't a plain DNS label before it becomes an
+                    # /etc/resolver/<name> path written as root. (Built only here --
+                    # disconnect tears down by marker+port, not by name.)
+                    _domains=""
+                    _oldifs=$IFS; IFS=,
+                    for _n in $_names; do
+                        if [ "$_n" = "@server" ]; then
+                            for _s in ${CISCO_SPLIT_DNS:-${CISCO_DEF_DOMAIN:-}}; do
+                                [ -n "$_s" ] || continue
+                                case "$_s" in
+                                    *[!A-Za-z0-9.-]*|*..*|.*|-*)
+                                        echo ">> ignoring unsafe server-pushed domain: $_s" >&2 ;;
+                                    *) _domains="$_domains $_s" ;;
+                                esac
+                            done
+                        else
+                            [ -n "$_n" ] && _domains="$_domains $_n"
+                        fi
+                    done
+                    IFS=$_oldifs
                     # Kill any previous proxy and WAIT for it to release the port
                     # before rebinding -- a straight kill-then-bind races EADDRINUSE
                     # and the new proxy would die silently (SO_REUSEADDR doesn't

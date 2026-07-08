@@ -18,6 +18,10 @@ done
 PROJ=$(cd "$(dirname "$src")/.." && pwd)
 . "$PROJ/lib/common.sh"   # RESOLVER_MARKER (shared with the root-side wrapper)
 
+# Root-owned teardown helper (installed + scoped-NOPASSWD by install-autostart.sh).
+# Used both to sweep stale resolver files at startup and to disconnect on logout.
+TEARDOWN_BIN=/usr/local/libexec/openconnect-auto-sso/vpn-teardown
+
 # --- load configuration ------------------------------------------------------
 # Precedence: $OC_AUTO_SSO_CONFIG, then the standard external location
 # ~/.config/openconnect-auto-sso/config.toml, then an in-repo config.toml (dev only).
@@ -124,9 +128,17 @@ if [ -n "$_leftover" ]; then
         for _f in $_leftover; do echo "    $_f" >&2; done
         echo "  They point those domains at a proxy that is no longer running, so" >&2
         echo "  lookups under them fail -- and can break this connect." >&2
-        # Default Yes (unlike the pf guard): the marker proves they're ours, no
-        # openconnect is running, and keeping them breaks DNS machine-wide.
-        _offer_sudo_fix "Remove them now" y "sudo rm$_leftover" _rm_resolver_leftovers
+        if [ ! -t 0 ] && [ -x "$TEARDOWN_BIN" ]; then
+            # Non-interactive (e.g. under the LaunchAgent): can't prompt, and this
+            # user-domain sweep can't sudo-rm root-owned files. Delegate to the
+            # root-owned teardown helper (scoped NOPASSWD) to heal them.
+            sudo -n "$TEARDOWN_BIN" --sweep 2>/dev/null && echo "  swept via teardown helper." >&2 \
+                || echo "  Clean later:  sudo rm$_leftover" >&2
+        else
+            # Default Yes (unlike the pf guard): the marker proves they're ours, no
+            # openconnect is running, and keeping them breaks DNS machine-wide.
+            _offer_sudo_fix "Remove them now" y "sudo rm$_leftover" _rm_resolver_leftovers
+        fi
     fi
 fi
 
@@ -171,7 +183,6 @@ pkill -f "$PROJ/src/vpn_browser.py" 2>/dev/null || true
 # privileged teardown helper (installed root-owned + scoped-NOPASSWD by
 # install-autostart.sh) to SIGTERM openconnect for a clean disconnect. `sudo -n`
 # never prompts: if the helper/rule isn't present it fails fast and we just exit.
-TEARDOWN_BIN=/usr/local/libexec/openconnect-auto-sso/vpn-teardown
 if [ -t 2 ]; then
     trap - INT TERM
 else
@@ -213,16 +224,19 @@ if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUT
     # token can use the VPN's pushed CISCO_SPLIT_DNS/CISCO_DEF_DOMAIN/INTERNAL_IP4_DNS
     # (sudo strips our env, so the wrapper's config is baked into this -s string).
     # openconnect runs this whole -s string via `/bin/sh -c`, which re-splits it on
-    # spaces, so PATH-valued fields are single-quoted to survive a space in $PROJ or
-    # $TMPDIR. The unquoted fields (PROXY_NAMES/PROXY_PORT/SPLIT_ROUTES) are validated
-    # by loadconfig to contain no spaces or shell metacharacters.
-    vs="'$PROJ/bin/vpnc-slice'"
-    [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env '$OC_DUMP'"        # diagnostic env dump
-    [ "$KEEPALIVE_HOST" = "@dns" ] && vs="$vs --write-dns '$KA_DNS_FILE'"  # keepalive target
+    # spaces, so PATH-valued fields are single-quoted (_shq) to survive a space -- or
+    # an apostrophe -- in $PROJ or $TMPDIR. The unquoted fields (PROXY_NAMES/
+    # PROXY_PORT/SPLIT_ROUTES) are validated by loadconfig to contain no spaces or
+    # shell metacharacters.
+    # _shq: emit $1 as a safely single-quoted shell word (embedded ' -> '\'').
+    _shq() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
+    vs="$(_shq "$PROJ/bin/vpnc-slice")"
+    [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env $(_shq "$OC_DUMP")"        # diagnostic env dump
+    [ "$KEEPALIVE_HOST" = "@dns" ] && vs="$vs --write-dns $(_shq "$KA_DNS_FILE")"  # keepalive target
     # DNS-driven auto-routing: resolve these names via the VPN's DNS and route each
     # answered IP through the tunnel (handled by the wrapper + src/dnsroute.py).
-    [ -n "$PROXY_NAMES" ] && vs="$vs --proxy $PROXY_NAMES $PROXY_PORT '$PROXY_PIDFILE'"
-    vs="$vs '$VPN_SLICE'"
+    [ -n "$PROXY_NAMES" ] && vs="$vs --proxy $PROXY_NAMES $PROXY_PORT $(_shq "$PROXY_PIDFILE")"
+    vs="$vs $(_shq "$VPN_SLICE")"
     # ALLOW_INCOMING=1 drops vpn-slice's pf firewall (keeps iCloud Private Relay working).
     [ "$ALLOW_INCOMING" = "1" ] && vs="$vs -i"
     # Dynamic routes pushed by the VPN (no need to hardcode them):
