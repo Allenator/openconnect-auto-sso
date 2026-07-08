@@ -42,6 +42,92 @@ _sweep_our_resolvers() {
     done
 }
 
+# Build $_domains (space-separated) from $_names (comma list). @server expands to the
+# SERVER-pushed domains (CISCO_SPLIT_DNS) -- untrusted -- so reject any that isn't a
+# plain DNS label before it becomes an /etc/resolver/<name> path written as root.
+_proxy_domains() {
+    _domains=""
+    _oldifs=$IFS; IFS=,
+    for _n in $_names; do
+        if [ "$_n" = "@server" ]; then
+            for _s in ${CISCO_SPLIT_DNS:-${CISCO_DEF_DOMAIN:-}}; do
+                [ -n "$_s" ] || continue
+                case "$_s" in
+                    *[!A-Za-z0-9.-]*|*..*|.*|-*)
+                        echo ">> ignoring unsafe server-pushed domain: $_s" >&2 ;;
+                    *) _domains="$_domains $_s" ;;
+                esac
+            done
+        else
+            [ -n "$_n" ] && _domains="$_domains $_n"
+        fi
+    done
+    IFS=$_oldifs
+}
+
+# Bring up the DNS-routing proxy on connect|reconnect (uses $_names/$_port/$_pidfile).
+# Guard clauses keep it flat; always returns 0 (never abort the vpnc-script pass).
+_proxy_connect() {
+    # Replace any previous proxy: kill it and WAIT for the port to free up -- a
+    # straight kill-then-bind races EADDRINUSE (SO_REUSEADDR doesn't reliably cover a
+    # still-open UDP bind).
+    if [ -f "$_pidfile" ]; then
+        _old=$(cat "$_pidfile" 2>/dev/null || true)
+        [ -n "$_old" ] && kill "$_old" 2>/dev/null || true
+        _i=0
+        while [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null && [ "$_i" -lt 30 ]; do
+            sleep 0.1; _i=$((_i + 1))
+        done
+    fi
+    # Clean slate: drop our (this-port) resolver files up front; rewritten below only
+    # if a new proxy binds, so a skipped/failed start never leaves a dead-port file.
+    _sweep_our_resolvers
+    _proxy_domains
+
+    # These are unset only if the server pushed no IPv4 DNS / no tun device; guard
+    # them (bare refs abort under set -u) and skip DNS-routing rather than crash.
+    _up=${INTERNAL_IP4_DNS:-}; _dev=${TUNDEV:-}
+    if [ -z "$_up" ] || [ -z "$_dev" ]; then
+        echo ">> no VPN DNS/tun device pushed; DNS-routing disabled for:$_domains" >&2
+        return 0
+    fi
+    if [ -z "$_domains" ]; then
+        echo ">> no domains to DNS-route (@server advertised none); proxy not started" >&2
+        return 0
+    fi
+
+    # Start the proxy and wait for its readiness signal (both sockets bound) before
+    # pointing /etc/resolver at it -- "process still alive" can't tell bound from
+    # still-importing. --exclude keeps the VPN gateway's own IP off the tunnel.
+    _ready="$_pidfile.ready"; rm -f "$_ready" 2>/dev/null || true
+    nohup "$PROJ/.venv/bin/python" "$PROJ/src/dnsroute.py" \
+        --upstream "$_up" --dev "$_dev" --port "$_port" \
+        --exclude "${VPNGATEWAY:-}" --ready-file "$_ready" \
+        >/dev/null 2>&1 &
+    _pid=$!
+    _i=0
+    while [ ! -f "$_ready" ] && kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 50 ]; do
+        sleep 0.1; _i=$((_i + 1))
+    done
+    if [ ! -f "$_ready" ]; then
+        kill "$_pid" 2>/dev/null || true
+        rm -f "$_pidfile" 2>/dev/null || true
+        echo "WARNING: DNS-routing proxy failed to bind 127.0.0.1:$_port" \
+             "(port busy, invalid, or dnspython missing); DNS-routing disabled." >&2
+        return 0
+    fi
+    # Guard the pidfile write (|| true): a failed write must not abort the pass.
+    echo "$_pid" > "$_pidfile" 2>/dev/null || true
+    [ -d /etc/resolver ] || mkdir -p /etc/resolver 2>/dev/null || true
+    for _d in $_domains; do
+        # Marker + port tag the file as ours for this proxy.
+        printf '%s\nnameserver 127.0.0.1\nport %s\n' "$RESOLVER_MARKER" "$_port" \
+            > "/etc/resolver/$_d" 2>/dev/null || true
+    done
+    echo ">> DNS-routing via VPN for:$_domains (127.0.0.1:$_port)" >&2
+    rm -f "$_ready" 2>/dev/null || true
+}
+
 while :; do
     case "${1:-}" in
         --dump-env)   # dump the full server-advertised environment to a file
@@ -59,88 +145,7 @@ while :; do
         --proxy)      # DNS-driven auto-routing via the loopback dnsroute proxy
             _names="$2"; _port="$3"; _pidfile="$4"; shift 4
             case "${reason:-}" in
-                connect|reconnect)
-                    # Expand @server -> the SERVER-pushed domains (CISCO_SPLIT_DNS) and
-                    # build the concrete name list. @server input is untrusted, so
-                    # reject any that isn't a plain DNS label before it becomes an
-                    # /etc/resolver/<name> path written as root. (Built only here --
-                    # disconnect tears down by marker+port, not by name.)
-                    _domains=""
-                    _oldifs=$IFS; IFS=,
-                    for _n in $_names; do
-                        if [ "$_n" = "@server" ]; then
-                            for _s in ${CISCO_SPLIT_DNS:-${CISCO_DEF_DOMAIN:-}}; do
-                                [ -n "$_s" ] || continue
-                                case "$_s" in
-                                    *[!A-Za-z0-9.-]*|*..*|.*|-*)
-                                        echo ">> ignoring unsafe server-pushed domain: $_s" >&2 ;;
-                                    *) _domains="$_domains $_s" ;;
-                                esac
-                            done
-                        else
-                            [ -n "$_n" ] && _domains="$_domains $_n"
-                        fi
-                    done
-                    IFS=$_oldifs
-                    # Kill any previous proxy and WAIT for it to release the port
-                    # before rebinding -- a straight kill-then-bind races EADDRINUSE
-                    # and the new proxy would die silently (SO_REUSEADDR doesn't
-                    # reliably cover a still-open UDP bind).
-                    if [ -f "$_pidfile" ]; then
-                        _old=$(cat "$_pidfile" 2>/dev/null || true)
-                        [ -n "$_old" ] && kill "$_old" 2>/dev/null || true
-                        _i=0
-                        while [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null && [ "$_i" -lt 30 ]; do
-                            sleep 0.1; _i=$((_i + 1))
-                        done
-                    fi
-                    # Clean slate: drop our (this-port) resolver files up front. They
-                    # are rewritten below ONLY if a new proxy actually binds, so a
-                    # skipped or failed start never leaves files aimed at a dead port.
-                    _sweep_our_resolvers
-                    # These are only unset if the server pushed no IPv4 DNS / no tun
-                    # device; guard them (bare refs would abort under set -u) and skip
-                    # DNS-routing rather than crash the whole vpnc-script pass.
-                    _up=${INTERNAL_IP4_DNS:-}; _dev=${TUNDEV:-}
-                    if [ -z "$_up" ] || [ -z "$_dev" ]; then
-                        echo ">> no VPN DNS/tun device pushed; DNS-routing disabled for:$_domains" >&2
-                    elif [ -z "$_domains" ]; then
-                        echo ">> no domains to DNS-route (@server advertised none); proxy not started" >&2
-                    else
-                        # Start the proxy and wait for its readiness signal (both
-                        # sockets bound) before pointing /etc/resolver at it. A mere
-                        # "process still alive" check can't tell bound from still-
-                        # importing, so it could wire DNS to a not-yet/never-bound port.
-                        # --exclude keeps the VPN gateway's own IP off the tunnel.
-                        _ready="$_pidfile.ready"; rm -f "$_ready" 2>/dev/null || true
-                        nohup "$PROJ/.venv/bin/python" "$PROJ/src/dnsroute.py" \
-                            --upstream "$_up" --dev "$_dev" --port "$_port" \
-                            --exclude "${VPNGATEWAY:-}" --ready-file "$_ready" \
-                            >/dev/null 2>&1 &
-                        _pid=$!
-                        _i=0
-                        while [ ! -f "$_ready" ] && kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 50 ]; do
-                            sleep 0.1; _i=$((_i + 1))
-                        done
-                        if [ -f "$_ready" ]; then
-                            # Guard the pidfile write (|| true): a failed write must not
-                            # abort the whole vpnc-script pass before it execs vpn-slice.
-                            echo "$_pid" > "$_pidfile" 2>/dev/null || true
-                            [ -d /etc/resolver ] || mkdir -p /etc/resolver 2>/dev/null || true
-                            for _d in $_domains; do
-                                # Marker + port tag the file as ours for this proxy.
-                                printf '%s\nnameserver 127.0.0.1\nport %s\n' "$RESOLVER_MARKER" "$_port" \
-                                    > "/etc/resolver/$_d" 2>/dev/null || true
-                            done
-                            echo ">> DNS-routing via VPN for:$_domains (127.0.0.1:$_port)" >&2
-                        else
-                            kill "$_pid" 2>/dev/null || true
-                            rm -f "$_pidfile" 2>/dev/null || true
-                            echo "WARNING: DNS-routing proxy failed to bind 127.0.0.1:$_port" \
-                                 "(port busy, invalid, or dnspython missing); DNS-routing disabled." >&2
-                        fi
-                        rm -f "$_ready" 2>/dev/null || true
-                    fi ;;
+                connect|reconnect) _proxy_connect ;;
                 disconnect)
                     [ -f "$_pidfile" ] && kill "$(cat "$_pidfile")" 2>/dev/null || true
                     rm -f "$_pidfile" 2>/dev/null || true

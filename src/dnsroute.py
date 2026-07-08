@@ -54,6 +54,10 @@ _SEEN = set()                 # IPs we've already added a route for (or given up
 _FAILS = {}                   # ip -> consecutive failed route-add attempts
 _SEEN_LOCK = threading.Lock()
 MAX_ROUTE_ATTEMPTS = 3        # after this many failures, stop retrying an IP
+GRACE_SECONDS = 5.0           # after startup, stay silent (not SERVFAIL) on all-
+                              # upstreams-down -- the connect window before the route
+                              # to the VPN DNS is up; measured from process start.
+_START = time.monotonic()
 
 
 def log(msg):
@@ -136,6 +140,16 @@ def servfail(query):
         return resp.to_wire()
     except Exception:
         return None
+
+
+def servfail_or_silence(query):
+    """All upstreams are unreachable. In the first few seconds (the connect window,
+    before the route to the VPN DNS is installed) stay SILENT so the client's stub
+    resolver retries into success once it's up; after the grace, SERVFAIL to fail
+    fast on a genuine outage instead of hanging every lookup."""
+    if time.monotonic() - _START < GRACE_SECONDS:
+        return None
+    return servfail(query)
 
 
 # --- route injection ---------------------------------------------------------
@@ -256,8 +270,7 @@ class UDPHandler(socketserver.BaseRequestHandler):
             # would let it race out the default interface).
             inject_routes(resp)
         else:
-            # All upstreams down: SERVFAIL so the client fails fast, not on silence.
-            resp = servfail(data)
+            resp = servfail_or_silence(data)   # SERVFAIL fast, unless connect window
         if not resp:
             return
         try:
@@ -283,8 +296,7 @@ class TCPHandler(socketserver.BaseRequestHandler):
                 (rlen,) = struct.unpack("!H", resp[:2])
                 inject_routes(resp[2:2 + rlen])
         else:
-            # All upstreams down: SERVFAIL (length-prefixed) so the client fails fast.
-            sf = servfail(query)
+            sf = servfail_or_silence(query)    # SERVFAIL fast, unless connect window
             resp = struct.pack("!H", len(sf)) + sf if sf else None
         if not resp:
             return

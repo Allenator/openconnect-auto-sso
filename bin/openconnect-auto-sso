@@ -205,6 +205,9 @@ fi
 set -- --cookie-on-stdin --servercert "$FINGERPRINT"
 [ -n "$RESOLVE" ] && set -- "$@" --resolve "$RESOLVE"
 [ -n "$PROTOCOL" ] && set -- "$@" --protocol="$PROTOCOL"
+# _shq: emit $1 as a safely single-quoted shell word (embedded ' -> '\''), so a
+# space or apostrophe in a path survives openconnect re-parsing the -s string via sh.
+_shq() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
 if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUTE_SPLITS" = "1" ]; then
     # root's PATH usually excludes Homebrew, so resolve vpn-slice to an abs path.
     VPN_SLICE=$(command -v vpn-slice || true)
@@ -228,8 +231,6 @@ if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUT
     # an apostrophe -- in $PROJ or $TMPDIR. The unquoted fields (PROXY_NAMES/
     # PROXY_PORT/SPLIT_ROUTES) are validated by loadconfig to contain no spaces or
     # shell metacharacters.
-    # _shq: emit $1 as a safely single-quoted shell word (embedded ' -> '\'').
-    _shq() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
     vs="$(_shq "$PROJ/bin/vpnc-slice")"
     [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env $(_shq "$OC_DUMP")"        # diagnostic env dump
     [ "$KEEPALIVE_HOST" = "@dns" ] && vs="$vs --write-dns $(_shq "$KA_DNS_FILE")"  # keepalive target
@@ -244,6 +245,16 @@ if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUT
     [ "$ROUTE_SPLITS" = "1" ] && vs="$vs -S"          # server split-includes
     [ -n "$SPLIT_ROUTES" ] && vs="$vs $SPLIT_ROUTES"  # your explicit subnets
     set -- "$@" -s "$vs"
+else
+    # Full tunnel (no split/DNS options). Still route through our wrapper -- with
+    # openconnect's OWN default vpnc-script as the exec target -- so the wrapper
+    # records openconnect's PID for a clean teardown on logout. Only when that
+    # default script is found and executable, so we never break routing otherwise
+    # (then openconnect uses the same default directly, just without PID recording).
+    _def=$("$OPENCONNECT" --help 2>&1 | sed -n 's/.*default: "\(.*\)".*/\1/p' | head -1)
+    if [ -n "$_def" ] && [ -x "$_def" ]; then
+        set -- "$@" -s "$(_shq "$PROJ/bin/vpnc-slice") $(_shq "$_def")"
+    fi
 fi
 
 # Optional keepalive: some servers drop an idle tunnel. Ping a host *inside* the
