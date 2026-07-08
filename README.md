@@ -178,6 +178,32 @@ pf). `allow_incoming = true` avoids creating it in the first place.
 youruser ALL=(root) NOPASSWD: /opt/homebrew/bin/openconnect
 ```
 
+## Start automatically at login
+
+To bring the tunnel up at login and keep it up, `install-autostart.sh` installs a
+per-user **LaunchAgent** plus the NOPASSWD `sudoers` rule the agent needs (a launchd
+job has no terminal to type a password into):
+
+```sh
+./install-autostart.sh install     # asks for your password once, for the sudoers file
+./install-autostart.sh status      # loaded? last exit code?
+./install-autostart.sh uninstall   # remove the agent + the sudoers rule
+tail -f ~/Library/Logs/openconnect-auto-sso.log
+```
+
+The agent runs in your GUI session (`Aqua`), so a **warm** cookie connects silently
+while a **cold** one still pops the SSO window at login. It reconnects if the tunnel
+drops (throttled to once a minute). To connect at login but *not* auto-reconnect, set
+`KeepAlive` to `false` in `~/Library/LaunchAgents/openconnect-auto-sso.plist` and
+re-run `uninstall` then `install`.
+
+> **Security.** That `sudoers` rule grants passwordless `sudo openconnect`, and
+> openconnect can run arbitrary commands as root via its `-s` vpnc-script option — so
+> it is effectively passwordless root for any process running as you. That is the price
+> of unattended auto-connect; `uninstall` removes it. Prefer to keep the prompt? Skip
+> this and connect manually (see *Skip the sudo prompt* above for the narrower variant
+> that still asks nothing but connects on demand).
+
 ## Security notes
 
 - **The browser is never root.** Phase 1 runs as you; only Phase 2 (the tunnel) uses
