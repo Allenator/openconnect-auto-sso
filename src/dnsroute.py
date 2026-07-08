@@ -50,14 +50,18 @@ DRY_RUN = False     # log route commands instead of running them
 TIMEOUT = 3.0       # per-upstream forward timeout (seconds)
 WATCHDOG_INTERVAL = 15.0
 
-_SEEN = set()                 # IPs we've already added a route for (or given up on)
-_FAILS = {}                   # ip -> consecutive failed route-add attempts
+_SEEN = set()                 # IPs we've already added a route for
+_FAILS = {}                   # ip -> monotonic time of last failed route-add (backoff)
 _SEEN_LOCK = threading.Lock()
-MAX_ROUTE_ATTEMPTS = 3        # after this many failures, stop retrying an IP
-GRACE_SECONDS = 5.0           # after startup, stay silent (not SERVFAIL) on all-
-                              # upstreams-down -- the connect window before the route
-                              # to the VPN DNS is up; measured from process start.
+RETRY_COOLDOWN = 3.0          # don't re-fork /sbin/route for a failing IP more than
+                              # once per this -- bounds churn WITHOUT ever giving up,
+                              # so a transient bring-up failure still routes later.
+# servfail_or_silence backstop: stay silent (let the client retry into success)
+# until we've forwarded at least once (the VPN-DNS route is proven up) OR this many
+# seconds elapse for a tunnel that never comes up; then SERVFAIL fast.
+GRACE_SECONDS = 15.0
 _START = time.monotonic()
+_EVER_FORWARDED = False        # set once any upstream reply is returned
 
 
 def log(msg):
@@ -84,6 +88,11 @@ def _recv_exact(sock, n):
 # our query: connect() the socket (the kernel then drops datagrams from any other
 # source) and require the response transaction ID to match the query's. A fresh
 # ephemeral socket per query means there's no cross-query contamination either.
+def _mark_forwarded():
+    global _EVER_FORWARDED
+    _EVER_FORWARDED = True    # simple bool store; GIL-atomic, no lock needed
+
+
 def forward_udp(query):
     """Send a bare DNS query to the first responsive upstream; return its reply."""
     qid = query[:2]
@@ -104,6 +113,7 @@ def forward_udp(query):
                     s.settimeout(remaining)
                     resp = s.recv(65535)
                     if resp[:2] == qid:
+                        _mark_forwarded()
                         return resp
         except OSError:
             continue
@@ -126,6 +136,7 @@ def forward_tcp(raw):
                 body = _recv_exact(s, rlen)
                 if body is None or body[:2] != qid:
                     continue
+                _mark_forwarded()
                 return lp + body
         except OSError:
             continue
@@ -143,11 +154,11 @@ def servfail(query):
 
 
 def servfail_or_silence(query):
-    """All upstreams are unreachable. In the first few seconds (the connect window,
-    before the route to the VPN DNS is installed) stay SILENT so the client's stub
-    resolver retries into success once it's up; after the grace, SERVFAIL to fail
-    fast on a genuine outage instead of hanging every lookup."""
-    if time.monotonic() - _START < GRACE_SECONDS:
+    """All upstreams are unreachable. Until we've EVER forwarded a reply (the VPN-DNS
+    route is proven up) -- or the backstop window elapses for a tunnel that never
+    comes up -- stay SILENT so the client's stub resolver retries into success. After
+    that, SERVFAIL to fail fast on a genuine outage instead of hanging every lookup."""
+    if not _EVER_FORWARDED and (time.monotonic() - _START) < GRACE_SECONDS:
         return None
     return servfail(query)
 
@@ -156,28 +167,23 @@ def servfail_or_silence(query):
 def _mark_seen(ip):
     with _SEEN_LOCK:
         _SEEN.add(ip)
+        _FAILS.pop(ip, None)      # a routed IP has no pending failure
 
 
-def _note_failure(ip):
-    """Record a failed route add; give up (return True) after MAX_ROUTE_ATTEMPTS.
-
-    Bounds retries so a permanently-unroutable answer IP doesn't re-fork /sbin/route
-    on every single lookup (route injection runs before the reply, so an unbounded
-    retry would delay every DNS answer for that name forever). Transient failures
-    (tunnel not fully up yet) still get a few retries before we stop.
-    """
+def _record_failure(ip):
     with _SEEN_LOCK:
-        n = _FAILS.get(ip, 0) + 1
-        _FAILS[ip] = n
-        if n >= MAX_ROUTE_ATTEMPTS:
-            _SEEN.add(ip)     # give up: treat as handled so we stop retrying
-            return True
-    return False
+        _FAILS[ip] = time.monotonic()
 
 
 def add_route(ip):
     with _SEEN_LOCK:
         if ip in _SEEN:
+            return
+        # Back off after a failure so a hard-to-route IP doesn't re-fork /sbin/route
+        # on every lookup -- but NEVER permanently give up, so a transient bring-up
+        # failure still routes once the tunnel settles.
+        _last = _FAILS.get(ip)
+        if _last is not None and (time.monotonic() - _last) < RETRY_COOLDOWN:
             return
     if ip in EXCLUDES:
         # Record it so we don't re-log the exclusion on every lookup.
@@ -195,16 +201,15 @@ def add_route(ip):
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired) as e:
-        # A transient failure (e.g. tunnel not fully up yet) should retry on the
-        # next lookup, but bound it so a permanent failure doesn't retry forever.
-        _tail = "giving up" if _note_failure(ip) else "will retry"
-        log("route add failed for %s: %s (%s)" % (ip, e, _tail))
+        _record_failure(ip)
+        log("route add failed for %s: %s (will retry after cooldown)" % (ip, e))
         return
     if res.returncode == 0 or "File exists" in (res.stderr or ""):
         _mark_seen(ip)
     else:
-        _tail = "giving up" if _note_failure(ip) else "will retry"
-        log("route add failed for %s: %s (%s)" % (ip, (res.stderr or "").strip(), _tail))
+        _record_failure(ip)
+        log("route add failed for %s: %s (will retry after cooldown)"
+            % (ip, (res.stderr or "").strip()))
 
 
 def _svcb_hint_ips(item):
