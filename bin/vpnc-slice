@@ -30,6 +30,18 @@ set -eu
 PROJ=$(cd "$(dirname "$0")/.." && pwd)
 . "$PROJ/lib/common.sh"   # RESOLVER_MARKER (shared with the connect script's sweep)
 
+# Remove the /etc/resolver files that are OURS (marker) AND for THIS proxy's port
+# ($_port). Port-scoping means tearing down one tunnel never deletes another
+# tunnel's resolver files (a second tunnel necessarily uses a different port).
+_sweep_our_resolvers() {
+    for _rf in /etc/resolver/*; do
+        [ -f "$_rf" ] || continue
+        grep -qxF -- "$RESOLVER_MARKER" "$_rf" 2>/dev/null || continue
+        grep -qxF "port $_port" "$_rf" 2>/dev/null || continue
+        rm -f "$_rf" 2>/dev/null || true
+    done
+}
+
 while :; do
     case "${1:-}" in
         --dump-env)   # dump the full server-advertised environment to a file
@@ -79,11 +91,15 @@ while :; do
                     if [ -f "$_pidfile" ]; then
                         _old=$(cat "$_pidfile" 2>/dev/null || true)
                         [ -n "$_old" ] && kill "$_old" 2>/dev/null || true
-                        _n=0
-                        while [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null && [ "$_n" -lt 30 ]; do
-                            sleep 0.1; _n=$((_n + 1))
+                        _i=0
+                        while [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null && [ "$_i" -lt 30 ]; do
+                            sleep 0.1; _i=$((_i + 1))
                         done
                     fi
+                    # Clean slate: drop our (this-port) resolver files up front. They
+                    # are rewritten below ONLY if a new proxy actually binds, so a
+                    # skipped or failed start never leaves files aimed at a dead port.
+                    _sweep_our_resolvers
                     # These are only unset if the server pushed no IPv4 DNS / no tun
                     # device; guard them (bare refs would abort under set -u) and skip
                     # DNS-routing rather than crash the whole vpnc-script pass.
@@ -93,45 +109,48 @@ while :; do
                     elif [ -z "$_domains" ]; then
                         echo ">> no domains to DNS-route (@server advertised none); proxy not started" >&2
                     else
-                        # Start the proxy FIRST, confirm it actually came up, and only
-                        # THEN point /etc/resolver at it -- so a proxy that dies on
-                        # startup (bad port, missing dnspython, lost bind race) never
-                        # leaves resolver files aimed at a dead port. --exclude keeps
-                        # the VPN gateway's own IP off the tunnel (it carries it).
+                        # Start the proxy and wait for its readiness signal (both
+                        # sockets bound) before pointing /etc/resolver at it. A mere
+                        # "process still alive" check can't tell bound from still-
+                        # importing, so it could wire DNS to a not-yet/never-bound port.
+                        # --exclude keeps the VPN gateway's own IP off the tunnel.
+                        _ready="$_pidfile.ready"; rm -f "$_ready" 2>/dev/null || true
                         nohup "$PROJ/.venv/bin/python" "$PROJ/src/dnsroute.py" \
                             --upstream "$_up" --dev "$_dev" --port "$_port" \
-                            --exclude "${VPNGATEWAY:-}" \
+                            --exclude "${VPNGATEWAY:-}" --ready-file "$_ready" \
                             >/dev/null 2>&1 &
                         _pid=$!
-                        sleep 0.3
-                        if kill -0 "$_pid" 2>/dev/null; then
-                            echo "$_pid" > "$_pidfile"
+                        _i=0
+                        while [ ! -f "$_ready" ] && kill -0 "$_pid" 2>/dev/null && [ "$_i" -lt 50 ]; do
+                            sleep 0.1; _i=$((_i + 1))
+                        done
+                        if [ -f "$_ready" ]; then
+                            # Guard the pidfile write (|| true): a failed write must not
+                            # abort the whole vpnc-script pass before it execs vpn-slice.
+                            echo "$_pid" > "$_pidfile" 2>/dev/null || true
                             [ -d /etc/resolver ] || mkdir -p /etc/resolver 2>/dev/null || true
                             for _d in $_domains; do
-                                # Marker tags the file as ours for the startup sweep.
+                                # Marker + port tag the file as ours for this proxy.
                                 printf '%s\nnameserver 127.0.0.1\nport %s\n' "$RESOLVER_MARKER" "$_port" \
                                     > "/etc/resolver/$_d" 2>/dev/null || true
                             done
                             echo ">> DNS-routing via VPN for:$_domains (127.0.0.1:$_port)" >&2
                         else
+                            kill "$_pid" 2>/dev/null || true
                             rm -f "$_pidfile" 2>/dev/null || true
-                            echo "WARNING: DNS-routing proxy failed to start (port $_port busy," \
-                                 "invalid, or dnspython missing); DNS-routing disabled." >&2
+                            echo "WARNING: DNS-routing proxy failed to bind 127.0.0.1:$_port" \
+                                 "(port busy, invalid, or dnspython missing); DNS-routing disabled." >&2
                         fi
+                        rm -f "$_ready" 2>/dev/null || true
                     fi ;;
                 disconnect)
                     [ -f "$_pidfile" ] && kill "$(cat "$_pidfile")" 2>/dev/null || true
                     rm -f "$_pidfile" 2>/dev/null || true
-                    # Remove OUR resolver files by marker -- the same authority the
-                    # connect script's startup sweep uses -- rather than re-deriving
-                    # domain names from a server env that may differ or be absent on
-                    # the disconnect pass (which would leak @server files pointing at
-                    # the now-dead proxy).
-                    for _f in /etc/resolver/*; do
-                        [ -f "$_f" ] || continue
-                        grep -qxF -- "$RESOLVER_MARKER" "$_f" 2>/dev/null \
-                            && rm -f "$_f" 2>/dev/null || true
-                    done ;;
+                    # Remove our resolver files by marker+port (see _sweep_our_resolvers)
+                    # rather than re-deriving domain names from a server env that may
+                    # differ/be absent now -- and scoped to this port so a second
+                    # tunnel's files are left intact.
+                    _sweep_our_resolvers ;;
             esac ;;
         *) break ;;
     esac

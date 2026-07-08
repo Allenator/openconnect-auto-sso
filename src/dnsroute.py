@@ -49,8 +49,10 @@ DRY_RUN = False     # log route commands instead of running them
 TIMEOUT = 3.0       # per-upstream forward timeout (seconds)
 WATCHDOG_INTERVAL = 15.0
 
-_SEEN = set()                 # IPs we've already added a route for
+_SEEN = set()                 # IPs we've already added a route for (or given up on)
+_FAILS = {}                   # ip -> consecutive failed route-add attempts
 _SEEN_LOCK = threading.Lock()
+MAX_ROUTE_ATTEMPTS = 3        # after this many failures, stop retrying an IP
 
 
 def log(msg):
@@ -133,6 +135,23 @@ def _mark_seen(ip):
         _SEEN.add(ip)
 
 
+def _note_failure(ip):
+    """Record a failed route add; give up (return True) after MAX_ROUTE_ATTEMPTS.
+
+    Bounds retries so a permanently-unroutable answer IP doesn't re-fork /sbin/route
+    on every single lookup (route injection runs before the reply, so an unbounded
+    retry would delay every DNS answer for that name forever). Transient failures
+    (tunnel not fully up yet) still get a few retries before we stop.
+    """
+    with _SEEN_LOCK:
+        n = _FAILS.get(ip, 0) + 1
+        _FAILS[ip] = n
+        if n >= MAX_ROUTE_ATTEMPTS:
+            _SEEN.add(ip)     # give up: treat as handled so we stop retrying
+            return True
+    return False
+
+
 def add_route(ip):
     with _SEEN_LOCK:
         if ip in _SEEN:
@@ -153,14 +172,16 @@ def add_route(ip):
     try:
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired) as e:
-        # Don't mark _SEEN: a transient failure (e.g. tunnel not fully up yet)
-        # must be retried on the next lookup, not cached as permanently handled.
-        log("route add failed for %s: %s (will retry)" % (ip, e))
+        # A transient failure (e.g. tunnel not fully up yet) should retry on the
+        # next lookup, but bound it so a permanent failure doesn't retry forever.
+        _tail = "giving up" if _note_failure(ip) else "will retry"
+        log("route add failed for %s: %s (%s)" % (ip, e, _tail))
         return
     if res.returncode == 0 or "File exists" in (res.stderr or ""):
         _mark_seen(ip)
     else:
-        log("route add failed for %s: %s (will retry)" % (ip, (res.stderr or "").strip()))
+        _tail = "giving up" if _note_failure(ip) else "will retry"
+        log("route add failed for %s: %s (%s)" % (ip, (res.stderr or "").strip(), _tail))
 
 
 def _svcb_hint_ips(item):
@@ -300,6 +321,9 @@ def main(argv):
     ap.add_argument("--exclude", default="",
                     help="IP(s) never to route via the tunnel (the VPN gateway); "
                          "comma/whitespace separated, may be empty")
+    ap.add_argument("--ready-file", default="",
+                    help="create this file once both sockets are bound (a readiness "
+                         "signal the wrapper waits for before wiring /etc/resolver)")
     ap.add_argument("--dry-run", action="store_true",
                     help="log route commands instead of running them")
     args = ap.parse_args(argv[1:])
@@ -324,6 +348,14 @@ def main(argv):
 
     threading.Thread(target=udp.serve_forever, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
+    # Both sockets are now bound (and listening); signal readiness so the wrapper
+    # only points /etc/resolver at us after the port is actually up.
+    if args.ready_file:
+        try:
+            with open(args.ready_file, "w") as fh:
+                fh.write("ready\n")
+        except OSError as e:
+            log("could not write ready-file %s: %s" % (args.ready_file, e))
     try:
         tcp.serve_forever()
     except KeyboardInterrupt:
