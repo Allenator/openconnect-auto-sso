@@ -75,14 +75,17 @@ def is_ip_or_cidr(entry):
         return False
 
 
-# A DNS name (RFC 1123 host/domain): dot-separated labels of letters/digits/hyphen,
-# each 1-63 chars, no leading/trailing hyphen, total <= 253. This is deliberately
-# strict: a via_vpn name becomes an /etc/resolver/<name> path written as root AND is
-# expanded (unquoted) into the vpnc-script -s string that openconnect runs via
-# `/bin/sh -c` as root -- so anything outside this set (shell metacharacters, '/',
-# '..', spaces) must never get through. Rejecting it here is the single gate.
-_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-_HOSTNAME_RE = re.compile(r"^%s(?:\.%s)*$" % (_LABEL, _LABEL))
+# A DNS name usable as an /etc/resolver/<name>: dot-separated labels of letters/
+# digits/hyphen/underscore, each 1-63 chars, no leading/trailing hyphen, total
+# <= 253. Underscore labels (_dmarc, _kerberos._tcp, my_service) are legal DNS
+# (RFC 2181) and common in corporate zones, so they must be accepted. It stays
+# strict enough that a via_vpn name -- which becomes a root-written /etc/resolver
+# path AND is expanded (unquoted) into the vpnc-script -s string that openconnect
+# runs via `/bin/sh -c` as root -- can never carry a shell metacharacter, '/',
+# '..', or a space (none of [A-Za-z0-9._-] is dangerous there). `\Z` (not `$`)
+# so a trailing newline can't sneak past. Callers strip a trailing FQDN dot first.
+_LABEL = r"[A-Za-z0-9_](?:[A-Za-z0-9_-]{0,61}[A-Za-z0-9_])?"
+_HOSTNAME_RE = re.compile(r"\A%s(?:\.%s)*\Z" % (_LABEL, _LABEL))
 
 
 def is_hostname(entry):
@@ -103,6 +106,10 @@ def classify_via_vpn(val):
         entry = raw.strip()
         if not entry:
             continue
+        # Accept a trailing-dot FQDN (e.g. copied from `dig`); /etc/resolver wants
+        # the dot-less form. Only strip a single trailing dot, and not from a token.
+        if len(entry) > 1 and entry.endswith(".") and not entry.startswith("@"):
+            entry = entry[:-1]
         if entry == "@server":
             proxy_names.append(entry)      # a token; the wrapper expands it at connect
         elif entry == "@internal":
