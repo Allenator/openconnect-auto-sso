@@ -1,16 +1,22 @@
 #!/bin/sh
 # install-autostart.sh -- connect the VPN automatically at login (opt-in).
 #
-# Separate from ./install.sh. Installs two pieces:
+# Separate from ./install.sh. Installs three pieces:
 #   1. a per-user LaunchAgent (~/Library/LaunchAgents/openconnect-auto-sso.plist)
 #      that runs the connect script at login and reconnects if the tunnel drops;
-#   2. a NOPASSWD sudoers drop-in (/etc/sudoers.d/openconnect-auto-sso) so Phase 2's
-#      `sudo openconnect` never prompts -- a LaunchAgent has no TTY to type into.
+#   2. a root-owned teardown helper (/usr/local/libexec/openconnect-auto-sso/
+#      vpn-teardown) that cleanly stops the tunnel on logout/uninstall -- the agent
+#      runs as you and can't signal the root openconnect directly;
+#   3. a NOPASSWD sudoers drop-in (/etc/sudoers.d/openconnect-auto-sso) so Phase 2's
+#      `sudo openconnect` and the teardown helper never prompt (a LaunchAgent has no
+#      TTY to type into).
 #
 # SECURITY: NOPASSWD on openconnect is effectively passwordless root, because
 # openconnect runs a vpnc-script (its -s option) as root -- so it can run arbitrary
 # commands as root. Any process running as you can then reach root without a
 # prompt. Enable this only if you accept that trade for hands-off auto-connect.
+# (The teardown helper is deliberately root-owned + self-contained, so its own
+# NOPASSWD grant does NOT widen this -- it can't be pointed at attacker code.)
 # Undo everything with: ./install-autostart.sh uninstall
 #
 # Usage: ./install-autostart.sh [install [--once] | uninstall | status]
@@ -24,6 +30,10 @@ plist="$HOME/Library/LaunchAgents/$label.plist"
 sudoers="/etc/sudoers.d/openconnect-auto-sso"
 log="$HOME/Library/Logs/openconnect-auto-sso.log"
 connect="$proj/bin/openconnect-auto-sso"
+libexecdir="/usr/local/libexec/openconnect-auto-sso"
+teardown_src="$proj/libexec/vpn-teardown"
+teardown_bin="$libexecdir/vpn-teardown"
+vpnpid="/var/run/openconnect-auto-sso.vpnpid"
 uid=$(id -u)
 user=$(id -un)
 
@@ -41,6 +51,7 @@ do_install() {
         exit 1
     fi
     oc=$(find_bin openconnect) || { echo "error: openconnect not on PATH" >&2; exit 1; }
+    [ -f "$teardown_src" ] || { echo "error: $teardown_src missing" >&2; exit 1; }
 
     # launchd's default PATH is minimal (no Homebrew); the tool needs openconnect /
     # uv / vpn-slice. Build a PATH covering wherever they live.
@@ -102,17 +113,28 @@ PLIST
 
     # Privileged step. Roll back BOTH the sudoers file and the plist if anything
     # below fails, so a partial install never leaves passwordless root with no agent.
-    _did_sudoers=n; _did_plist=n
+    _did_sudoers=n; _did_plist=n; _did_libexec=n
     trap '
         [ "$_did_plist" = y ] && rm -f "$plist" 2>/dev/null || true
         [ "$_did_sudoers" = y ] && sudo rm -f "$sudoers" 2>/dev/null || true
+        [ "$_did_libexec" = y ] && sudo rm -rf "$libexecdir" 2>/dev/null || true
         rm -f "$ptmp" 2>/dev/null || true
     ' EXIT
 
-    echo ">> installing sudoers rule (asks for your password once)..."
+    echo ">> installing the root teardown helper + sudoers rule (password once)..."
+    # Root-owned teardown helper -- so its NOPASSWD grant can't be hijacked by
+    # editing a user-writable file. Install it BEFORE the rule that references it.
+    sudo install -d -o root -g wheel -m 0755 "$libexecdir"
+    sudo install -o root -g wheel -m 0755 "$teardown_src" "$teardown_bin"
+    _did_libexec=y
+    echo "   $teardown_bin"
+
+    # Two scoped NOPASSWD lines: openconnect (bring the tunnel up) and the teardown
+    # helper (stop it cleanly on logout/uninstall).
     stmp=$(mktemp)
-    printf '# openconnect-auto-sso: passwordless sudo for the VPN tunnel (Phase 2).\n' > "$stmp"
+    printf '# openconnect-auto-sso: passwordless sudo for the tunnel (up + teardown).\n' > "$stmp"
     printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$oc" >> "$stmp"
+    printf '%s ALL=(root) NOPASSWD: %s\n' "$user" "$teardown_bin" >> "$stmp"
     if ! sudo visudo -cf "$stmp" >/dev/null 2>&1; then
         echo "error: sudoers syntax check failed; not installing" >&2
         rm -f "$stmp"; exit 1
@@ -142,9 +164,20 @@ PLIST
 }
 
 do_uninstall() {
+    # Cleanly stop a running tunnel via the helper FIRST (while its NOPASSWD rule
+    # still exists), so uninstall doesn't strand a root openconnect. Do this before
+    # bootout so the agent's KeepAlive can't relaunch a fresh connect in the gap.
+    if [ -x "$teardown_bin" ]; then
+        echo ">> stopping any running tunnel (clean disconnect)..."
+        sudo "$teardown_bin" 2>/dev/null || true
+    fi
     launchctl bootout "gui/$uid/$label" 2>/dev/null \
         || launchctl unload "$plist" 2>/dev/null || true
     if [ -f "$plist" ]; then rm -f "$plist" && echo "removed $plist"; fi
+    if [ -e "$libexecdir" ]; then
+        sudo rm -rf "$libexecdir" && echo "removed $libexecdir" || true
+    fi
+    sudo rm -f "$vpnpid" 2>/dev/null || true
     if [ -f "$sudoers" ]; then
         echo ">> removing sudoers rule (asks for your password)..."
         # Check the removal explicitly: a failed `sudo rm` in an `&&` chain would be
@@ -157,7 +190,7 @@ do_uninstall() {
             exit 1
         fi
     fi
-    echo ">> done. A tunnel that is currently up keeps running until it next exits."
+    echo ">> done."
 }
 
 do_status() {
@@ -170,6 +203,8 @@ do_status() {
         echo "  loaded: no"
     fi
     [ -f "$sudoers" ] && echo "sudoers:     $sudoers (present)" || echo "sudoers:     (not installed)"
+    [ -x "$teardown_bin" ] && echo "teardown:    $teardown_bin (present)" || echo "teardown:    (not installed)"
+    [ -f "$vpnpid" ] && echo "tunnel pid:  $(cat "$vpnpid" 2>/dev/null) (connected)" || echo "tunnel pid:  (not connected)"
     [ -f "$log" ] && echo "log:         $log" || echo "log:         (none yet) $log"
 }
 

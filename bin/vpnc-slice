@@ -156,5 +156,15 @@ while :; do
     esac
 done
 
+# Record openconnect's own PID (it exports VPNPID to the vpnc-script) to a root-owned
+# file so the privileged vpn-teardown helper can cleanly stop the tunnel on
+# logout/uninstall. Runs for every reason, independent of the directives above.
+case "${reason:-}" in
+    connect|reconnect)
+        [ -n "${VPNPID:-}" ] && printf '%s\n' "$VPNPID" > "$VPNPID_FILE" 2>/dev/null || true ;;
+    disconnect)
+        rm -f "$VPNPID_FILE" 2>/dev/null || true ;;
+esac
+
 vpn_slice="$1"; shift
 exec "$vpn_slice" "$@"

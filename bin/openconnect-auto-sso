@@ -163,7 +163,20 @@ auth_out=$(authenticate) || { echo "error: authentication failed" >&2; exit 1; }
 # SSO server-side (no localhost callback), so the helper cannot self-close -- end
 # it here. (It flushes cookies to disk every few seconds, so nothing is lost.)
 pkill -f "$PROJ/src/vpn_browser.py" 2>/dev/null || true
-trap - INT TERM   # from here, let Phase 2 handle Ctrl-C for a clean disconnect
+
+# Phase 2 signal handling. In a terminal, Ctrl-C reaches the root openconnect child
+# directly via the foreground process group, so we clear our trap and let openconnect
+# run its own clean disconnect. Under launchd there is no controlling tty, so the
+# signal reaches only this (user) script and not the root child -- so invoke the
+# privileged teardown helper (installed root-owned + scoped-NOPASSWD by
+# install-autostart.sh) to SIGTERM openconnect for a clean disconnect. `sudo -n`
+# never prompts: if the helper/rule isn't present it fails fast and we just exit.
+TEARDOWN_BIN=/usr/local/libexec/openconnect-auto-sso/vpn-teardown
+if [ -t 2 ]; then
+    trap - INT TERM
+else
+    trap '[ -x "$TEARDOWN_BIN" ] && sudo -n "$TEARDOWN_BIN" 2>/dev/null; exit 143' INT TERM
+fi
 
 eval "$auth_out"   # sets COOKIE / HOST / CONNECT_URL / FINGERPRINT / RESOLVE
 

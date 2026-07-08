@@ -181,8 +181,8 @@ youruser ALL=(root) NOPASSWD: /opt/homebrew/bin/openconnect
 ## Start automatically at login
 
 To bring the tunnel up at login and keep it up, `install-autostart.sh` installs a
-per-user **LaunchAgent** plus the NOPASSWD `sudoers` rule the agent needs (a launchd
-job has no terminal to type a password into):
+per-user **LaunchAgent**, a small **root-owned teardown helper**, and the NOPASSWD
+`sudoers` rule they need (a launchd job has no terminal to type a password into):
 
 Run `./install.sh` first so a config exists — `install` refuses to load an agent that
 would just fail-loop with no config.
@@ -201,12 +201,22 @@ the tunnel drops (throttled). Note that a *persistent* failure — no network, o
 SSO login you keep dismissing — also retries on that throttle, re-popping the login;
 use `--once` (or `uninstall`) if that's not what you want.
 
-> **Security.** That `sudoers` rule grants passwordless `sudo openconnect`, and
+Because the agent runs as you but the tunnel runs as root, it can't signal openconnect
+directly. The teardown helper closes that gap: on **logout** the connect script calls
+it (via a scoped NOPASSWD rule) to send openconnect a clean disconnect, and `uninstall`
+stops a running tunnel the same way before removing anything — so neither strands a root
+tunnel with leftover routes/DNS. (If openconnect is ever `SIGKILL`ed instead — e.g. a
+crash — that clean path is skipped; a stray `/etc/resolver/<name>` can then block the
+next connect until you `sudo rm` it, which the startup sweep points out.)
+
+> **Security.** The `sudoers` rule grants passwordless `sudo openconnect`, and
 > openconnect can run arbitrary commands as root via its `-s` vpnc-script option — so
 > it is effectively passwordless root for any process running as you. That is the price
-> of unattended auto-connect; `uninstall` removes it. Prefer to keep the prompt? Skip
-> this and connect manually (see *Skip the sudo prompt* above for the narrower variant
-> that still asks nothing but connects on demand).
+> of unattended auto-connect; `uninstall` removes it. (The second NOPASSWD entry, for
+> the teardown helper, does **not** widen this: the helper is root-owned and
+> self-contained — it only signals the recorded openconnect PID, so it can't be pointed
+> at attacker code the way a user-writable script could.) Prefer to keep the prompt?
+> Skip this and connect manually (see *Skip the sudo prompt* above).
 
 ## Security notes
 
