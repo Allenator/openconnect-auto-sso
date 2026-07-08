@@ -184,18 +184,22 @@ To bring the tunnel up at login and keep it up, `install-autostart.sh` installs 
 per-user **LaunchAgent** plus the NOPASSWD `sudoers` rule the agent needs (a launchd
 job has no terminal to type a password into):
 
+Run `./install.sh` first so a config exists — `install` refuses to load an agent that
+would just fail-loop with no config.
+
 ```sh
-./install-autostart.sh install     # asks for your password once, for the sudoers file
-./install-autostart.sh status      # loaded? last exit code?
-./install-autostart.sh uninstall   # remove the agent + the sudoers rule
+./install-autostart.sh install         # connect at login + reconnect on drop
+./install-autostart.sh install --once  # connect once at login, no auto-reconnect
+./install-autostart.sh status          # loaded? last exit code?
+./install-autostart.sh uninstall       # remove the agent + the sudoers rule
 tail -f ~/Library/Logs/openconnect-auto-sso.log
 ```
 
 The agent runs in your GUI session (`Aqua`), so a **warm** cookie connects silently
-while a **cold** one still pops the SSO window at login. It reconnects if the tunnel
-drops (throttled to once a minute). To connect at login but *not* auto-reconnect, set
-`KeepAlive` to `false` in `~/Library/LaunchAgents/openconnect-auto-sso.plist` and
-re-run `uninstall` then `install`.
+while a **cold** one still pops the SSO window at login. By default it reconnects if
+the tunnel drops (throttled). Note that a *persistent* failure — no network, or an
+SSO login you keep dismissing — also retries on that throttle, re-popping the login;
+use `--once` (or `uninstall`) if that's not what you want.
 
 > **Security.** That `sudoers` rule grants passwordless `sudo openconnect`, and
 > openconnect can run arbitrary commands as root via its `-s` vpnc-script option — so

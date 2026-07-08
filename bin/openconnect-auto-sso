@@ -130,14 +130,22 @@ if [ -n "$_leftover" ]; then
     fi
 fi
 
+# Resolve openconnect to an absolute path and use it for BOTH phases. Phase 2 runs
+# it via sudo; passing the absolute path makes the NOPASSWD sudoers drop-in from
+# install-autostart.sh (which pins openconnect's absolute path) match
+# deterministically -- independent of sudo's secure_path / the invoking PATH, which
+# a bare `sudo openconnect` would depend on.
+OPENCONNECT=$(command -v openconnect || true)
+[ -n "$OPENCONNECT" ] || { echo "error: openconnect not found on PATH" >&2; exit 1; }
+
 # --- Phase 1: authenticate as the current user (no sudo, no root browser) ----
 echo ">> authenticating to $SERVER" >&2
 authenticate() {
     if [ -n "$PROTOCOL" ]; then
-        openconnect --protocol="$PROTOCOL" \
+        "$OPENCONNECT" --protocol="$PROTOCOL" \
             --external-browser="$PROJ/bin/vpn-browser" --authenticate "$SERVER"
     else
-        openconnect \
+        "$OPENCONNECT" \
             --external-browser="$PROJ/bin/vpn-browser" --authenticate "$SERVER"
     fi
 }
@@ -247,4 +255,4 @@ trap '
 ' EXIT
 
 echo ">> connecting tunnel (sudo)" >&2
-printf '%s' "$COOKIE" | sudo openconnect "$@" "$CONNECT_URL"
+printf '%s' "$COOKIE" | sudo "$OPENCONNECT" "$@" "$CONNECT_URL"
