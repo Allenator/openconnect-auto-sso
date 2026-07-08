@@ -55,7 +55,10 @@ ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (serve
 ROUTE_SPLITS="${ROUTE_SPLITS:-0}"       # also add the server's split-include subnets
 PROXY_PORT="${PROXY_PORT:-45353}"       # loopback port for the DNS-routing proxy
 KA_DNS_FILE="${TMPDIR:-/tmp}/openconnect-auto-sso.dns.$$"     # keepalive @dns target
-PROXY_PIDFILE="${TMPDIR:-/tmp}/openconnect-auto-sso.proxy.$$" # DNS-routing proxy PID
+# The proxy PID file drives a ROOT kill in the wrapper (it SIGTERMs the pid it holds),
+# so it lives in root-only /var/run: a user-writable TMPDIR path would let the tunnel's
+# own user seed a victim PID for root to signal. The wrapper (root) writes it.
+PROXY_PIDFILE="/var/run/openconnect-auto-sso.proxy.$$"       # DNS-routing proxy PID
 
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
@@ -179,7 +182,9 @@ pkill -f "$PROJ/src/vpn_browser.py" 2>/dev/null || true
 # privileged teardown helper (installed root-owned + scoped-NOPASSWD by
 # install-autostart.sh) to SIGTERM openconnect for a clean disconnect. `sudo -n`
 # never prompts: if the helper/rule isn't present it fails fast and we just exit.
-if [ -t 2 ]; then
+# Test stdin (matches the startup sweep's `[ ! -t 0 ]`), so a manual run with only
+# stderr redirected still takes the terminal path.
+if [ -t 0 ]; then
     trap - INT TERM
 else
     trap '[ -x "$TEARDOWN_BIN" ] && sudo -n "$TEARDOWN_BIN" 2>/dev/null; exit 143' INT TERM
