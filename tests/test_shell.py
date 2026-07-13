@@ -1,9 +1,12 @@
 """Tests for the POSIX-sh components, driven from pytest by shelling out to `sh`.
 
-The scripts are sourced with a test-only guard (OC_*_TEST=1) that stops before their
-main body, so individual functions can be exercised in isolation; file-touching helpers
-are pointed at a temp dir via RESOLVER_DIR. vpn-teardown is run as a real subprocess with
-a PATH-stubbed `pgrep` (never exercising its kill path, which would signal real PIDs).
+The executable scripts are sourced with a test-only guard (OC_*_TEST=1) that stops before
+their main body, so individual functions can be exercised in isolation; file-touching
+helpers are pointed at a temp dir via RESOLVER_DIR. lib/common.sh is the exception: it is
+constants + functions with no main body, so it is sourced directly with no guard, and its
+TCP probe is stubbed via NC_BIN so nothing touches the network. vpn-teardown is run as a
+real subprocess with a PATH-stubbed `pgrep` (never exercising its kill path, which would
+signal real PIDs).
 
 macOS-only: the scripts use BSD `stat -f`, /etc/resolver, and utun conventions.
 """
@@ -129,6 +132,85 @@ def test_verify_safe_ancestors_rejects_unsafe_ancestor(tmp_path):
     r = _sh(SRC_INSTALL, 'verify_safe_ancestors "%s" && echo OK || echo BAD' % leaf)
     assert r.stdout.strip() == "BAD"
     assert "refusing to install" in r.stderr
+
+
+# --- lib/common.sh: server_hostport + wait_for_server ---------------------------------
+# common.sh is constants + functions with no main body, so it needs NO test seam --
+# sourcing it directly is safe.
+SRC_COMMON = '. "$OC_PROJ/lib/common.sh"'
+
+
+@pytest.mark.parametrize("server,expect", [
+    ("vpn.example.com", "vpn.example.com 443"),
+    ("vpn.example.com:8443", "vpn.example.com 8443"),
+    ("https://vpn.example.com", "vpn.example.com 443"),
+    ("https://vpn.example.com/group", "vpn.example.com 443"),
+    ("https://vpn.example.com:8443/group", "vpn.example.com 8443"),
+    ("vpn.example.com/group", "vpn.example.com 443"),
+    ("https://user@vpn.example.com:8443/g", "vpn.example.com 8443"),
+    ("[2001:db8::1]", "2001:db8::1 443"),
+    ("[2001:db8::1]:8443", "2001:db8::1 8443"),
+    ("2001:db8::1", "2001:db8::1 443"),
+])
+def test_server_hostport(server, expect):
+    body = 'server_hostport "%s"\nprintf "%%s %%s\\n" "$HOSTPORT_HOST" "$HOSTPORT_PORT"\n' % server
+    r = _sh(SRC_COMMON, body)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == expect
+
+
+def _nc_stub(tmp_path, script):
+    """Write a fake `nc` and return its path (wait_for_server calls it via $NC_BIN)."""
+    stub = tmp_path / "nc"
+    stub.write_text(script)
+    stub.chmod(0o755)
+    return str(stub)
+
+
+def test_wait_for_server_returns_at_once_when_reachable(tmp_path):
+    nc = _nc_stub(tmp_path, "#!/bin/sh\nexit 0\n")
+    r = _sh(SRC_COMMON, 'wait_for_server vpn.example.com && echo REACHABLE\n',
+            extra_env={"NC_BIN": nc})
+    assert r.returncode == 0, r.stderr
+    assert "REACHABLE" in r.stdout
+    assert "waiting for" not in r.stderr      # no wait announced on the happy path
+
+
+def test_wait_for_server_times_out_when_unreachable(tmp_path):
+    # Regression for the original bug: the probe MUST actually loop and then time out.
+    # (The old route-based probe never looped at all -- macOS `route get` exits 0 even
+    # with no default route, so the wait was dead code.) NET_WAIT_MAX is overridden so
+    # the bounded loop finishes fast.
+    nc = _nc_stub(tmp_path, "#!/bin/sh\nexit 1\n")
+    r = _sh(SRC_COMMON, 'NET_WAIT_MAX=2\nwait_for_server vpn.example.com:8443 || echo TIMEDOUT\n',
+            extra_env={"NC_BIN": nc})
+    assert r.returncode == 0, r.stderr
+    assert "TIMEDOUT" in r.stdout
+    assert "waiting for vpn.example.com:8443" in r.stderr
+    assert "still unreachable after 2s" in r.stderr
+
+
+def test_wait_for_server_recovers_when_server_comes_back(tmp_path):
+    # First probe fails, later ones succeed: exercises the retry path and the recovery log.
+    tries = tmp_path / "tries"
+    nc = _nc_stub(tmp_path, (
+        '#!/bin/sh\n'
+        'n=$(cat "%s" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "%s"\n'
+        '[ "$n" -ge 2 ]\n' % (tries, tries)))
+    r = _sh(SRC_COMMON, 'NET_WAIT_MAX=20\nwait_for_server vpn.example.com && echo OK\n',
+            extra_env={"NC_BIN": nc})
+    assert r.returncode == 0, r.stderr
+    assert "OK" in r.stdout
+    assert "is reachable; continuing" in r.stderr
+
+
+def test_net_wait_max_is_at_least_throttle_interval():
+    # The load-bearing invariant: launchd delays a respawn by (ThrottleInterval - runtime),
+    # so the wait must outlast the throttle window or an eventual give-up idles out the rest.
+    r = _sh(SRC_COMMON, 'printf "%s %s\\n" "$NET_WAIT_MAX" "$THROTTLE_INTERVAL"\n')
+    assert r.returncode == 0, r.stderr
+    net_wait, throttle = (int(x) for x in r.stdout.split())
+    assert net_wait >= throttle
 
 
 # --- vpn-teardown: arg dispatch + sweep guard (kill path deliberately not exercised) ---

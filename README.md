@@ -54,9 +54,10 @@ Config is a TOML file at `~/.config/openconnect-auto-sso/config.toml` (outside t
 | `protocol` | string | openconnect protocol; `""` auto-detects (e.g. `"anyconnect"`, `"gp"`). |
 | `via_vpn` | list | Everything that should go through the VPN, in one list; each entry's shape decides how it's handled (see below). `[]` = full tunnel. |
 | `proxy_port` | int | Loopback port for the DNS-routing proxy (default `45353`); only used when `via_vpn` contains a name or `@server`. |
-| `allow_incoming` | bool | `true` allows incoming from the VPN (no pf firewall) so iCloud Private Relay keeps working. |
+| `allow_incoming` | bool | `true` allows incoming from the VPN (no pf firewall) so iCloud Private Relay keeps working (default `false`). |
 | `keepalive_host` | string | Host to ping through the tunnel to avoid idle-disconnects. `"@dns"` auto-targets the VPN's own pushed DNS server (recommended); or a specific in-VPN host. `""` = off. |
 | `keepalive_interval` | int | Seconds between keepalive pings (default 30). |
+| `reconnect_timeout` | int | Seconds openconnect retries in-process after a drop before giving up and exiting (`0` = give up at once). The default depends on context: **30** under the auto-start agent (something will restart it) and **300** for a manual run (nothing will). See [Sleep and wake](#sleep-and-wake). |
 | `profile_name` | string | Qt persistent-profile storage key. Usually leave default. |
 | `callback` | string | openconnect external-browser callback `host:port`. Rarely changed. |
 
@@ -107,6 +108,16 @@ The connect script resolves `vpn-slice` to an absolute path, since `sudo` (Phase
 
 Many VPN servers disconnect a tunnel that carries no traffic (openconnect reports `Received server disconnect: ... 'Idle Timeout'`). In split-tunnel mode that happens easily, since only your routed subnets generate traffic. Set `keepalive_host` to a host that is reachable **inside** the VPN — i.e. one covered by `via_vpn` (or anything, in full-tunnel mode) — and the connect script pings it every `keepalive_interval` seconds while connected, stopping automatically on disconnect. The easiest choice is `keepalive_host = "@dns"`, which auto-targets the VPN's own pushed DNS server — always routed and always up, so you don't have to name it.
 
+## Sleep and wake
+
+openconnect's built-in reconnect cannot survive a macOS sleep: on wake its socket is still bound to local addresses that no longer exist, so every retry fails (`Can't assign requested address`) until its retry budget expires — and only then does it exit. A *fresh* openconnect process connects fine. So the recovery strategy is to give up quickly and let a fresh connect take over, rather than to keep reconnecting.
+
+That only makes sense when something will actually restart you, so `reconnect_timeout` defaults by context: **30 s under the auto-start agent** (launchd's `KeepAlive` respawns the connect script) and **300 s for a manual run** — openconnect's own default — because a terminal user has no supervisor, and in-process recovery is the only recovery they have. Set `reconnect_timeout` explicitly to override either.
+
+Before authenticating, the connect script waits for the VPN server to become **reachable** (up to 5 minutes under the agent, 10 s in a terminal). It is a TCP probe rather than a default-route check, so it also covers "the Wi-Fi is up but the WAN is down" and DNS that isn't ready yet. Waiting beats exiting: launchd delays a respawn by `ThrottleInterval` *minus* how long the job ran, so a job that waits the outage out respawns immediately, whereas one that fails fast idles out the remainder. (A captive portal that redirects the VPN port can still make the probe report "reachable" — it is a readiness gate, not a guarantee; Phase 1 then reports the real error.)
+
+The trade-off is worth stating plainly: an outage **longer than `reconnect_timeout`** ends the tunnel and costs a fresh connect rather than an in-process resume. With a warm cookie that fresh connect is silent, but it does mint a new VPN session — which matters if your gateway caps concurrent sessions, or your identity provider forces MFA on every fresh authentication. Raise `reconnect_timeout` toward 300 if you would rather ride out long outages on the existing session.
+
 ## Recipes
 
 **Coexist with Tailscale.** Keep Tailscale's CGNAT range off the VPN by excluding it:
@@ -141,7 +152,7 @@ Run `./install.sh` first so a config exists — `install` refuses to load an age
 tail -f ~/Library/Logs/openconnect-auto-sso.log
 ```
 
-The agent runs in your GUI session (`Aqua`), so a **warm** cookie connects silently while a **cold** one still pops the SSO window at login. By default it reconnects if the tunnel drops (throttled). Note that a *persistent* failure — no network, or an SSO login you keep dismissing — also retries on that throttle, re-popping the login; use `--once` (or `uninstall`) if that's not what you want.
+The agent runs in your GUI session (`Aqua`), so a **warm** cookie connects silently while a **cold** one still pops the SSO window at login. By default it reconnects if the tunnel drops. Note that a *persistent* failure keeps retrying roughly every 5 minutes — for a dead network that cadence comes from the reachability wait (see [Sleep and wake](#sleep-and-wake)), and for an SSO login you keep dismissing it comes from launchd's throttle, which re-pops the login each time; use `--once` (or `uninstall`) if that's not what you want.
 
 Because the agent runs as you but the tunnel runs as root, it can't signal openconnect directly. The teardown helper closes that gap: on **logout** the connect script calls it (via a scoped NOPASSWD rule) to send openconnect a clean disconnect, and `uninstall` stops a running tunnel the same way before removing anything — so neither strands a root tunnel with leftover routes/DNS. (If openconnect is ever `SIGKILL`ed instead — e.g. a crash — that clean path is skipped; a stray `/etc/resolver/<name>` can then block the next connect until you `sudo rm` it, which the startup sweep points out.)
 
@@ -155,7 +166,7 @@ Because the agent runs as you but the tunnel runs as root, it can't signal openc
 
 ## Troubleshooting
 
-Environment knobs for the browser helper:
+Environment knobs (browser helper and connect script):
 
 | Variable                 | Effect                                             |
 |--------------------------|----------------------------------------------------|

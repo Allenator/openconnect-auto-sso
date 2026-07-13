@@ -36,6 +36,7 @@ SCALARS = {
     "allow_incoming":     ("ALLOW_INCOMING", "bool"),
     "keepalive_host":     ("KEEPALIVE_HOST", "str"),
     "keepalive_interval": ("KEEPALIVE_INTERVAL", "int"),
+    "reconnect_timeout":  ("RECONNECT_TIMEOUT", "int"),
     "proxy_port":         ("PROXY_PORT", "int"),
     "profile_name":       ("PROFILE_NAME", "str"),
     "callback":           ("CALLBACK", "str"),
@@ -60,6 +61,11 @@ def render_scalar(key, kind, val):
             die("'proxy_port' must be a port number 1-65535")
         if key == "keepalive_interval" and val < 1:
             die("'keepalive_interval' must be a positive integer (seconds)")
+        # Upper bound matters: openconnect parses this with atoi, so an out-of-range value
+        # overflows to a non-positive int -- which it reads as "give up at once", the exact
+        # opposite of the "retry ~forever" a user writing a huge number intends.
+        if key == "reconnect_timeout" and not (0 <= val <= 2147483647):
+            die("'reconnect_timeout' must be 0-2147483647 (seconds; 0 = give up at once)")
         return str(val)
     # str
     if not isinstance(val, str):

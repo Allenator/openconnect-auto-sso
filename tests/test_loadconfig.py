@@ -152,6 +152,55 @@ def test_proxy_port_out_of_range_fails():
     assert r.returncode == 1
 
 
+def test_reconnect_timeout_emitted():
+    r = _run_cli('server = "x"\nreconnect_timeout = 15\n')
+    assert r.returncode == 0, r.stderr
+    assert "RECONNECT_TIMEOUT=15" in r.stdout
+
+
+def test_reconnect_timeout_zero_allowed():
+    # 0 is meaningful: give up immediately and let a fresh connect take over.
+    r = _run_cli('server = "x"\nreconnect_timeout = 0\n')
+    assert r.returncode == 0, r.stderr
+    assert "RECONNECT_TIMEOUT=0" in r.stdout
+
+
+def test_reconnect_timeout_negative_rejected():
+    r = _run_cli('server = "x"\nreconnect_timeout = -1\n')
+    assert r.returncode == 1
+    assert "reconnect_timeout" in r.stderr
+
+
+def test_reconnect_timeout_non_integer_rejected():
+    r = _run_cli('server = "x"\nreconnect_timeout = "30"\n')
+    assert r.returncode == 1
+
+
+def test_reconnect_timeout_absurdly_large_rejected():
+    # openconnect parses this with atoi, so an out-of-range value overflows to a
+    # non-positive int, which it reads as "give up at once" -- the opposite of the
+    # "retry ~forever" a user writing a huge number intends. Reject it here instead.
+    r = _run_cli('server = "x"\nreconnect_timeout = 99999999999999999999\n')
+    assert r.returncode == 1
+
+
+def test_absent_reconnect_timeout_emits_no_variable():
+    # The connect script's context-dependent default (30 supervised / 300 interactive)
+    # only works if loadconfig stays SILENT when the key is absent.
+    r = _run_cli('server = "x"\n')
+    assert r.returncode == 0, r.stderr
+    assert "RECONNECT_TIMEOUT" not in r.stdout
+
+
+def test_config_example_parses():
+    # Guards against config.example.toml drifting from SCALARS/KNOWN_KEYS (a key added to
+    # the example but not the schema would fail here with "unknown key").
+    example = os.path.join(os.path.dirname(__file__), "..", "config.example.toml")
+    r = subprocess.run([sys.executable, LOADCONFIG_PY, example],
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+
+
 def test_scalar_with_space_is_shell_quoted():
     # A server value with a space must come back quoted so the eval'ing shell can't
     # word-split it.

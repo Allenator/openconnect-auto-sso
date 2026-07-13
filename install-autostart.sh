@@ -35,7 +35,7 @@ if [ "${OC_INSTALL_TEST:-}" = 1 ]; then
 else
     proj=$(cd "$(dirname "$0")" && pwd)
 fi
-. "$proj/lib/common.sh"   # LIBEXEC_DIR, TEARDOWN_BIN (single owner of the paths)
+. "$proj/lib/common.sh"   # LIBEXEC_DIR, TEARDOWN_BIN, THROTTLE_INTERVAL (single owner)
 label="openconnect-auto-sso"
 plist="$HOME/Library/LaunchAgents/$label.plist"
 sudoers="/etc/sudoers.d/openconnect-auto-sso"
@@ -168,7 +168,7 @@ do_install() {
     <key>KeepAlive</key>
     <$keepalive/>
     <key>ThrottleInterval</key>
-    <integer>300</integer>
+    <integer>$THROTTLE_INTERVAL</integer>
     <key>LimitLoadToSessionType</key>
     <string>Aqua</string>
     <key>EnvironmentVariables</key>

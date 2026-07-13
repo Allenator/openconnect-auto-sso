@@ -1,12 +1,18 @@
 # openconnect-auto-sso configuration (TOML).
 # Copy to ~/.config/openconnect-auto-sso/config.toml and edit it there
 # (kept outside the repo). An in-repo config.toml also works for development.
+#
+# ./install.sh SEEDS your real config by copying this file verbatim, so anything left
+# UNCOMMENTED here is pinned into your config forever -- the built-in default can no
+# longer reach you, even if it changes. So only `server` (which you must supply) is
+# active below. Every other key is shown commented WITH ITS DEFAULT: uncomment one only
+# when you actually want to override it.
 
-# VPN server: hostname or full URL. Required.
+# VPN server: hostname or full URL. Required -- this is the one value you must set.
 server = "vpn.example.com"
 
-# openconnect protocol; "" (or omit) auto-detects. e.g. "anyconnect", "gp".
-protocol = ""
+# openconnect protocol; "" auto-detects. e.g. "anyconnect", "gp".
+# protocol = ""
 
 # What goes through the VPN. One list; each entry's shape decides how it's handled:
 #
@@ -22,8 +28,8 @@ protocol = ""
 #   "@internal"          also route the VPN's own pool subnet (server-pushed).
 #   "@splits"            also route the server's split-include subnets, if any.
 #
-# Empty list = full tunnel (everything via the VPN, no proxy).
-via_vpn = []
+# Default is the empty list = full tunnel (everything via the VPN, no proxy).
+# via_vpn = []
 # example:
 # via_vpn = ["example.com", "10.0.0.0/8", "%100.64.0.0/10", "@internal"]
 #
@@ -32,20 +38,28 @@ via_vpn = []
 # "Secure DNS") bypasses /etc/resolver, so no route is added for it -- for those,
 # put the destination's CIDR in via_vpn instead of (or in addition to) its name.
 
-# Loopback UDP/TCP port for the DNS-routing proxy (only used when a name or
-# @server is listed).
-proxy_port = 45353
+# Loopback UDP/TCP port for the DNS-routing proxy (only used when via_vpn lists a name
+# or @server).
+# proxy_port = 45353
 
-# Allow incoming connections from the VPN (vpn-slice -i). true installs no pf
-# firewall, so iCloud Private Relay keeps working -- at the cost of hosts on the
-# VPN being able to reach open ports on your machine.
-allow_incoming = false
+# Allow incoming connections from the VPN (vpn-slice -i). true installs no pf firewall,
+# so iCloud Private Relay keeps working -- at the cost of hosts on the VPN being able to
+# reach open ports on your machine.
+# allow_incoming = false
 
 # Keepalive: ping a host reachable INSIDE the VPN so an idle tunnel isn't dropped.
 # "" = off. Use "@dns" to auto-target the VPN's own DNS server (recommended -- it's
 # pushed by the connection, always routed, and always up), or a specific in-VPN host.
-keepalive_host = ""
-keepalive_interval = 30
+# keepalive_host = ""
+# keepalive_interval = 30
+
+# How long openconnect retries in-process after a drop before giving up (seconds; 0 = give
+# up at once). There is no single default: it is 30 under the auto-start agent (something
+# will restart it) and 300 for a manual run (nothing will), so leaving this unset is
+# usually right. openconnect cannot reconnect across a macOS sleep -- a fresh connect is
+# what actually recovers -- and an outage longer than this ends the tunnel. Read
+# "Sleep and wake" in the README before pinning a value here.
+# reconnect_timeout = 30      # 300 when run interactively; unset = pick automatically
 
 # Advanced (usually leave default):
 # profile_name = "openconnect-auto-sso"   # Qt persistent-profile storage key

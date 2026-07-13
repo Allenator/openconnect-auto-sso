@@ -16,7 +16,8 @@ while [ -L "$src" ]; do
     case $src in /*) ;; *) src=$dir/$src ;; esac
 done
 PROJ=$(cd "$(dirname "$src")/.." && pwd)
-. "$PROJ/lib/common.sh"   # RESOLVER_MARKER, TEARDOWN_BIN (shared with the installer)
+. "$PROJ/lib/common.sh"   # RESOLVER_MARKER, TEARDOWN_BIN, and the recovery timing +
+                          # helpers (wait_for_server, RECONNECT_TIMEOUT_*, NET_WAIT_MAX)
 
 # --- load configuration ------------------------------------------------------
 # Precedence: $OC_AUTO_SSO_CONFIG, then the standard external location
@@ -49,6 +50,18 @@ PROFILE_NAME="${PROFILE_NAME:-openconnect-auto-sso}"
 CALLBACK="${CALLBACK:-localhost:29786}"
 KEEPALIVE_HOST="${KEEPALIVE_HOST:-}"
 KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
+# How long openconnect retries in-process before giving up and exiting. The right value
+# depends on whether anything will restart us (see lib/common.sh): under launchd, give up
+# fast so KeepAlive can start a FRESH connect -- the only thing that works after a sleep.
+# In a terminal nothing would respawn us, so keep openconnect's own long budget instead.
+# An explicit `reconnect_timeout` in the config always wins.
+if [ -z "${RECONNECT_TIMEOUT:-}" ]; then
+    if [ -t 0 ]; then
+        RECONNECT_TIMEOUT="$RECONNECT_TIMEOUT_INTERACTIVE"
+    else
+        RECONNECT_TIMEOUT="$RECONNECT_TIMEOUT_SUPERVISED"
+    fi
+fi
 ALLOW_INCOMING="${ALLOW_INCOMING:-0}"
 PROXY_NAMES="${PROXY_NAMES:-}"          # DNS names routed via the VPN (proxy + /etc/resolver)
 ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (server-pushed)
@@ -150,6 +163,20 @@ fi
 OPENCONNECT=$(command -v openconnect || true)
 [ -n "$OPENCONNECT" ] || { echo "error: openconnect not found on PATH" >&2; exit 1; }
 
+# A wake from sleep -- or a login before Wi-Fi associates -- can leave us with no usable
+# network yet. Authenticating into that fails instantly and exits non-zero, and under
+# launchd that burns a throttled retry (respawn is delayed by THROTTLE_INTERVAL minus our
+# runtime). So WAIT for the server to actually be reachable instead: staying alive is
+# always cheaper than exiting into the throttle. wait_for_server lives in lib/common.sh,
+# which owns the sizing (NET_WAIT_MAX >= THROTTLE_INTERVAL, so an eventual give-up still
+# respawns immediately). A terminal user has no supervisor and wants a prompt error rather
+# than a multi-minute hang, so shorten the bound there.
+if [ -t 0 ]; then
+    NET_WAIT_MAX=10
+fi
+# Bounded, and best-effort: on timeout we fall through and let Phase 1 report the real error.
+wait_for_server "$SERVER" || true
+
 # --- Phase 1: authenticate as the current user (no sudo, no root browser) ----
 echo ">> authenticating to $SERVER" >&2
 authenticate() {
@@ -207,6 +234,9 @@ fi
 set -- --cookie-on-stdin --servercert "$FINGERPRINT"
 [ -n "$RESOLVE" ] && set -- "$@" --resolve "$RESOLVE"
 [ -n "$PROTOCOL" ] && set -- "$@" --protocol="$PROTOCOL"
+# Budget for openconnect's own in-process reconnect; sized by supervisor presence above.
+# lib/common.sh owns the rationale (why a sleep needs a FRESH connect, not a reconnect).
+set -- "$@" --reconnect-timeout="$RECONNECT_TIMEOUT"
 # _shq: emit $1 as a safely single-quoted shell word (embedded ' -> '\''), so a
 # space or apostrophe in a path survives openconnect re-parsing the -s string via sh.
 _shq() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
