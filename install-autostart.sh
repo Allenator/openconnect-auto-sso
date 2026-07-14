@@ -176,7 +176,9 @@ do_install() {
         <key>PATH</key>
         <string>$(xml_escape "$apath")</string>
         <key>HOME</key>
-        <string>$(xml_escape "$HOME")</string>$_cfg_env
+        <string>$(xml_escape "$HOME")</string>
+        <key>OC_SUPERVISED</key>
+        <string>1</string>$_cfg_env
     </dict>
     <key>StandardOutPath</key>
     <string>$(xml_escape "$log")</string>

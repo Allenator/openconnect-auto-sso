@@ -1,5 +1,5 @@
 #!/bin/sh
-# Launch the persistent-profile SSO browser via the project's uv environment.
+# Launch the persistent-profile SSO browser from the project's venv.
 # openconnect --external-browser invokes this with the login URL as $1.
 #
 # Resolves its own real path first, so it works when symlinked into ~/.local/bin.
@@ -14,4 +14,9 @@ while [ -L "$src" ]; do
 done
 proj=$(cd "$(dirname "$src")/.." && pwd)
 
-exec uv run --directory "$proj" --quiet python "$proj/src/vpn_browser.py" "$@"
+# Run the venv python DIRECTLY rather than `uv run`: openconnect spawns this deep inside
+# Phase 1, so it must not depend on `uv` being on PATH (a missing uv would exec-fail 127
+# and wedge auth) nor trigger uv's implicit sync (network / .venv mutation) mid-connect.
+# Matches bin/openconnect-auto-sso's convention.
+PY="$proj/.venv/bin/python"; [ -x "$PY" ] || PY=python3
+exec "$PY" "$proj/src/vpn_browser.py" "$@"

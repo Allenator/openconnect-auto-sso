@@ -86,17 +86,26 @@ _proxy_domains() {
     IFS=$_oldifs
 }
 
+# Proxy state file (fixed path): line 1 = dnsroute PID, line 2 = owning openconnect PID.
+# _proxy_pid reads line 1; _is_dnsroute confirms a PID is really our dnsroute (guards
+# against PID reuse) before we signal it as root.
+_proxy_pid()   { [ -f "$_pidfile" ] && sed -n 1p "$_pidfile" 2>/dev/null || true; }
+_is_dnsroute() { [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -q 'dnsroute\.py'; }
+
 # Bring up the DNS-routing proxy on connect|reconnect (uses $_names/$_port/$_pidfile).
 # Guard clauses keep it flat; always returns 0 (never abort the vpnc-script pass).
 _proxy_connect() {
-    # Replace any previous proxy: kill it and WAIT for the port to free up -- a
-    # straight kill-then-bind races EADDRINUSE (SO_REUSEADDR doesn't reliably cover a
-    # still-open UDP bind).
-    if [ -f "$_pidfile" ]; then
-        _old=$(cat "$_pidfile" 2>/dev/null || true)
-        [ -n "$_old" ] && kill "$_old" 2>/dev/null || true
+    # Replace any previous proxy on this port -- our own from an in-process reconnect, OR
+    # an orphan a crashed predecessor left holding it (its watchdog may never have fired if
+    # the utun name got reused). Verify the recorded PID is really our dnsroute (not a
+    # reused PID), kill it, and WAIT for it to exit so the port frees -- a straight
+    # kill-then-bind races EADDRINUSE. A live SECOND instance is refused at connect-script
+    # startup, so any proxy still here is ours to reclaim.
+    _old=$(_proxy_pid)
+    if _is_dnsroute "$_old"; then
+        kill "$_old" 2>/dev/null || true
         _i=0
-        while [ -n "$_old" ] && kill -0 "$_old" 2>/dev/null && [ "$_i" -lt 30 ]; do
+        while kill -0 "$_old" 2>/dev/null && [ "$_i" -lt 30 ]; do
             sleep 0.1; _i=$((_i + 1))
         done
     fi
@@ -142,8 +151,10 @@ _proxy_connect() {
              "(port busy, invalid, or dnspython missing); DNS-routing disabled." >&2
         return 0
     fi
-    # Guard the pidfile write (|| true): a failed write must not abort the pass.
-    echo "$_pid" > "$_pidfile" 2>/dev/null || true
+    # Record the dnsroute PID (line 1) and the owning openconnect PID (line 2, VPNPID) so a
+    # later run can reclaim this proxy or detect that this tunnel is still live. Guard the
+    # write (|| true): a failed write must not abort the pass.
+    printf '%s\n%s\n' "$_pid" "${VPNPID:-}" > "$_pidfile" 2>/dev/null || true
     [ -d "$RESOLVER_DIR" ] || mkdir -p "$RESOLVER_DIR" 2>/dev/null || true
     for _d in $_domains; do
         # Marker + port tag the file as ours for this proxy.
@@ -183,8 +194,11 @@ while :; do
             case "${reason:-}" in
                 connect|reconnect) _proxy_connect ;;
                 disconnect)
-                    [ -f "$_pidfile" ] && kill "$(cat "$_pidfile")" 2>/dev/null || true
-                    rm -f "$_pidfile" 2>/dev/null || true
+                    # Kill ONLY the dnsroute (line 1) -- never line 2's openconnect PID,
+                    # which is mid-teardown running this very pass. Verify it's ours first.
+                    _old=$(_proxy_pid)
+                    _is_dnsroute "$_old" && kill "$_old" 2>/dev/null || true
+                    rm -f "$_pidfile" "$_pidfile.ready" 2>/dev/null || true
                     # Remove our resolver files by marker+port (see _sweep_our_resolvers)
                     # rather than re-deriving domain names from a server env that may
                     # differ/be absent now -- and scoped to this port so a second

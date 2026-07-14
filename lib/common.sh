@@ -35,12 +35,29 @@ NET_WAIT_MAX="$THROTTLE_INTERVAL"    # cap on the wait below; keep >= THROTTLE_I
 RECONNECT_TIMEOUT_SUPERVISED=30      # under launchd: give up fast; KeepAlive reconnects
 RECONNECT_TIMEOUT_INTERACTIVE=300    # no supervisor: openconnect's own default budget
 
+# Decide the reconnect budget + network-wait bound from whether a supervisor will restart
+# us. $1 = "1" when supervised. The auto-start agent sets OC_SUPERVISED=1 in its plist;
+# NOTHING else does, so a lone run (terminal, nohup, cron) is treated as unsupervised and
+# keeps openconnect's long in-process budget -- because nothing would respawn it, and a
+# short give-up there would kill a tunnel a >30s blip should have ridden out. We shorten
+# ONLY when we know something takes over. An explicit reconnect_timeout in the config
+# still wins (this only DEFAULTS it). Owned here so the connect script needs no test seam.
+recovery_budget() {
+    if [ "${1:-}" = 1 ]; then
+        : "${RECONNECT_TIMEOUT:=$RECONNECT_TIMEOUT_SUPERVISED}"
+        NET_WAIT_MAX="$THROTTLE_INTERVAL"    # wait out the throttle window (respawn is free)
+    else
+        : "${RECONNECT_TIMEOUT:=$RECONNECT_TIMEOUT_INTERACTIVE}"
+        NET_WAIT_MAX=10                       # a human is watching; fail fast, don't hang
+    fi
+}
+
 # Split openconnect's server form -- [https://]host[:port][/group] -- into
 # $HOSTPORT_HOST / $HOSTPORT_PORT. Pure parameter expansion: no eval, no subshell.
 server_hostport() {
     _hp=${1#*://}                    # strip scheme (no-op when absent)
     _hp=${_hp%%/*}                   # strip trailing path / usergroup
-    _hp=${_hp#*@}                    # strip userinfo
+    _hp=${_hp##*@}                   # strip userinfo (last @: @ can't appear in the host)
     case $_hp in
         \[*\]:*) HOSTPORT_HOST=${_hp%%\]*}; HOSTPORT_HOST=${HOSTPORT_HOST#\[}
                  HOSTPORT_PORT=${_hp##*\]:} ;;                        # [v6]:port
@@ -76,10 +93,20 @@ server_reachable() {
 # guarantee -- Phase 1 still reports the real error in that case.
 wait_for_server() {
     server_hostport "$1"
-    _deadline=$(( $(date +%s) + NET_WAIT_MAX ))
+    # SKIP the gate (proceed, don't stall) when we can't run a meaningful probe -- a
+    # broken probe must not silently burn the whole NET_WAIT_MAX on every connect. Cases:
+    # the probe tool is missing/non-executable, or a malformed `server` yielded no host or
+    # a non-numeric port. Phase 1 then reports the real error instead of a 5-minute hang.
+    [ -x "$NC_BIN" ] || return 0
+    [ -n "$HOSTPORT_HOST" ] || return 0
+    case $HOSTPORT_PORT in ''|*[!0-9]*) return 0 ;; esac
+    # Fail safe if `date` is unavailable rather than looping forever on a bad comparison.
+    _deadline=$(date +%s) || return 0
+    _deadline=$(( _deadline + NET_WAIT_MAX ))
     _announced=n
     while ! server_reachable "$HOSTPORT_HOST" "$HOSTPORT_PORT"; do
-        if [ "$(date +%s)" -ge "$_deadline" ]; then
+        _now=$(date +%s) || return 0
+        if [ "$_now" -ge "$_deadline" ]; then
             echo "WARNING: $HOSTPORT_HOST:$HOSTPORT_PORT still unreachable after" \
                  "${NET_WAIT_MAX}s; trying anyway." >&2
             return 1

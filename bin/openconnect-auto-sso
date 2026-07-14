@@ -50,29 +50,25 @@ PROFILE_NAME="${PROFILE_NAME:-openconnect-auto-sso}"
 CALLBACK="${CALLBACK:-localhost:29786}"
 KEEPALIVE_HOST="${KEEPALIVE_HOST:-}"
 KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
-# How long openconnect retries in-process before giving up and exiting. The right value
-# depends on whether anything will restart us (see lib/common.sh): under launchd, give up
-# fast so KeepAlive can start a FRESH connect -- the only thing that works after a sleep.
-# In a terminal nothing would respawn us, so keep openconnect's own long budget instead.
-# An explicit `reconnect_timeout` in the config always wins.
-if [ -z "${RECONNECT_TIMEOUT:-}" ]; then
-    if [ -t 0 ]; then
-        RECONNECT_TIMEOUT="$RECONNECT_TIMEOUT_INTERACTIVE"
-    else
-        RECONNECT_TIMEOUT="$RECONNECT_TIMEOUT_SUPERVISED"
-    fi
-fi
+# Pick the reconnect budget + network-wait bound from supervisor presence (lib/common.sh
+# owns the rationale). The auto-start agent exports OC_SUPERVISED=1 in its plist; nothing
+# else does, so a lone run keeps openconnect's long in-process budget (nothing would
+# respawn it). An explicit `reconnect_timeout` from the config still wins.
+recovery_budget "${OC_SUPERVISED:-}"
 ALLOW_INCOMING="${ALLOW_INCOMING:-0}"
 PROXY_NAMES="${PROXY_NAMES:-}"          # DNS names routed via the VPN (proxy + /etc/resolver)
 ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (server-pushed)
 ROUTE_SPLITS="${ROUTE_SPLITS:-0}"       # also add the server's split-include subnets
 PROXY_PORT="${PROXY_PORT:-45353}"       # loopback port for the DNS-routing proxy
 KA_DNS_FILE="${TMPDIR:-/tmp}/openconnect-auto-sso.dns.$$"     # keepalive @dns target
-# The proxy PID file drives a ROOT kill in the wrapper (it SIGTERMs the pid it holds),
-# so it lives in /var/run (root:daemon, 0775): a user-writable TMPDIR path would let the
-# tunnel's own user seed a victim PID for root to signal, and the invoking user is not in
-# group daemon so cannot write here. Only the wrapper (root) reads and writes it.
-PROXY_PIDFILE="/var/run/openconnect-auto-sso.proxy.$$"       # DNS-routing proxy PID
+# Proxy state file (FIXED path, not per-$$): line 1 = the dnsroute PID, line 2 = the
+# owning openconnect PID (VPNPID). A fixed path lets a fresh run reason about a PREVIOUS
+# run's proxy -- reclaim an orphan a crash left holding the port (see the wrapper), and
+# refuse a second live instance (below). It drives a ROOT kill in the wrapper, so it lives
+# in /var/run (root:daemon, 0775): a user-writable path would let the tunnel's own user
+# seed a victim PID for root to signal, and the invoking user isn't in group daemon.
+# Only the wrapper (root) writes it.
+PROXY_PIDFILE="/var/run/openconnect-auto-sso.proxy"
 
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
@@ -155,6 +151,20 @@ if [ -n "$_leftover" ]; then
     fi
 fi
 
+# Refuse to start while another instance of THIS tool is already connected: a second
+# tunnel can't bind the shared DNS-proxy port, and the loser's failed-bind cleanup would
+# delete the winner's /etc/resolver files (breaking split-DNS for both). Line 2 of the
+# proxy state file is the owning openconnect PID; if that process is still a live
+# openconnect, a tunnel is up. This keys on OUR recorded PID (via `ps`, which works
+# cross-user unlike `kill -0` on a root process), so an unrelated openconnect VPN doesn't
+# trip it, and a dead/stale record is ignored -- the wrapper reclaims the orphan proxy.
+_running_oc=$(sed -n 2p "$PROXY_PIDFILE" 2>/dev/null || true)
+if [ -n "$_running_oc" ] && ps -p "$_running_oc" -o comm= 2>/dev/null | grep -q openconnect; then
+    echo "error: openconnect-auto-sso is already connected (openconnect pid $_running_oc)." >&2
+    echo "       Disconnect it first (Ctrl-C, or ./install-autostart.sh uninstall) before reconnecting." >&2
+    exit 1
+fi
+
 # Resolve openconnect to an absolute path and use it for BOTH phases. Phase 2 runs
 # it via sudo; passing the absolute path makes the NOPASSWD sudoers drop-in from
 # install-autostart.sh (which pins openconnect's absolute path) match
@@ -167,14 +177,11 @@ OPENCONNECT=$(command -v openconnect || true)
 # network yet. Authenticating into that fails instantly and exits non-zero, and under
 # launchd that burns a throttled retry (respawn is delayed by THROTTLE_INTERVAL minus our
 # runtime). So WAIT for the server to actually be reachable instead: staying alive is
-# always cheaper than exiting into the throttle. wait_for_server lives in lib/common.sh,
-# which owns the sizing (NET_WAIT_MAX >= THROTTLE_INTERVAL, so an eventual give-up still
-# respawns immediately). A terminal user has no supervisor and wants a prompt error rather
-# than a multi-minute hang, so shorten the bound there.
-if [ -t 0 ]; then
-    NET_WAIT_MAX=10
-fi
-# Bounded, and best-effort: on timeout we fall through and let Phase 1 report the real error.
+# always cheaper than exiting into the throttle. wait_for_server (and NET_WAIT_MAX, already
+# sized by recovery_budget above: the full throttle window when supervised, a short bound
+# otherwise) live in lib/common.sh. Best-effort: on timeout we fall through under `|| true`
+# and let Phase 1 report the real error -- WITHOUT the `|| true`, a set -eu abort here would
+# kill the whole connect on a slow network, the opposite of "wait and proceed".
 wait_for_server "$SERVER" || true
 
 # --- Phase 1: authenticate as the current user (no sudo, no root browser) ----
