@@ -10,7 +10,10 @@ set -eu
 
 # --- locate the project (works when symlinked into ~/.local/bin) -------------
 src=$0
+_n=0
 while [ -L "$src" ]; do
+    _n=$((_n + 1))
+    [ "$_n" -gt 40 ] && { echo "error: too many symlink levels resolving $0" >&2; exit 1; }
     dir=$(cd "$(dirname "$src")" && pwd)
     src=$(readlink "$src")
     case $src in /*) ;; *) src=$dir/$src ;; esac
@@ -198,17 +201,57 @@ authenticate() {
 
 COOKIE=''; HOST=''; CONNECT_URL=''; FINGERPRINT=''; RESOLVE=''
 
-# If the user aborts (Ctrl-C) while authentication is still in progress, end the
-# SSO browser so it isn't left orphaned (the script would otherwise exit before
-# the post-auth pkill below).
-trap 'pkill -f "$PROJ/src/vpn_browser.py" 2>/dev/null; exit 130' INT TERM
+# End the SSO browser helper: SIGTERM it and WAIT for it to exit, rather than a
+# fire-and-forget kill. Chromium batches cookie commits (~30s), and the helper needs a
+# moment (its SIGTERM handler flushes and lingers ~1.5s) to durably write the session
+# cookie the login just earned -- killing it the instant Phase 1 ends can drop it (B2).
+# Bounded, then force-killed, so a wedged helper can never stall us. Safe to call
+# repeatedly: a no-op once the helper is gone.
+_HELPER_PAT="$PROJ/src/vpn_browser.py"
+_end_browser() {
+    pkill -TERM -f "$_HELPER_PAT" 2>/dev/null || return 0   # nothing running
+    _i=0
+    while pgrep -f "$_HELPER_PAT" >/dev/null 2>&1; do
+        _i=$((_i + 1))
+        [ "$_i" -ge 8 ] && { pkill -KILL -f "$_HELPER_PAT" 2>/dev/null || true; break; }
+        sleep 1
+    done
+}
+
+# Reap the helper on ANY exit from Phase 1. The EXIT trap also covers a FAILED Phase 1,
+# which previously left the hidden helper alive (its pkill sat after the `|| exit` and
+# the trap covered only INT/TERM) -- B5a. Replaced once Phase 2 owns cleanup.
+trap '_end_browser; exit 130' INT TERM
+trap '{ [ -n "${_p1_wd:-}" ] && kill "$_p1_wd" 2>/dev/null; } || true; _end_browser' EXIT
+
+# Dead-man backstop for a helper that dies WITHOUT reaching openconnect's loopback
+# callback AND without signaling (exec-fail / crash / SIGKILL): openconnect's callback
+# listener is select(...,NULL) -- no timeout -- and never watches the helper, so it
+# (and the auth capture below) would block forever. Kill a Phase-1 openconnect that
+# outlives the deadline. The pattern matches only openconnect (its argv carries
+# --external-browser=<...>/bin/vpn-browser), never the helper (…/src/vpn_browser.py).
+# Sized WELL above the helper's own ~300s self-timeout plus the longest plausible
+# interactive login (password + Duo can take minutes), so it NEVER interrupts a real
+# login -- purely a last resort for an already-dead helper. See B1.
+PHASE1_DEADLINE="${PHASE1_DEADLINE:-420}"
+_p1_pat="external-browser=$PROJ/bin/vpn-browser"
+( sleep "$PHASE1_DEADLINE"
+  if pgrep -f "$_p1_pat" >/dev/null 2>&1; then
+      echo "error: Phase 1 exceeded ${PHASE1_DEADLINE}s; the SSO helper looks dead -- aborting." >&2
+      pkill -TERM -f "$_p1_pat" 2>/dev/null || true
+  fi ) &
+_p1_wd=$!
 
 auth_out=$(authenticate) || { echo "error: authentication failed" >&2; exit 1; }
 
+kill "$_p1_wd" 2>/dev/null || true   # auth finished in time: cancel the backstop
+wait "$_p1_wd" 2>/dev/null || true
+_p1_wd=''
+
 # Phase 1 done, so the SSO browser is no longer needed. Some servers complete the
-# SSO server-side (no localhost callback), so the helper cannot self-close -- end
-# it here. (It flushes cookies to disk every few seconds, so nothing is lost.)
-pkill -f "$PROJ/src/vpn_browser.py" 2>/dev/null || true
+# SSO server-side (no localhost callback), so the helper cannot self-close -- end it
+# here (terminate-then-wait, so its just-earned cookie is durably flushed first).
+_end_browser
 
 # Phase 2 signal handling. In a terminal, Ctrl-C reaches the root openconnect child
 # directly via the foreground process group, so we clear our trap and let openconnect

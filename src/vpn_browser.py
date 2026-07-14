@@ -23,33 +23,128 @@ Environment (all optional; set by bin/vpn-browser / the connect script):
   VPN_BROWSER_DEBUG=1     log lifecycle events to stderr
 """
 import os
+import signal
+import subprocess
 import sys
 import time
 
 # QtWebEngine must be imported before the QApplication is constructed.
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage
+from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
 from PyQt6.QtNetwork import QNetworkCookie
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import QUrl, QTimer, QStandardPaths
 
 APP_NAME = "openconnect-auto-sso"
 
+# Reveal the window (as a fallback) after this many idle rounds settled on the SAME
+# URL even when the interactivity heuristic sees nothing: the heuristic is main-frame
+# only and blind to iframe / shadow-DOM / position:fixed controls, so a login page
+# built that way would otherwise wait invisibly forever (feeding the B1 wedge).
+REVEAL_AFTER_IDLE_ROUNDS = 3
+IDLE_MS_FLOOR = 250        # never let VPN_BROWSER_IDLE_MS=0 turn the idle timer into a busy-loop
+FINISH_GRACE_MS = 1500     # callback self-close: let Chromium durably commit the cookie
+TERM_GRACE_MS = 1500       # SIGTERM (connect-script cleanup): same, before we exit
+SIGNAL_PUMP_MS = 200       # tick the interpreter so a pending SIGTERM is serviced promptly
+
 # Hold the profile for the whole process lifetime so it outlives the page.
 _profile = None
 
 
+def env_int(name, default):
+    """Parse an integer env var, falling back to `default` for a missing / empty /
+    non-numeric value instead of raising. A bad VPN_BROWSER_* var must not crash us
+    before the QApplication exists -- openconnect would then block forever on its
+    loopback-callback select() (it never watches this helper). See B1.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 def parse_callback(spec):
     host, _, port = spec.partition(":")
-    return (host or "localhost"), int(port or "29786")
+    try:
+        port = int(port) if port else 29786
+    except (TypeError, ValueError):
+        port = 29786       # a malformed CALLBACK port must default, not crash (B1)
+    return (host or "localhost"), port
+
+
+def is_host_loopback(host):
+    """True for any spelling of the loopback host (localhost / 127.0.0.0-8 / ::1)."""
+    h = (host or "").strip().lower()
+    return h in ("localhost", "127.0.0.1", "::1") or h.startswith("127.")
 
 
 def is_callback(url, host, port):
+    """True when `url` is openconnect's loopback callback.
+
+    openconnect actually listens on ::1 (in6addr_loopback) and advertises the callback
+    as some spelling of localhost, but the IdP may redirect to a different spelling
+    (127.0.0.1 / ::1 / localhost). So when the configured host is itself loopback,
+    treat ANY loopback spelling on the right port as the callback -- otherwise a
+    ::1 redirect is missed and finish() (self-close + cookie flush) never fires. A
+    custom non-loopback CALLBACK host still requires an exact host match.
+    """
     if url.port() != port:
         return False
-    if url.host() == host:
+    if url.host().lower() == (host or "").lower():
         return True
-    return host == "localhost" and url.host() in ("localhost", "127.0.0.1")
+    return is_host_loopback(host) and is_host_loopback(url.host())
+
+
+def is_allowed_url(url_str):
+    """Only http/https logins may be loaded. The SSO URL comes from the (possibly
+    hostile / MITM'd) gateway; a file:// -- or any non-web -- scheme could read the
+    on-disk cookie DB. See B4. Refusing unknown schemes is fail-closed.
+    """
+    return QUrl(url_str).scheme().lower() in ("http", "https")
+
+
+def _comm_is_openconnect(comm):
+    """True if a `ps -o comm=` value (a name or an absolute path) is openconnect."""
+    return "openconnect" in (comm or "").strip().lower()
+
+
+def _identify_parent():
+    """Return (ppid, is_openconnect). openconnect posix_spawn()s us directly and
+    bin/vpn-browser exec's python in place, so at startup getppid() IS the openconnect
+    that is now blocked in select() awaiting the loopback callback. We verify that
+    before ever signaling it, so a manual/dev run (parent = a shell) is never killed.
+    """
+    ppid = os.getppid()
+    if ppid <= 1:
+        return ppid, False
+    try:
+        out = subprocess.run(["ps", "-p", str(ppid), "-o", "comm="],
+                             capture_output=True, text=True, timeout=2).stdout
+    except Exception:
+        return ppid, False
+    return ppid, _comm_is_openconnect(out)
+
+
+def reveal_decision(has_input, cur_url, prev_url, prev_rounds,
+                    threshold=REVEAL_AFTER_IDLE_ROUNDS):
+    """Pure decision for on_idle. Returns (action, new_url, new_rounds) where action
+    is 'reveal' or 'wait'.
+
+    Reveal at once if the page has a visible interactive element. Otherwise count
+    consecutive idle rounds on the SAME url and reveal once they reach `threshold`
+    (the B3 fallback for the heuristic's blind spots). A url change resets the count,
+    so a healthy warm flow -- which keeps navigating toward the callback -- never trips
+    the fallback and stays hidden.
+    """
+    if has_input:
+        return ("reveal", cur_url, prev_rounds)
+    rounds = prev_rounds + 1 if cur_url == prev_url else 1
+    if rounds >= threshold:
+        return ("reveal", cur_url, rounds)
+    return ("wait", cur_url, rounds)
 
 
 def set_activation_policy(app, policy):
@@ -82,11 +177,38 @@ def main(argv):
         return 2
     login_url = argv[1]
 
+    # Identify our parent up front (before Qt can crash): if it is openconnect, we can
+    # fail Phase 1 LOUDLY on our own errors. openconnect awaits the loopback callback in
+    # select(...,NULL) -- no timeout -- and never watches this helper, so any death of
+    # ours that doesn't deliver the callback would otherwise wedge `openconnect
+    # --authenticate` (and the connect script's auth capture) forever. See B1.
+    parent_pid, parent_is_oc = _identify_parent()
+
+    def fail_parent(reason):
+        # Re-check getppid() at signal time: only signal while openconnect is STILL our
+        # live parent. If Phase 1 already finished, openconnect has exited and we've been
+        # reparented (getppid() != parent_pid) -- signaling then would be pointless and,
+        # worse, could hit a reused PID. This makes the SIGTERM safe.
+        if parent_is_oc and parent_pid > 1 and os.getppid() == parent_pid:
+            print("[vpn-browser] aborting openconnect (pid %d): %s" % (parent_pid, reason),
+                  file=sys.stderr, flush=True)
+            try:
+                os.kill(parent_pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+    # B4: the login URL comes from the (possibly hostile) gateway. Refuse anything but
+    # http/https before we spin up Qt -- a file:// URL could read the on-disk cookie DB.
+    if not is_allowed_url(login_url):
+        print("error: refusing non-http(s) SSO login URL: %r" % login_url, file=sys.stderr)
+        fail_parent("refused non-http(s) login URL")
+        return 3
+
     profile_name = os.environ.get("PROFILE_NAME") or APP_NAME
     cb_host, cb_port = parse_callback(os.environ.get("CALLBACK") or "localhost:29786")
     show_always = os.environ.get("VPN_BROWSER_SHOW") == "1"
-    idle_ms = int(os.environ.get("VPN_BROWSER_IDLE_MS") or "3500")
-    hard_ms = int(os.environ.get("VPN_BROWSER_TIMEOUT_MS") or "300000")
+    idle_ms = max(IDLE_MS_FLOOR, env_int("VPN_BROWSER_IDLE_MS", 3500))   # 0 would busy-loop (B5d)
+    hard_ms = env_int("VPN_BROWSER_TIMEOUT_MS", 300000)
     debug = os.environ.get("VPN_BROWSER_DEBUG") == "1"
     t0 = time.monotonic()
 
@@ -95,6 +217,20 @@ def main(argv):
             print("[vpn-browser +%.1fs]" % (time.monotonic() - t0), *a,
                   file=sys.stderr, flush=True)
 
+    # Any fatal error while standing Qt up (bad display, profile path, construction)
+    # would exit us non-zero and wedge openconnect's callback wait -- so signal the
+    # parent on the way out. The connect-script deadline backstops a death so early we
+    # can't even reach here.
+    try:
+        return _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
+                    idle_ms, hard_ms, log, fail_parent)
+    except BaseException:
+        fail_parent("fatal error starting the SSO browser")
+        raise
+
+
+def _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
+         idle_ms, hard_ms, log, fail_parent):
     app = QApplication([argv[0]])
     app.setApplicationName(APP_NAME)
     # Deliberately NO setOrganizationName: with an org name set, Qt derives the
@@ -114,12 +250,23 @@ def main(argv):
     base = QStandardPaths.writableLocation(
         QStandardPaths.StandardLocation.GenericDataLocation)
     storage = os.path.join(base, APP_NAME, "QtWebEngine", profile_name)
-    os.makedirs(storage, exist_ok=True)
+    # 0o700: the cookie DB under here is credential-equivalent (it holds the persisted
+    # SSO session). mode= only affects a freshly created dir and is subject to umask, so
+    # chmod too -- enforce it on a dir that pre-existed with looser permissions. (B5c)
+    os.makedirs(storage, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(storage, 0o700)
+    except OSError:
+        pass
     _profile.setPersistentStoragePath(storage)
     _profile.setCachePath(storage)
     _profile.setPersistentCookiesPolicy(
         QWebEngineProfile.PersistentCookiesPolicy.ForcePersistentCookies
     )
+    # B4: don't let web content reach file:// URLs -- the cookie DB lives on local disk.
+    # (TLS is left at Qt's secure default, which rejects certificate errors.)
+    _profile.settings().setAttribute(
+        QWebEngineSettings.WebAttribute.LocalContentCanAccessFileUrls, False)
     log("profile storage:", storage)
 
     view = QWebEngineView()
@@ -127,7 +274,8 @@ def main(argv):
     view.setWindowTitle("VPN sign-in")
     view.resize(480, 720)
 
-    done = {"v": False}
+    done = {"v": False}          # callback reached -> success, self-closing
+    asked_to_stop = {"v": False}  # SIGTERM from the connect script -> expected shutdown
 
     def flush_cookies():
         # A no-op delete forces the cookie store to sync to disk.
@@ -139,7 +287,9 @@ def main(argv):
         done["v"] = True
         log("callback reached; flushing cookies and quitting")
         flush_cookies()
-        QTimer.singleShot(800, app.quit)
+        # Chromium batches cookie commits (~30s); give the just-earned session cookie
+        # time to land on disk before we quit. See B2.
+        QTimer.singleShot(FINISH_GRACE_MS, app.quit)
 
     # Not every server uses the localhost callback (some complete the SSO
     # server-side), so we can't always self-close -- the connect script ends us
@@ -149,8 +299,37 @@ def main(argv):
     flusher.timeout.connect(flush_cookies)
     flusher.start(3000)
 
+    # Keep the interpreter ticking so a Python signal handler (on_sigterm) is serviced
+    # promptly while Qt's C++ event loop is otherwise blocked. See B2.
+    pump = QTimer()
+    pump.timeout.connect(lambda: None)
+    pump.start(SIGNAL_PUMP_MS)
+
+    # B2: the connect script now sends SIGTERM and WAITS for us, instead of a
+    # fire-and-forget kill that could drop the cookie the login just produced. On
+    # SIGTERM: flush and linger briefly so Chromium durably commits it, then quit.
+    def on_sigterm(_signum, _frame):
+        if asked_to_stop["v"]:
+            return
+        asked_to_stop["v"] = True
+        log("SIGTERM: flushing cookies, exiting shortly")
+        flush_cookies()
+        QTimer.singleShot(TERM_GRACE_MS, app.quit)
+
+    signal.signal(signal.SIGTERM, on_sigterm)
+
+    # B1: if we quit WITHOUT having reached the callback and WITHOUT the connect script
+    # telling us to stop (window closed, hard-timeout fired, or an unexpected quit),
+    # Phase 1 will never get its callback -- so fail openconnect loudly rather than let
+    # it block forever.
+    def on_about_to_quit():
+        if not done["v"] and not asked_to_stop["v"]:
+            fail_parent("SSO browser closed before authentication completed")
+    app.aboutToQuit.connect(on_about_to_quit)
+
     idle = QTimer()
     idle.setSingleShot(True)
+    idle_state = {"url": None, "rounds": 0}
 
     # A warm SSO flow transits blank/redirect pages that momentarily look idle.
     # Only reveal the window when the current page actually has something to
@@ -179,12 +358,17 @@ def main(argv):
         def decide(has_input):
             if done["v"] or view.isVisible():
                 return
-            if has_input:
+            action, url, rounds = reveal_decision(
+                bool(has_input), view.url().toString(),
+                idle_state["url"], idle_state["rounds"])
+            idle_state["url"], idle_state["rounds"] = url, rounds
+            if action == "reveal":
+                if not has_input:
+                    log("idle %d rounds on %s; revealing as a fallback" % (rounds, url))
                 do_reveal()
             else:
-                log("idle on a non-interactive page (%s); staying hidden"
-                    % view.url().toString())
-                idle.start(idle_ms)     # still a transient; keep waiting
+                log("idle on a non-interactive page (%s); staying hidden" % url)
+                idle.start(idle_ms)     # still looks transient; keep waiting
 
         try:
             view.page().runJavaScript(NEEDS_INPUT_JS, decide)
@@ -217,7 +401,9 @@ def main(argv):
 
     # Orphan backstop only: the connect script ends us when Phase 1 finishes.
     # This must never fire during a legitimate (possibly slow) interactive login.
-    QTimer.singleShot(hard_ms, app.quit)
+    # A non-positive timeout disables it (rather than quitting instantly). (B5d)
+    if hard_ms > 0:
+        QTimer.singleShot(hard_ms, app.quit)
     return app.exec()
 
 

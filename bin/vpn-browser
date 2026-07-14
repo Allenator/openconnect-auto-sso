@@ -4,7 +4,10 @@
 #
 # Resolves its own real path first, so it works when symlinked into ~/.local/bin.
 src=$0
+_n=0
 while [ -L "$src" ]; do
+    _n=$((_n + 1))
+    [ "$_n" -gt 40 ] && { echo "vpn-browser: too many symlink levels resolving $0" >&2; exit 1; }
     dir=$(cd "$(dirname "$src")" && pwd)
     src=$(readlink "$src")
     case $src in
