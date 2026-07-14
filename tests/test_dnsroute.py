@@ -144,6 +144,46 @@ def test_inflight_released_even_when_route_raises():
     assert "203.0.113.16" in dnsroute._FAILS          # and recorded as failed
 
 
+# --- C1: bogus-scope filter (loopback/link-local/multicast/unspecified) -------
+# Mutation-meaningful: each of these forks /sbin/route today if the _is_bogus_scope
+# guard in add_route is removed, so run.assert_not_called() pins the filter.
+@pytest.mark.parametrize("bogus", [
+    "127.0.0.2",   # loopback v4 -- the split-horizon blackhole that motivated C1
+    "169.254.1.1", # link-local v4
+    "224.0.0.1",   # multicast v4
+    "0.0.0.0",     # unspecified v4
+    "::1",         # loopback v6
+    "fe80::1",     # link-local v6
+    "ff02::1",     # multicast v6
+    "::",          # unspecified v6
+])
+def test_bogus_scope_ip_is_not_routed(bogus):
+    with mock.patch.object(dnsroute.subprocess, "run", side_effect=_run_ok) as run:
+        dnsroute.add_route(bogus)
+    run.assert_not_called()                  # never forks /sbin/route
+    assert bogus in dnsroute._SEEN           # marked so it isn't re-logged every lookup
+    assert bogus not in dnsroute._INFLIGHT   # in-flight claim released in finally
+
+
+@pytest.mark.parametrize("routable", [
+    "10.1.2.3",    # private RFC1918 -- must still route
+    "104.16.1.1",  # public          -- must still route (routing is NOT private-only)
+])
+def test_routable_ip_is_still_routed(routable):
+    with mock.patch.object(dnsroute.subprocess, "run", side_effect=_run_ok) as run:
+        dnsroute.add_route(routable)
+    run.assert_called_once()
+    assert routable in dnsroute._SEEN
+
+
+def test_unparseable_answer_ip_is_not_routed():
+    # add_route parses untrusted DNS answers as root; a non-IP string must be dropped
+    # (treated as bogus), never handed to /sbin/route.
+    with mock.patch.object(dnsroute.subprocess, "run", side_effect=_run_ok) as run:
+        dnsroute.add_route("not-an-ip")
+    run.assert_not_called()
+
+
 # --- inject_routes -----------------------------------------------------------
 def _resp_with(name, rrtype, *values):
     q = dns.message.make_query(name, rrtype)
@@ -182,6 +222,21 @@ def test_svcb_hints_are_routed():
     routed = {c.args[0] for c in add.call_args_list}
     assert "203.0.113.5" in routed
     assert "2001:db8::5" in routed
+
+
+@pytest.mark.skipif(dnsroute._SVCB_PARAM is None, reason="dnspython lacks SVCB param keys")
+def test_svcb_hint_bogus_scope_filtered_end_to_end():
+    # The scope filter lives in add_route (the single choke point), so an SVCB
+    # ipv4hint pointing at loopback is dropped end-to-end just like an A record,
+    # while a sibling routable hint on the same record still gets its route. This
+    # exercises the real add_route (subprocess mocked), not a mocked add_route.
+    wire = _resp_with("h.corp", "HTTPS", "1 . ipv4hint=127.0.0.2,10.9.8.7")
+    with mock.patch.object(dnsroute.subprocess, "run", side_effect=_run_ok) as run:
+        dnsroute.inject_routes(wire)
+    flat = [" ".join(c.args[0]) for c in run.call_args_list]
+    assert run.call_count == 1                        # only the routable hint forked route
+    assert any("10.9.8.7" in f for f in flat)
+    assert not any("127.0.0.2" in f for f in flat)    # loopback hint never routed
 
 
 # --- servfail_or_silence -----------------------------------------------------

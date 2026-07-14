@@ -26,6 +26,7 @@ vanish with the utun, so there is no route teardown; a watchdog exits when the d
 gone, and SIGTERM exits cleanly.
 """
 import argparse
+import ipaddress
 import os
 import re
 import signal
@@ -165,13 +166,64 @@ def servfail_or_silence(query):
     """All upstreams are unreachable. Until we've EVER forwarded a reply (the VPN-DNS
     route is proven up) -- or the backstop window elapses for a tunnel that never
     comes up -- stay SILENT so the client's stub resolver retries into success. After
-    that, SERVFAIL to fail fast on a genuine outage instead of hanging every lookup."""
+    that, SERVFAIL to fail fast on a genuine outage instead of hanging every lookup.
+
+    Fail-closed assumption (NOT empirically confirmed in this dev environment):
+    this SERVFAIL is returned to macOS on a scoped /etc/resolver/<domain> resolver
+    (`scutil --dns` shows ours as a domain-matched resolver -> nameserver 127.0.0.1).
+    The concern is a split-brain LEAK: if mDNSResponder responds to a scoped-resolver
+    SERVFAIL by failing over to the primary (default-interface) resolver, a proxied
+    name would then resolve via public DNS and the client would reach it off-tunnel.
+    The intended fail-closed fix, IF the leak is confirmed, is to keep returning None
+    (silence) here too, so the stub retries into the same scoped resolver instead of
+    falling out to the primary. That fix was deliberately NOT applied because it is
+    unverified AND its efficacy is uncertain: mDNSResponder penalizes/fails a
+    DNSServer over on TIMEOUT as well as on SERVFAIL, so silence may merely add
+    latency before the same failover -- and it trades away the current fail-fast
+    behavior (a real outage would then hang every lookup). To confirm on a machine
+    with sudo and no live VPN: `echo "nameserver 127.0.0.1\nport 55353" >
+    /etc/resolver/servfailtest`, run a stub on 127.0.0.1:55353 that answers every
+    query with SERVFAIL, `dscacheutil -flushcache`, then `dscacheutil -q host -a name
+    x.servfailtest` (or `dig`) while tcpdumping the default interface -- if the query
+    egresses to the primary DNS, the leak is real and this branch should return None.
+
+    _EVER_FORWARDED interaction (worth flagging for the sleep/wake workstream): it is
+    process-global and never resets, so once any reply has EVER been forwarded the
+    grace window no longer applies and this returns SERVFAIL immediately. A long-up
+    tunnel that then loses its VPN DNS (sleep/wake, upstream gone) therefore SERVFAILs
+    at once -- so if the leak above is real, every post-wake DNS gap is a leak window,
+    not just initial bring-up."""
     if not _EVER_FORWARDED and (time.monotonic() - _START) < GRACE_SECONDS:
         return None
     return servfail(query)
 
 
 # --- route injection ---------------------------------------------------------
+def _is_bogus_scope(ip):
+    """True for an answer IP we must never turn into a host route, independent of
+    the gateway EXCLUDES: loopback, link-local, multicast, or the unspecified
+    address. A proxied name resolving -- via the VPN's own, possibly split-horizon,
+    DNS -- to such an address would otherwise fork a nonsensical route, e.g. a
+    `127.0.0.2` split-horizon answer becoming `route add -host 127.0.0.2 -interface
+    utunN`, blackholing loopback. `ipaddress` classifies both IPv4 and IPv6. A
+    string that doesn't parse as an IP is treated as bogus (skip, don't route)
+    rather than crashing this root code that parses untrusted DNS answers.
+
+    Deliberately still routable: both private (RFC1918/CGNAT) *and* public
+    addresses -- name-based routing means "route wherever the name resolves," and
+    legitimate corp resources live on public IPs too (a private-only filter would
+    break real configs); the user narrows ranges via `%CIDR` in config. `.is_reserved`
+    (chiefly IPv4 240/4) is also left routable on purpose: it's outside the decided
+    policy, is not a loopback-style blackhole hazard, and a stray reserved IP simply
+    makes `route add` fail harmlessly (recorded in _FAILS) rather than mis-routing."""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return True
+    return (addr.is_loopback or addr.is_link_local
+            or addr.is_multicast or addr.is_unspecified)
+
+
 def _mark_seen(ip):
     with _SEEN_LOCK:
         _SEEN.add(ip)
@@ -202,6 +254,14 @@ def add_route(ip):
             # Record it so we don't re-log the exclusion on every lookup.
             _mark_seen(ip)
             log("not routing %s (excluded: the VPN gateway/transport)" % ip)
+            return
+        # Single choke point for BOTH A/AAAA and SVCB ipv4hint/ipv6hint IPs: drop
+        # answers in a scope that must never become a host route (see _is_bogus_scope)
+        # BEFORE we fork /sbin/route. Mark seen -- like EXCLUDES -- so a repeated
+        # split-horizon answer isn't re-logged on every lookup.
+        if _is_bogus_scope(ip):
+            _mark_seen(ip)
+            log("not routing %s (bogus scope: loopback/link-local/multicast/unspecified)" % ip)
             return
         if _family(ip) == socket.AF_INET6:
             cmd = ["/sbin/route", "-n", "add", "-inet6", ip, "-interface", DEV]
@@ -270,6 +330,11 @@ def inject_routes(wire):
 
 
 # --- servers -----------------------------------------------------------------
+# Note (accepted): the ThreadingMixIn worker pool and the _SEEN set are both
+# unbounded. This is a loopback-only listener (bound to 127.0.0.1), so the only
+# actor that can grow either is a local process on this host; a hard bound is left
+# off deliberately -- a thread cap risks blocking/deadlock under burst load, and an
+# _SEEN LRU bound would re-fork /sbin/route and re-log for evicted-then-reseen IPs.
 class _ThreadingUDPServer(socketserver.ThreadingMixIn, socketserver.UDPServer):
     allow_reuse_address = True
     daemon_threads = True
