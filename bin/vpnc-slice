@@ -90,23 +90,43 @@ _proxy_domains() {
     IFS=$_oldifs
 }
 
-# Proxy state file (fixed path): line 1 = dnsroute PID, line 2 = owning openconnect PID.
-# _proxy_pid reads line 1; _is_dnsroute confirms a PID is really our dnsroute (guards
-# against PID reuse) before we signal it as root.
+# Proxy state file (per-port path chosen by the connect script): line 1 = dnsroute PID,
+# line 2 = owning openconnect PID (VPNPID). _proxy_pid reads line 1; _proxy_owner reads
+# line 2. _is_dnsroute confirms a PID is really OUR dnsroute before we signal it as root
+# -- matched on the FULL "$PROJ/src/dnsroute.py" argv (not a bare "dnsroute.py" substring
+# an unrelated process could carry), guarding against PID reuse.
 _proxy_pid()   { [ -f "$_pidfile" ] && sed -n 1p "$_pidfile" 2>/dev/null || true; }
-_is_dnsroute() { [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -q 'dnsroute\.py'; }
+_proxy_owner() { [ -f "$_pidfile" ] && sed -n 2p "$_pidfile" 2>/dev/null || true; }
+_is_dnsroute() { [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -qF -- "$PROJ/src/dnsroute.py"; }
+
+# Ownership invariant, gating EVERY proxy-state mutation (reclaim / disconnect teardown):
+# may we kill/rm/sweep this proxy's state? True when it is ours (owner == our VPNPID --
+# openconnect keeps the same PID across an in-process reconnect, so this reclaims our own
+# old proxy), when no owner is recorded, or when the recorded owner is NOT a live
+# openconnect (it died, or its PID was reused by something else). False ONLY when a live
+# DIFFERENT openconnect still owns this port: we must never touch its proxy, its pidfile,
+# or its /etc/resolver files. `ps -o comm=` works cross-user (unlike kill -0 on a root PID).
+_may_touch_proxy() {
+    _owner=$(_proxy_owner)
+    [ -z "$_owner" ] && return 0                                   # no owner recorded
+    [ "$_owner" = "${VPNPID:-}" ] && return 0                      # our own (incl. in-process reconnect)
+    ps -p "$_owner" -o comm= 2>/dev/null | grep -q openconnect && return 1   # a live DIFFERENT tunnel
+    return 0                                                       # owner dead / reused -> reclaimable
+}
 
 # Bring up the DNS-routing proxy on connect|reconnect (uses $_names/$_port/$_pidfile).
 # Guard clauses keep it flat; always returns 0 (never abort the vpnc-script pass).
 _proxy_connect() {
-    # Replace any previous proxy on this port -- our own from an in-process reconnect, OR
-    # an orphan a crashed predecessor left holding it (its watchdog may never have fired if
-    # the utun name got reused). Verify the recorded PID is really our dnsroute (not a
-    # reused PID), kill it, and WAIT for it to exit so the port frees -- a straight
-    # kill-then-bind races EADDRINUSE. A live SECOND instance is refused at connect-script
-    # startup, so any proxy still here is ours to reclaim.
+    # Replace a previous proxy on this port ONLY when the ownership invariant permits it:
+    # our own from an in-process reconnect (owner == VPNPID), OR an orphan a crashed
+    # predecessor left holding it (owner dead/empty/reused -- its watchdog may never have
+    # fired if the utun name got reused). Verify the recorded PID is really our dnsroute
+    # (not a reused PID), kill it, and WAIT for it to exit so the port frees -- a straight
+    # kill-then-bind races EADDRINUSE. If a live DIFFERENT openconnect owns this port we
+    # leave its proxy alone and just try to bind: our bind EADDRINUSEs -> the benign
+    # warn-only failed-bind path below.
     _old=$(_proxy_pid)
-    if _is_dnsroute "$_old"; then
+    if _may_touch_proxy && _is_dnsroute "$_old"; then
         kill "$_old" 2>/dev/null || true
         _i=0
         while kill -0 "$_old" 2>/dev/null && [ "$_i" -lt 30 ]; do
@@ -138,9 +158,14 @@ _proxy_connect() {
     # pointing /etc/resolver at it -- "process still alive" can't tell bound from
     # still-importing. --exclude keeps the VPN gateway's own IP off the tunnel.
     _ready="$_pidfile.ready"; rm -f "$_ready" 2>/dev/null || true
+    # Have the proxy watch the owning openconnect (VPNPID) so an orphan self-reaps ~1s
+    # after its owner dies. Pass it only when openconnect actually set VPNPID; it's a
+    # numeric PID, so the unquoted expansion word-splits into two args (or none) safely.
+    _watch=""
+    [ -n "${VPNPID:-}" ] && _watch="--watch-pid $VPNPID"
     nohup "$PROJ/.venv/bin/python" "$PROJ/src/dnsroute.py" \
         --upstream "$_up" --dev "$_dev" --port "$_port" \
-        --exclude "${VPNGATEWAY:-}" --ready-file "$_ready" \
+        --exclude "${VPNGATEWAY:-}" --ready-file "$_ready" $_watch \
         >/dev/null 2>&1 &
     _pid=$!
     _i=0
@@ -148,9 +173,13 @@ _proxy_connect() {
         sleep 0.1; _i=$((_i + 1))
     done
     if [ ! -f "$_ready" ]; then
+        # Warn-only. Kill ONLY the proxy WE just spawned ($_pid) -- it is ours and failed
+        # to signal ready. Do NOT rm the pidfile or sweep /etc/resolver files here: on a
+        # shared port that state may belong to a live DIFFERENT tunnel that won the bind,
+        # and our bind simply lost with EADDRINUSE (finding 14). Leave the winner's
+        # pidfile, .ready, and resolver files intact; this tunnel just runs without
+        # DNS-routing.
         kill "$_pid" 2>/dev/null || true
-        rm -f "$_pidfile" 2>/dev/null || true
-        _sweep_our_resolvers   # no working proxy -> remove any dead-port files
         echo "WARNING: DNS-routing proxy failed to bind 127.0.0.1:$_port" \
              "(port busy, invalid, or dnspython missing); DNS-routing disabled." >&2
         return 0
@@ -198,16 +227,24 @@ while :; do
             case "${reason:-}" in
                 connect|reconnect) _proxy_connect ;;
                 disconnect)
-                    # Kill ONLY the dnsroute (line 1) -- never line 2's openconnect PID,
-                    # which is mid-teardown running this very pass. Verify it's ours first.
-                    _old=$(_proxy_pid)
-                    _is_dnsroute "$_old" && kill "$_old" 2>/dev/null || true
-                    rm -f "$_pidfile" "$_pidfile.ready" 2>/dev/null || true
-                    # Remove our resolver files by marker+port (see _sweep_our_resolvers)
-                    # rather than re-deriving domain names from a server env that may
-                    # differ/be absent now -- and scoped to this port so a second
-                    # tunnel's files are left intact.
-                    _sweep_our_resolvers ;;
+                    # Tear down ONLY if the ownership invariant permits: this proxy is
+                    # ours (owner == our VPNPID -- the openconnect running this very pass),
+                    # unowned, or owned by a dead/reused PID. If a live DIFFERENT
+                    # openconnect owns this port, do NOTHING -- leaving its proxy, pidfile,
+                    # and /etc/resolver files intact so one tunnel's disconnect never yanks
+                    # another same-port tunnel's DNS (finding 14).
+                    if _may_touch_proxy; then
+                        # Kill ONLY the dnsroute (line 1) -- never line 2's openconnect PID,
+                        # which is mid-teardown running this very pass. Verify it's ours first.
+                        _old=$(_proxy_pid)
+                        _is_dnsroute "$_old" && kill "$_old" 2>/dev/null || true
+                        rm -f "$_pidfile" "$_pidfile.ready" 2>/dev/null || true
+                        # Remove our resolver files by marker+port (see _sweep_our_resolvers)
+                        # rather than re-deriving domain names from a server env that may
+                        # differ/be absent now -- and scoped to this port so a second
+                        # tunnel's files are left intact.
+                        _sweep_our_resolvers
+                    fi ;;
             esac ;;
         *) break ;;
     esac

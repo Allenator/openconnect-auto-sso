@@ -64,14 +64,20 @@ ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (serve
 ROUTE_SPLITS="${ROUTE_SPLITS:-0}"       # also add the server's split-include subnets
 PROXY_PORT="${PROXY_PORT:-45353}"       # loopback port for the DNS-routing proxy
 KA_DNS_FILE="${TMPDIR:-/tmp}/openconnect-auto-sso.dns.$$"     # keepalive @dns target
-# Proxy state file (FIXED path, not per-$$): line 1 = the dnsroute PID, line 2 = the
-# owning openconnect PID (VPNPID). A fixed path lets a fresh run reason about a PREVIOUS
-# run's proxy -- reclaim an orphan a crash left holding the port (see the wrapper), and
-# refuse a second live instance (below). It drives a ROOT kill in the wrapper, so it lives
-# in /var/run (root:daemon, 0775): a user-writable path would let the tunnel's own user
-# seed a victim PID for root to signal, and the invoking user isn't in group daemon.
-# Only the wrapper (root) writes it.
-PROXY_PIDFILE="/var/run/openconnect-auto-sso.proxy"
+# Proxy state file (PER-PORT path, keyed on $PROXY_PORT): line 1 = the dnsroute PID,
+# line 2 = the owning openconnect PID (VPNPID). A stable per-port path lets a fresh run on
+# the SAME port reason about a PREVIOUS run's proxy -- reclaim our own (in-process
+# reconnect) or an orphan a crash left holding the port (see the wrapper) -- while two
+# tunnels on DIFFERENT ports get DIFFERENT files, so neither clobbers the other's record.
+# There is no "refuse a second instance": the wrapper gates every proxy-state mutation on
+# an ownership invariant (owner == VPNPID, or the owner is no longer a live openconnect),
+# so a live DIFFERENT tunnel on the same port is left untouched -- our own dnsroute then
+# fails to bind and degrades to a clear "DNS-routing disabled (port busy)" warning, no
+# lockout and no cross-instance root-kill (launchd already stops the agent double-running).
+# It drives a ROOT kill in the wrapper, so it lives in /var/run (root:daemon, 0775): a
+# user-writable path would let the tunnel's own user seed a victim PID for root to signal,
+# and the invoking user isn't in group daemon. Only the wrapper (root) writes it.
+PROXY_PIDFILE="/var/run/openconnect-auto-sso.proxy.$PROXY_PORT"
 
 # The SSO browser helper (spawned by openconnect) reads these from the env.
 export PROFILE_NAME CALLBACK
@@ -152,20 +158,6 @@ if [ -n "$_leftover" ]; then
             _offer_sudo_fix "Remove them now" y "sudo rm$_leftover" _rm_resolver_leftovers
         fi
     fi
-fi
-
-# Refuse to start while another instance of THIS tool is already connected: a second
-# tunnel can't bind the shared DNS-proxy port, and the loser's failed-bind cleanup would
-# delete the winner's /etc/resolver files (breaking split-DNS for both). Line 2 of the
-# proxy state file is the owning openconnect PID; if that process is still a live
-# openconnect, a tunnel is up. This keys on OUR recorded PID (via `ps`, which works
-# cross-user unlike `kill -0` on a root process), so an unrelated openconnect VPN doesn't
-# trip it, and a dead/stale record is ignored -- the wrapper reclaims the orphan proxy.
-_running_oc=$(sed -n 2p "$PROXY_PIDFILE" 2>/dev/null || true)
-if [ -n "$_running_oc" ] && ps -p "$_running_oc" -o comm= 2>/dev/null | grep -q openconnect; then
-    echo "error: openconnect-auto-sso is already connected (openconnect pid $_running_oc)." >&2
-    echo "       Disconnect it first (Ctrl-C, or ./install-autostart.sh uninstall) before reconnecting." >&2
-    exit 1
 fi
 
 # Resolve openconnect to an absolute path and use it for BOTH phases. Phase 2 runs

@@ -265,3 +265,80 @@ def test_servfail_immediately_once_forwarded():
     dnsroute._mark_forwarded()
     assert dnsroute._EVER_FORWARDED
     assert dnsroute.servfail_or_silence(_query()) is not None
+
+
+# --- pid_watchdog (--watch-pid orphan reaper) --------------------------------
+# The proxy watches its owning openconnect (VPNPID); when that owner dies, os.kill(pid, 0)
+# raises ProcessLookupError (ESRCH) and the proxy reaps itself ~1s later -- belt-and-
+# suspenders with the 15s device watchdog. Kept hermetic: os._exit is stubbed so the
+# daemon loop unwinds through an exception instead of terminating pytest, and the (patched)
+# sleep is bounded so nothing can hang.
+class _StopLoop(Exception):
+    """Sentinel to unwind pid_watchdog's infinite loop from a patched sleep."""
+
+
+def test_pid_watchdog_exits_when_owner_dead(monkeypatch):
+    # A genuinely dead owner PID (a reaped child) makes os.kill(pid, 0) raise
+    # ProcessLookupError -> the watchdog exits with status 0.
+    import subprocess
+    p = subprocess.Popen(["true"]); p.wait()          # reaped -> PID no longer a live process
+    n = {"i": 0}
+
+    def bounded_sleep(*_a):
+        n["i"] += 1
+        if n["i"] > 5:                                 # safety net (a PID reuse can't hang us)
+            raise _StopLoop
+    monkeypatch.setattr(dnsroute.time, "sleep", bounded_sleep)
+
+    exited = {}
+
+    def fake_exit(code):
+        exited["code"] = code
+        raise SystemExit(code)                         # unwind the loop, don't kill pytest
+    monkeypatch.setattr(dnsroute.os, "_exit", fake_exit)
+
+    with pytest.raises(SystemExit):
+        dnsroute.pid_watchdog(p.pid)
+    assert exited["code"] == 0
+
+
+def test_pid_watchdog_stays_alive_while_owner_lives(monkeypatch):
+    # While the owner is alive (os.kill succeeds), the watchdog must NEVER exit.
+    monkeypatch.setattr(dnsroute.os, "kill", lambda pid, sig: None)   # owner always "alive"
+    n = {"i": 0}
+
+    def stop_after(*_a):
+        n["i"] += 1
+        if n["i"] >= 3:
+            raise _StopLoop
+    monkeypatch.setattr(dnsroute.time, "sleep", stop_after)
+
+    exited = {"called": False}
+    monkeypatch.setattr(dnsroute.os, "_exit",
+                        lambda code: exited.__setitem__("called", True))
+    with pytest.raises(_StopLoop):
+        dnsroute.pid_watchdog(4242)
+    assert exited["called"] is False
+
+
+def test_pid_watchdog_ignores_eperm(monkeypatch):
+    # EPERM (owner alive but unsignalable) is NOT ESRCH, so it must NOT trigger an exit.
+    import errno as _errno
+
+    def eperm(pid, sig):
+        raise PermissionError(_errno.EPERM, "operation not permitted")
+    monkeypatch.setattr(dnsroute.os, "kill", eperm)
+    n = {"i": 0}
+
+    def stop_after(*_a):
+        n["i"] += 1
+        if n["i"] >= 3:
+            raise _StopLoop
+    monkeypatch.setattr(dnsroute.time, "sleep", stop_after)
+
+    exited = {"called": False}
+    monkeypatch.setattr(dnsroute.os, "_exit",
+                        lambda code: exited.__setitem__("called", True))
+    with pytest.raises(_StopLoop):
+        dnsroute.pid_watchdog(4242)
+    assert exited["called"] is False

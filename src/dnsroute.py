@@ -26,6 +26,7 @@ vanish with the utun, so there is no route teardown; a watchdog exits when the d
 gone, and SIGTERM exits cleanly.
 """
 import argparse
+import errno
 import ipaddress
 import os
 import re
@@ -54,6 +55,7 @@ EXCLUDES = set()    # IPs never to route (the VPN gateway -- routing it would lo
 DRY_RUN = False     # log route commands instead of running them
 TIMEOUT = 3.0       # per-upstream forward timeout (seconds)
 WATCHDOG_INTERVAL = 15.0
+WATCH_PID_INTERVAL = 1.0    # how often pid_watchdog polls its --watch-pid owner
 
 _SEEN = set()                 # IPs we've already added a route for
 _FAILS = {}                   # ip -> monotonic time of last failed route-add (backoff)
@@ -410,6 +412,30 @@ def watchdog():
             os._exit(0)
 
 
+def pid_watchdog(watch_pid):
+    """Exit ~1s after the owning openconnect (watch_pid) dies.
+
+    Belt-and-suspenders with the 15s device watchdog(): the wrapper passes its own
+    openconnect PID (VPNPID) here, so an ORPHANED proxy -- one whose owner crashed or
+    was killed without a clean disconnect -- reaps itself within a second, freeing its
+    loopback port, instead of lingering until the device watchdog fires (or forever if
+    the utun name got reused). os.kill(pid, 0) sends no signal; it only probes existence:
+    ESRCH (ProcessLookupError) means the owner is gone -> exit; EPERM means it is alive
+    but unsignalable -> keep watching. Any other OSError is treated as transient."""
+    while True:
+        time.sleep(WATCH_PID_INTERVAL)
+        try:
+            os.kill(watch_pid, 0)
+        except ProcessLookupError:
+            log("owner pid %d is gone; exiting" % watch_pid)
+            os._exit(0)
+        except OSError as e:
+            if e.errno == errno.ESRCH:
+                log("owner pid %d is gone; exiting" % watch_pid)
+                os._exit(0)
+            # EPERM (alive but unsignalable) or a transient error -- keep watching.
+
+
 def _on_term(signum, frame):
     os._exit(0)
 
@@ -428,6 +454,9 @@ def main(argv):
     ap.add_argument("--ready-file", default="",
                     help="create this file once both sockets are bound (a readiness "
                          "signal the wrapper waits for before wiring /etc/resolver)")
+    ap.add_argument("--watch-pid", default=0, type=int,
+                    help="exit ~1s after this PID (the owning openconnect) dies -- a "
+                         "belt-and-suspenders orphan reaper alongside the device watchdog")
     ap.add_argument("--dry-run", action="store_true",
                     help="log route commands instead of running them")
     args = ap.parse_args(argv[1:])
@@ -452,6 +481,10 @@ def main(argv):
 
     threading.Thread(target=udp.serve_forever, daemon=True).start()
     threading.Thread(target=watchdog, daemon=True).start()
+    # Reap ourselves shortly after the owning openconnect dies (belt-and-suspenders with
+    # the device watchdog). >1 guards against a bogus 0/1 (never watch pid 1 = launchd).
+    if args.watch_pid > 1:
+        threading.Thread(target=pid_watchdog, args=(args.watch_pid,), daemon=True).start()
     # Both sockets are now bound (and listening); signal readiness so the wrapper
     # only points /etc/resolver at us after the port is actually up.
     if args.ready_file:

@@ -102,7 +102,7 @@ def test_sweep_without_keeplist_removes_all_our_port(tmp_path):
     assert remaining == {"c.corp", "foreign.corp"}
 
 
-# --- vpnc-slice: proxy-state helpers (orphan reclaim / double-start refusal) ---
+# --- vpnc-slice: proxy-state helpers (ownership invariant / orphan reclaim) ---
 def test_proxy_pid_reads_first_line(tmp_path):
     pf = tmp_path / "proxy"
     pf.write_text("4242\n9999\n")   # line 1 = dnsroute PID, line 2 = openconnect PID
@@ -139,6 +139,134 @@ def test_is_dnsroute_matches_real_dnsroute_not_others():
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+def test_is_dnsroute_rejects_arbitrary_dnsroute_py_command():
+    # Finding 8: the matcher keys on the FULL "$PROJ/src/dnsroute.py" argv, not a bare
+    # "dnsroute.py" substring -- else an unrelated process merely mentioning "dnsroute.py"
+    # would be signalled as root. Spawn a decoy whose argv contains "dnsroute.py" but NOT
+    # our real path, and confirm _is_dnsroute rejects it (the old substring match accepted it).
+    decoy = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)  # /tmp/evil/dnsroute.py"])
+    try:
+        out = ""
+        for _ in range(30):
+            out = subprocess.run(["ps", "-p", str(decoy.pid), "-o", "command="],
+                                 capture_output=True, text=True).stdout
+            if "dnsroute.py" in out:
+                break
+            time.sleep(0.1)
+        assert "dnsroute.py" in out          # the decoy DOES carry the bare substring...
+        r = _sh(SRC_VPNC, '_is_dnsroute %d && echo YES || echo NO\n' % decoy.pid)
+        assert r.stdout.strip() == "NO", (r.stderr, out)   # ...but is NOT our full path
+    finally:
+        decoy.terminate()
+        decoy.wait(timeout=5)
+
+
+# --- vpnc-slice: _may_touch_proxy ownership invariant (reclaim / teardown gate) -------
+# Truth table: we may mutate this proxy's state iff it is ours, unowned, or owned by a
+# PID that is no longer a live openconnect. The ONE case we must refuse is a live DIFFERENT
+# openconnect on the same port (else one tunnel yanks another's proxy + /etc/resolver).
+def test_may_touch_proxy_true_when_no_owner(tmp_path):
+    pf = tmp_path / "proxy"
+    pf.write_text("4242\n")          # line 1 only -- no owner recorded on line 2
+    body = ('_pidfile="%s"\nVPNPID=999999\n'
+            '_may_touch_proxy && echo TOUCH || echo LEAVE\n') % pf
+    r = _sh(SRC_VPNC, body)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "TOUCH"
+
+
+def test_may_touch_proxy_true_when_no_pidfile(tmp_path):
+    body = ('_pidfile="%s"\nVPNPID=999999\n'
+            '_may_touch_proxy && echo TOUCH || echo LEAVE\n') % (tmp_path / "nope")
+    r = _sh(SRC_VPNC, body)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "TOUCH"
+
+
+def test_may_touch_proxy_true_when_owner_is_us(tmp_path):
+    # owner == our VPNPID -> ours (openconnect keeps its PID across an in-process reconnect,
+    # so this reclaims our OWN old proxy). Short-circuits before any `ps` liveness probe.
+    pf = tmp_path / "proxy"
+    pf.write_text("4242\n7777\n")
+    body = ('_pidfile="%s"\nVPNPID=7777\n'
+            '_may_touch_proxy && echo TOUCH || echo LEAVE\n') % pf
+    r = _sh(SRC_VPNC, body)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "TOUCH"
+
+
+def test_may_touch_proxy_false_for_live_different_openconnect(tmp_path):
+    # A live DIFFERENT openconnect owner -> LEAVE. Stub `ps` (a shell function shadows the
+    # external command) so the owner PID reads as a live openconnect; the invariant must
+    # then refuse to touch the proxy so the other tunnel's state survives.
+    pf = tmp_path / "proxy"
+    pf.write_text("4242\n55555\n")   # owner (line 2) 55555, different from VPNPID below
+    body = ('ps() { echo "/opt/homebrew/bin/openconnect"; }\n'
+            '_pidfile="%s"\nVPNPID=999999\n'
+            '_may_touch_proxy && echo TOUCH || echo LEAVE\n') % pf
+    r = _sh(SRC_VPNC, body)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "LEAVE"
+
+
+def test_may_touch_proxy_true_for_dead_owner(tmp_path):
+    # A recorded owner that is no longer alive (or whose PID got reused by a non-openconnect)
+    # is reclaimable. Use a reaped child's PID: definitively not a live openconnect.
+    dead = subprocess.Popen(["true"]); dead.wait()
+    pf = tmp_path / "proxy"
+    pf.write_text("4242\n%d\n" % dead.pid)
+    body = ('_pidfile="%s"\nVPNPID=999999\n'
+            '_may_touch_proxy && echo TOUCH || echo LEAVE\n') % pf
+    r = _sh(SRC_VPNC, body)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "TOUCH"
+
+
+def test_may_touch_proxy_true_for_reused_non_openconnect_owner(tmp_path):
+    # Owner PID reused by an unrelated live program (ps shows a non-openconnect comm) ->
+    # reclaimable, since it is not the openconnect that recorded it.
+    pf = tmp_path / "proxy"
+    pf.write_text("4242\n55555\n")
+    body = ('ps() { echo "/usr/bin/less"; }\n'
+            '_pidfile="%s"\nVPNPID=999999\n'
+            '_may_touch_proxy && echo TOUCH || echo LEAVE\n') % pf
+    r = _sh(SRC_VPNC, body)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "TOUCH"
+
+
+# --- vpnc-slice: failed-bind path leaves a same-port winner's state intact (finding 14) --
+def test_failed_bind_leaves_pidfile_and_resolvers_intact(tmp_path):
+    # When our dnsroute fails to bind (the port is held by a live DIFFERENT tunnel), the
+    # connect pass must WARN ONLY -- never rm the pidfile or sweep /etc/resolver files, which
+    # would nuke the winner's DNS. Stub `nohup` so dnsroute never starts (no ready-file),
+    # drive _proxy_connect into the failed-bind branch, and assert the pre-existing pidfile
+    # + resolver file survive untouched.
+    resolv = tmp_path / "resolver"
+    resolv.mkdir()
+    _mk_resolver(resolv / "keep.corp", 45353)     # a winner's resolver file (our marker+port)
+    pf = tmp_path / "proxy"
+    pf.write_text("4242\n55555\n")                # a winner's pidfile (owner 55555)
+    body = (
+        'nohup() { :; }\n'                        # dnsroute never starts -> failed-bind path
+        '_names="keep.corp"\n'
+        'CISCO_SPLIT_DNS=""; CISCO_DEF_DOMAIN=""\n'
+        'INTERNAL_IP4_DNS="10.0.0.53"; TUNDEV="utun-test"; VPNGATEWAY="10.0.0.1"\n'
+        'VPNPID=999999\n'                         # we are a DIFFERENT tunnel
+        '_port=45353\n_pidfile="%s"\n'
+        '_proxy_connect\n'
+        'echo DONE\n'
+    ) % pf
+    r = _sh(SRC_VPNC, body, extra_env={"RESOLVER_DIR": str(resolv)})
+    assert r.returncode == 0, r.stderr
+    assert "DONE" in r.stdout
+    assert "failed to bind" in r.stderr
+    assert pf.exists(), "failed-bind wrongly deleted the pidfile"
+    assert pf.read_text() == "4242\n55555\n", "failed-bind wrongly rewrote the pidfile"
+    assert (resolv / "keep.corp").exists(), "failed-bind wrongly swept a resolver file"
 
 
 # --- vpnc-slice: NC_BIN root-gate (off-root the override is still honored) -----------
