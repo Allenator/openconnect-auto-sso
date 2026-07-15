@@ -195,47 +195,129 @@ def test_verify_safe_ancestors_rejects_unsafe_ancestor(tmp_path):
     assert "refusing to install" in r.stderr
 
 
-# --- install-autostart: dir_no_other_write ($proj writability guard, D2) --------------
+# --- install-autostart: dir_ok_for_repo + verify_repo_ancestors (repo-path guard) -----
+# $connect is run by the login agent as YOU and reaches root via NOPASSWD openconnect, so any
+# repo-path component another user can write, rename, or symlink-redirect is a passwordless-
+# root vector. Unlike dir_is_safe (which vets the root teardown helper and demands root
+# ownership) the owner here may be root OR you -- but a component owned by a DIFFERENT non-root
+# user, a symlink, or a group/other-writable dir is refused, at EVERY level of the path.
 @pytest.mark.parametrize("mode,expect", [
     (0o700, "OK"), (0o755, "OK"), (0o750, "OK"), (0o705, "OK"),   # no group/other write
     (0o770, "NO"), (0o720, "NO"), (0o775, "NO"),                  # group-writable
     (0o702, "NO"), (0o706, "NO"), (0o707, "NO"),                  # other-writable
     (0o777, "NO"),                                                # both
 ])
-def test_dir_no_other_write(tmp_path, mode, expect):
-    # The connect script is run by the login agent as YOU and reaches root via NOPASSWD
-    # openconnect, so a group/other-writable repo is a passwordless-root vector. Unlike
-    # dir_is_safe this does NOT require root ownership (it's the user's own repo) -- only
-    # that group/other can't write it.
+def test_dir_ok_for_repo_mode_bits(tmp_path, mode, expect):
+    # Self-owned dir: the owner check passes (it's YOURS), so only the group/other-write bits
+    # decide -- the same table dir_no_other_write used, now on the owner-aware predicate.
     d = tmp_path / ("m%o" % mode)
     d.mkdir()
     d.chmod(mode)
-    r = _sh(SRC_INSTALL, 'dir_no_other_write "%s" && echo OK || echo NO' % d)
+    r = _sh(SRC_INSTALL, 'dir_ok_for_repo "%s" && echo OK || echo NO' % d)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == expect, oct(mode)
 
 
-def test_dir_no_other_write_fails_closed_on_missing(tmp_path):
+def test_dir_ok_for_repo_fails_closed_on_missing(tmp_path):
     # A path that can't be stat'd must fail closed (treated as unsafe), not accepted.
-    r = _sh(SRC_INSTALL, 'dir_no_other_write "%s" && echo OK || echo NO' % (tmp_path / "nope"))
+    r = _sh(SRC_INSTALL, 'dir_ok_for_repo "%s" && echo OK || echo NO' % (tmp_path / "nope"))
     assert r.stdout.strip() == "NO"
+
+
+def test_dir_ok_for_repo_rejects_symlink(tmp_path):
+    # stat -f is lstat, so a symlinked component (mode l...) is rejected even though it's
+    # self-owned -- otherwise exec/install would follow it to an unchecked target. The link is
+    # owned by YOU (so the owner check passes), so ONLY the l*) branch can reject it here.
+    target = tmp_path / "target"
+    target.mkdir()
+    target.chmod(0o700)
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    r = _sh(SRC_INSTALL, 'dir_ok_for_repo "%s" && echo OK || echo NO' % link)
+    assert r.stdout.strip() == "NO"
+
+
+def test_dir_ok_for_repo_rejects_foreign_owner(tmp_path):
+    # A self-owned dir must be rejected when the invoking uid is neither 0 nor the owner --
+    # i.e. an ancestor owned by a DIFFERENT non-root user. Creating a truly foreign-owned dir
+    # needs root (chown), so we spoof $uid to a bogus value instead: the dir (owned by YOU) is
+    # then neither root- nor self-owned from the predicate's view, exercising the owner branch.
+    d = tmp_path / "d"
+    d.mkdir()
+    d.chmod(0o700)
+    r = _sh(SRC_INSTALL, 'uid=424242\ndir_ok_for_repo "%s" && echo OK || echo NO' % d)
+    assert r.stdout.strip() == "NO"
+
+
+def test_verify_repo_ancestors_accepts_clean_user_chain(tmp_path):
+    # Every existing component of a private, self-owned chain (root-owned system dirs up top,
+    # your own dirs below) passes. realpath first so a symlinked $TMPDIR prefix (on macOS
+    # /var -> /private/var) isn't itself the offender -- we're vetting the user-owned tail.
+    base = os.path.realpath(str(tmp_path))
+    os.makedirs(base + "/a/b")
+    os.chmod(base + "/a", 0o755)
+    os.chmod(base + "/a/b", 0o755)
+    r = _sh(SRC_INSTALL, 'verify_repo_ancestors "%s/a/b/leaf" && echo OK || echo BAD' % base)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "OK"
+
+
+def test_verify_repo_ancestors_refuses_symlinked_component(tmp_path):
+    # A symlink ANYWHERE in the chain is refused: the walk lstat's each component and rejects
+    # mode l... (a self-owned link passes the owner check, so the symlink branch is what bites).
+    base = os.path.realpath(str(tmp_path))
+    os.makedirs(base + "/real/b")
+    os.symlink(base + "/real", base + "/link")
+    r = _sh(SRC_INSTALL, 'verify_repo_ancestors "%s/link/b/leaf" && echo OK || echo BAD' % base)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "BAD"
+    assert "refusing to install" in r.stderr
+
+
+def test_verify_repo_ancestors_refuses_group_writable_ancestor(tmp_path):
+    # A group/other-writable ANCESTOR (not just the leaf) is enough: unlink/rename is governed
+    # by the parent's write bit, so a loose mid-path dir lets another user swap the leaf.
+    base = os.path.realpath(str(tmp_path))
+    os.makedirs(base + "/loose/sub")
+    os.chmod(base + "/loose", 0o775)                 # group-writable ancestor
+    r = _sh(SRC_INSTALL, 'verify_repo_ancestors "%s/loose/sub/leaf" && echo OK || echo BAD' % base)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "BAD"
+    assert "refusing to install" in r.stderr
+
+
+def test_verify_repo_ancestors_refuses_foreign_owned_ancestor(tmp_path):
+    # An ancestor owned by a DIFFERENT non-root user is refused (they can rename components).
+    # Making a truly foreign-owned dir needs root (chown); lacking that, we spoof the invoking
+    # uid so our own self-owned ancestors read as foreign -- exercising the same owner branch of
+    # the walk. (If a future env CAN chown to another uid, a real foreign dir works identically.)
+    base = os.path.realpath(str(tmp_path))
+    os.makedirs(base + "/a/b")
+    os.chmod(base + "/a", 0o755)
+    os.chmod(base + "/a/b", 0o755)
+    r = _sh(SRC_INSTALL,
+            'uid=424242\nverify_repo_ancestors "%s/a/b/leaf" && echo OK || echo BAD' % base)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "BAD"
+    assert "refusing to install" in r.stderr
 
 
 def test_do_install_refuses_group_or_other_writable_proj(tmp_path):
     # Integration: do_install must ABORT (before any sudo) when $proj is group/other-writable.
     # We override $proj/$connect after sourcing and point them at a world-writable fake repo
-    # with an executable connect stub (so the earlier `-x` check passes). The writability
-    # refusal is ordered before every privileged/mutating step, so this never touches sudo.
+    # with an executable connect stub (so the earlier `-x` check passes). The refusal is
+    # ordered before every privileged/mutating step, so this never touches sudo.
     proj = tmp_path / "shared-clone"
     (proj / "bin").mkdir(parents=True)
     connect = proj / "bin" / "openconnect-auto-sso"
     connect.write_text("#!/bin/sh\n:\n")
     connect.chmod(0o755)
     proj.chmod(0o777)                                    # world-writable repo root
-    body = ('proj="%s"\nconnect="%s"\ndo_install\n') % (proj, connect)
+    rp = os.path.realpath(str(proj))
+    body = ('proj="%s"\nconnect="%s/bin/openconnect-auto-sso"\ndo_install\n') % (rp, rp)
     r = _sh(SRC_INSTALL, body)
     assert r.returncode != 0
-    assert "group- or other-writable" in r.stderr
+    assert "group/other-writable" in r.stderr
     assert "refusing to install" in r.stderr
 
 
@@ -249,10 +331,12 @@ def test_do_install_refuses_writable_connect_dir(tmp_path):
     connect.chmod(0o755)
     proj.chmod(0o755)                                    # root private...
     (proj / "bin").chmod(0o777)                          # ...but bin/ world-writable
-    body = ('proj="%s"\nconnect="%s"\ndo_install\n') % (proj, connect)
+    rp = os.path.realpath(str(proj))
+    body = ('proj="%s"\nconnect="%s/bin/openconnect-auto-sso"\ndo_install\n') % (rp, rp)
     r = _sh(SRC_INSTALL, body)
     assert r.returncode != 0
-    assert "group- or other-writable" in r.stderr
+    assert "group/other-writable" in r.stderr
+    assert "refusing to install" in r.stderr
 
 
 # --- lib/common.sh: server_hostport + wait_for_server ---------------------------------

@@ -74,19 +74,46 @@ dir_is_safe() {
     return 0
 }
 
-# True if directory $1 is NOT group- or other-writable. Unlike dir_is_safe this does NOT
-# require root ownership -- it vets the user's OWN repo ($proj), which the login agent runs
-# as the user (bin/openconnect-auto-sso) and which then reaches root via the NOPASSWD
-# openconnect rule. If the repo lived somewhere group/other-writable (a shared clone), a
-# non-owner could plant code there that runs as the victim -> passwordless root. Same POSIX
-# mode-bit check as dir_is_safe (and the same ACL limitation noted above), minus the
-# root-owned requirement. Fails closed if $1 can't be stat'd.
-dir_no_other_write() {
-    _mode=$(stat -f '%Sp' "$1" 2>/dev/null) || return 1
+# Per-component predicate for the user's OWN repo path. Like dir_is_safe, but the owner may
+# be root OR the invoking user ($uid) -- the repo is legitimately user-owned, so requiring
+# root ownership (as dir_is_safe does for the root teardown helper) would be wrong. A
+# component owned by a DIFFERENT non-root user is still unsafe: they can rename/replace it and
+# redirect the login agent's code -> passwordless root (the agent runs the connect script as
+# you and reaches root via the NOPASSWD openconnect rule). Rejects a symlinked component
+# (`stat -f` is lstat, so a symlink reports mode `l...`) and any group/other-writable
+# component -- the same POSIX mode-bit check as dir_is_safe (and the same ACL limitation noted
+# above), plus the owner-is-root-or-me rule. Fails closed if $1 can't be stat'd.
+dir_ok_for_repo() {
+    _st=$(stat -f '%u %Sp' "$1" 2>/dev/null) || return 1
+    _owner=${_st%% *}; _mode=${_st#* }
+    _wantuid=${uid:-$(id -u)}
+    [ "$_owner" = 0 ] || [ "$_owner" = "$_wantuid" ] || return 1   # root- or self-owned only
     case "$_mode" in
+        l*)                 return 1 ;;            # symlink -> writer follows it elsewhere
         ?????w*|????????w*) return 1 ;;            # group- or other-writable
     esac
     return 0
+}
+
+# Shared ancestor walk for the two install-time path guards. Emit the FIRST existing
+# component of directory path $1 (walking / down to the leaf) for which the predicate
+# function named in $2 returns non-zero; empty output means every existing component passed.
+# Meant to run ONLY inside a command substitution: that subshell scopes the `set -f` (stop
+# each segment being pathname-expanded -- a stray glob char would otherwise validate the
+# wrong paths) and IFS=/ (split on separators) so the caller's shell options stay untouched.
+# The predicate ($2) is a function, so it's available in this same shell.
+_first_bad_ancestor() {
+    set -f; IFS=/
+    _acc=""
+    for _seg in $1; do
+        [ -n "$_seg" ] || continue          # skip the empty leading segment
+        _acc="$_acc/$_seg"
+        # -e follows symlinks, -L catches a dangling one; either must be vetted because the
+        # writer (`install -d`, or the login agent that executes from here) follows whatever
+        # the path resolves to.
+        { [ -e "$_acc" ] || [ -L "$_acc" ]; } || continue
+        "$2" "$_acc" || { printf '%s' "$_acc"; break; }
+    done
 }
 
 # Verify EVERY existing component of directory path $1 (from / down to the leaf) is a
@@ -101,23 +128,7 @@ verify_safe_ancestors() {
         /*) ;;
         *)  echo "error: refusing to install under non-absolute path '$1'" >&2; return 1 ;;
     esac
-    # Walk every existing component from / to the leaf and emit the first unsafe one. Run
-    # the IFS/glob-sensitive split in a SUBSHELL: `set -f` stops each segment being
-    # pathname-expanded (a stray glob char would otherwise validate the wrong paths) and
-    # IFS=/ splits on separators -- both scoped to the subshell so the parent's options are
-    # untouched. dir_is_safe is a function, so it's available here.
-    _bad=$(
-        set -f; IFS=/
-        _acc=""
-        for _seg in $1; do
-            [ -n "$_seg" ] || continue          # skip the empty leading segment
-            _acc="$_acc/$_seg"
-            # -e follows symlinks, -L catches a dangling one; either must be vetted because
-            # `install -d` writes through whatever the path resolves to.
-            { [ -e "$_acc" ] || [ -L "$_acc" ]; } || continue
-            dir_is_safe "$_acc" || { printf '%s' "$_acc"; break; }
-        done
-    )
+    _bad=$(_first_bad_ancestor "$1" dir_is_safe)
     if [ -n "$_bad" ]; then
         echo "error: $_bad is not root-owned, is group/other-writable, or is a" >&2
         echo "       symlink; refusing to install a passwordless-root helper under it." >&2
@@ -126,22 +137,43 @@ verify_safe_ancestors() {
     return 0
 }
 
+# Verify EVERY existing component of the user's repo path $1 (from / down to the leaf) is
+# safe to host the login agent's code -- root- or self-owned, not a symlink, not
+# group/other-writable (see dir_ok_for_repo). Parallels verify_safe_ancestors and shares the
+# same walk, differing ONLY in the per-component owner rule: the repo is user-owned, so an
+# ancestor owned by root or by YOU is fine, but one owned by a different non-root user (or one
+# a non-owner can write/rename/symlink-redirect) lets them plant code the agent runs as you
+# -> passwordless root. Returns 0 if all-safe; prints the offender and returns 1 if not.
+verify_repo_ancestors() {
+    # Fail closed on a non-absolute (or empty) path -- the walk below assumes a leading /.
+    case $1 in
+        /*) ;;
+        *)  echo "error: refusing to install under non-absolute path '$1'" >&2; return 1 ;;
+    esac
+    _bad=$(_first_bad_ancestor "$1" dir_ok_for_repo)
+    if [ -n "$_bad" ]; then
+        echo "error: $_bad is group/other-writable, a symlink, or owned by another user;" >&2
+        echo "       refusing to install. The login agent runs the connect script as you and" >&2
+        echo "       reaches root via the NOPASSWD openconnect rule, so any repo-path" >&2
+        echo "       component another user can write, rename, or redirect lets them plant" >&2
+        echo "       code that runs as you (passwordless root). Move the repo somewhere" >&2
+        echo "       private (under your home, chmod go-w) and re-run." >&2
+        return 1
+    fi
+    return 0
+}
+
 do_install() {
     [ -x "$connect" ] || { echo "error: $connect not found/executable" >&2; exit 1; }
-    # The LaunchAgent runs $connect as YOU on every login, and $connect reaches root via
-    # the NOPASSWD openconnect rule -- so a non-owner who can write into the repo tree gets
-    # passwordless root by planting code the agent then runs. Refuse to install if the repo
-    # root ($proj) or the connect script's own dir is group/other-writable (a shared clone).
-    # We do NOT require root-ownership here (it's the user's repo) -- only that others can't
-    # write it. The normal case (repo under $HOME, user-private) passes.
+    # The LaunchAgent runs $connect as YOU on every login, and $connect reaches root via the
+    # NOPASSWD openconnect rule -- so a non-owner who can write, rename, or symlink-redirect
+    # ANY component of the repo path gets passwordless root by planting code the agent then
+    # runs. verify_repo_ancestors walks every existing component from / down to the leaf and
+    # refuses if any is group/other-writable, a symlink, or owned by a user other than root or
+    # you. We do NOT require root-ownership here (it's the user's repo) -- only that no OTHER
+    # user can subvert the path. The normal case (repo under $HOME, user-private) passes.
     for _d in "$proj" "$(dirname "$connect")"; do
-        dir_no_other_write "$_d" && continue
-        echo "error: $_d is group- or other-writable; refusing to install." >&2
-        echo "       the login agent runs $connect as you and can reach root via the" >&2
-        echo "       NOPASSWD openconnect rule, so a writable repo would let another user" >&2
-        echo "       plant code that runs as you. Move/clone it somewhere private (e.g." >&2
-        echo "       under your home directory, chmod go-w) and re-run." >&2
-        exit 1
+        verify_repo_ancestors "$_d" || exit 1
     done
     # A working config must exist first: otherwise RunAtLoad fails every login and
     # KeepAlive would respawn the failing connect forever. Fail loudly here instead.
@@ -341,8 +373,9 @@ do_status() {
     [ -f "$log" ] && echo "log:         $log" || echo "log:         (none yet) $log"
 }
 
-# The test harness sources this file to exercise dir_is_safe / verify_safe_ancestors in
-# isolation; OC_INSTALL_TEST=1 skips the subcommand dispatch so sourcing has no side
+# The test harness sources this file to exercise the path guards (dir_is_safe /
+# verify_safe_ancestors, dir_ok_for_repo / verify_repo_ancestors) in isolation;
+# OC_INSTALL_TEST=1 skips the subcommand dispatch so sourcing has no side
 # effects. Guard the dispatch with `if` rather than a top-level `return` -- `return` is
 # invalid in an executed script and, under dash, a stray OC_INSTALL_TEST=1 in the env
 # would make it silently exit without installing.
