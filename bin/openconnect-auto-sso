@@ -9,16 +9,23 @@
 set -eu
 
 # --- locate the project (works when symlinked into ~/.local/bin) -------------
-src=$0
-_n=0
-while [ -L "$src" ]; do
-    _n=$((_n + 1))
-    [ "$_n" -gt 40 ] && { echo "error: too many symlink levels resolving $0" >&2; exit 1; }
-    dir=$(cd "$(dirname "$src")" && pwd)
-    src=$(readlink "$src")
-    case $src in /*) ;; *) src=$dir/$src ;; esac
-done
-PROJ=$(cd "$(dirname "$src")/.." && pwd)
+# Normally $0-derived (following any symlink chain). Honor the OC_PROJ override ONLY under
+# the test seam (OC_CONNECT_TEST=1); a stray/poisoned OC_PROJ in a real run must NOT be able
+# to redirect $PROJ, which selects lib/common.sh and the vpn-browser/vpnc-slice helpers.
+if [ "${OC_CONNECT_TEST:-}" = 1 ] && [ -n "${OC_PROJ:-}" ]; then
+    PROJ="$OC_PROJ"
+else
+    src=$0
+    _n=0
+    while [ -L "$src" ]; do
+        _n=$((_n + 1))
+        [ "$_n" -gt 40 ] && { echo "error: too many symlink levels resolving $0" >&2; exit 1; }
+        dir=$(cd "$(dirname "$src")" && pwd)
+        src=$(readlink "$src")
+        case $src in /*) ;; *) src=$dir/$src ;; esac
+    done
+    PROJ=$(cd "$(dirname "$src")/.." && pwd)
+fi
 
 # B10: $PROJ is later spliced into `pgrep -f` / `pkill -f` patterns (the Phase-1
 # dead-man backstop and _end_browser), which BSD/macOS pgrep interprets as an ERE. A
@@ -38,6 +45,44 @@ esac
 
 . "$PROJ/lib/common.sh"   # RESOLVER_MARKER, TEARDOWN_BIN, and the recovery timing +
                           # helpers (wait_for_server, RECONNECT_TIMEOUT_*, NET_WAIT_MAX)
+
+# --- pure helpers, defined BEFORE the OC_CONNECT_TEST seam --------------------
+# These have no side effects at definition time, so a test can source this script under
+# OC_CONNECT_TEST=1 (which guards off the whole connect flow below) and exercise them in
+# isolation -- no config load, no startup sweep, no auth, no sudo.
+#
+# _shq: emit $1 as a safely single-quoted shell word (embedded ' -> '\''), so a space or
+# apostrophe in a path survives openconnect re-parsing the Phase-2 -s string via sh.
+_shq() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
+
+# apply_launch_budget: feed the launch mode ($OC_LAUNCHD: unset|once|keepalive, set only by
+# the LaunchAgent plist) to recovery_budget, which picks the reconnect + network-wait budgets
+# (lib/common.sh owns the rationale). Wrapped so the seam can exercise the OC_LAUNCHD wiring.
+apply_launch_budget() { recovery_budget "${OC_LAUNCHD:-}"; }
+
+# _build_vs: assemble the Phase-2 `-s` wrapper string into $vs from the config-derived globals
+# + the resolved $VPN_SLICE abs path. The caller appends `-s "$vs"` to openconnect's argv (the
+# `set --` stays in the caller so it edits the caller's positionals). Split out so the seam can
+# unit-test the _shq quoting and the --proxy/-I/-S/-i inclusion with no live tunnel.
+_build_vs() {
+    vs="$(_shq "$PROJ/bin/vpnc-slice")"
+    [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env $(_shq "$OC_DUMP")"        # diagnostic env dump
+    [ "$KEEPALIVE_HOST" = "@dns" ] && vs="$vs --write-dns $(_shq "$KA_DNS_FILE")"  # keepalive target
+    # DNS-driven auto-routing: resolve these names via the VPN's DNS and route each
+    # answered IP through the tunnel (handled by the wrapper + src/dnsroute.py).
+    [ -n "$PROXY_NAMES" ] && vs="$vs --proxy $PROXY_NAMES $PROXY_PORT $(_shq "$PROXY_PIDFILE")"
+    vs="$vs $(_shq "$VPN_SLICE")"
+    # ALLOW_INCOMING=1 drops vpn-slice's pf firewall (keeps iCloud Private Relay working).
+    [ "$ALLOW_INCOMING" = "1" ] && vs="$vs -i"
+    # Dynamic routes pushed by the VPN (no need to hardcode them):
+    [ "$ROUTE_INTERNAL" = "1" ] && vs="$vs -I"        # VPN's own subnet
+    [ "$ROUTE_SPLITS" = "1" ] && vs="$vs -S"          # server split-includes
+    [ -n "$SPLIT_ROUTES" ] && vs="$vs $SPLIT_ROUTES"  # your explicit subnets
+    return 0   # never let a false trailing `[ ] && ...` trip set -e in the caller
+}
+
+# --- everything below is the connect flow; OC_CONNECT_TEST=1 guards it off when sourced ---
+if [ "${OC_CONNECT_TEST:-}" != 1 ]; then
 
 # --- load configuration ------------------------------------------------------
 # Precedence: $OC_AUTO_SSO_CONFIG, then the standard external location
@@ -74,7 +119,7 @@ KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
 # rationale). The auto-start agent exports OC_LAUNCHD=keepalive|once in its plist; nothing
 # else does, so a lone run reads as unset and keeps openconnect's long in-process budget
 # (nothing would respawn it). An explicit `reconnect_timeout` from the config still wins.
-recovery_budget "${OC_LAUNCHD:-}"
+apply_launch_budget
 ALLOW_INCOMING="${ALLOW_INCOMING:-0}"
 PROXY_NAMES="${PROXY_NAMES:-}"          # DNS names routed via the VPN (proxy + /etc/resolver)
 ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (server-pushed)
@@ -296,9 +341,6 @@ set -- --cookie-on-stdin --servercert "$FINGERPRINT"
 # Budget for openconnect's own in-process reconnect; sized by supervisor presence above.
 # lib/common.sh owns the rationale (why a sleep needs a FRESH connect, not a reconnect).
 set -- "$@" --reconnect-timeout="$RECONNECT_TIMEOUT"
-# _shq: emit $1 as a safely single-quoted shell word (embedded ' -> '\''), so a
-# space or apostrophe in a path survives openconnect re-parsing the -s string via sh.
-_shq() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
 if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUTE_SPLITS" = "1" ]; then
     # root's PATH usually excludes Homebrew, so resolve vpn-slice to an abs path.
     VPN_SLICE=$(command -v vpn-slice || true)
@@ -322,19 +364,7 @@ if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUT
     # an apostrophe -- in $PROJ or $TMPDIR. The unquoted fields (PROXY_NAMES/
     # PROXY_PORT/SPLIT_ROUTES) are validated by loadconfig to contain no spaces or
     # shell metacharacters.
-    vs="$(_shq "$PROJ/bin/vpnc-slice")"
-    [ -n "${OC_DUMP:-}" ] && vs="$vs --dump-env $(_shq "$OC_DUMP")"        # diagnostic env dump
-    [ "$KEEPALIVE_HOST" = "@dns" ] && vs="$vs --write-dns $(_shq "$KA_DNS_FILE")"  # keepalive target
-    # DNS-driven auto-routing: resolve these names via the VPN's DNS and route each
-    # answered IP through the tunnel (handled by the wrapper + src/dnsroute.py).
-    [ -n "$PROXY_NAMES" ] && vs="$vs --proxy $PROXY_NAMES $PROXY_PORT $(_shq "$PROXY_PIDFILE")"
-    vs="$vs $(_shq "$VPN_SLICE")"
-    # ALLOW_INCOMING=1 drops vpn-slice's pf firewall (keeps iCloud Private Relay working).
-    [ "$ALLOW_INCOMING" = "1" ] && vs="$vs -i"
-    # Dynamic routes pushed by the VPN (no need to hardcode them):
-    [ "$ROUTE_INTERNAL" = "1" ] && vs="$vs -I"        # VPN's own subnet
-    [ "$ROUTE_SPLITS" = "1" ] && vs="$vs -S"          # server split-includes
-    [ -n "$SPLIT_ROUTES" ] && vs="$vs $SPLIT_ROUTES"  # your explicit subnets
+    _build_vs                 # sets $vs from the config globals + $VPN_SLICE (helper above)
     set -- "$@" -s "$vs"
 fi
 # Full tunnel (no split/DNS options) needs no -s: openconnect uses its own default
@@ -377,3 +407,5 @@ trap '
 
 echo ">> connecting tunnel (sudo)" >&2
 printf '%s' "$COOKIE" | sudo "$OPENCONNECT" "$@" "$CONNECT_URL"
+
+fi   # end OC_CONNECT_TEST seam (the connect flow above never runs when sourced)

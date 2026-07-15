@@ -27,6 +27,11 @@ MARKER = "# openconnect-auto-sso"
 # Source lines that load each script's functions with its main body guarded off.
 SRC_VPNC = 'export OC_VPNC_SLICE_TEST=1; . "$OC_PROJ/bin/vpnc-slice"'
 SRC_INSTALL = 'export OC_INSTALL_TEST=1; . "$OC_PROJ/install-autostart.sh"'
+CONNECT = os.path.join(REPO, "bin", "openconnect-auto-sso")
+# Unlike the others, source the connect script by its LITERAL path, not "$OC_PROJ/...":
+# its $PROJ ERE-guard tests override OC_PROJ to a metachar path, and we must still be able
+# to locate the real script to source. OC_PROJ then only drives the guard/`$PROJ` value.
+SRC_CONNECT = 'export OC_CONNECT_TEST=1; . "%s"' % CONNECT
 TEARDOWN = os.path.join(REPO, "libexec", "vpn-teardown")
 
 
@@ -94,12 +99,16 @@ def test_sweep_without_keeplist_removes_all_our_port(tmp_path):
     _mk_resolver(tmp_path / "a.corp", 45353)
     _mk_resolver(tmp_path / "b.corp", 45353)
     _mk_resolver(tmp_path / "c.corp", 40000)         # different port -> left intact
-    (tmp_path / "foreign.corp").write_text("nameserver 9.9.9.9\n")
+    (tmp_path / "foreign.corp").write_text("nameserver 9.9.9.9\n")   # no marker, no port line
+    # Same port (45353) but NO marker line: isolates the MARKER filter. foreign.corp above is
+    # also protected by the port filter, so without this file removing the marker check would
+    # go unnoticed; this file survives ONLY because sweep refuses files lacking our marker.
+    (tmp_path / "portonly.corp").write_text("nameserver 127.0.0.1\nport 45353\n")
     body = '_port=45353\n_sweep_our_resolvers\n'
     r = _sh(SRC_VPNC, body, extra_env={"RESOLVER_DIR": str(tmp_path)})
     assert r.returncode == 0, r.stderr
     remaining = {p.name for p in tmp_path.iterdir()}
-    assert remaining == {"c.corp", "foreign.corp"}
+    assert remaining == {"c.corp", "foreign.corp", "portonly.corp"}
 
 
 # --- vpnc-slice: proxy-state helpers (ownership invariant / orphan reclaim) ---
@@ -188,10 +197,16 @@ def test_may_touch_proxy_true_when_no_pidfile(tmp_path):
 
 def test_may_touch_proxy_true_when_owner_is_us(tmp_path):
     # owner == our VPNPID -> ours (openconnect keeps its PID across an in-process reconnect,
-    # so this reclaims our OWN old proxy). Short-circuits before any `ps` liveness probe.
+    # so this reclaims our OWN old proxy). CRUCIAL: stub `ps` so the owner PID reads as a LIVE
+    # openconnect, making the owner==VPNPID short-circuit the ONLY path to TOUCH -- if that
+    # branch is broken, the fallthrough ps probe now sees a live openconnect and returns LEAVE.
+    # (Without a live-openconnect stub the fallthrough would also yield TOUCH for the fake PID,
+    # so the test would pass even with the self-ownership check disabled -- a tautology.)
     pf = tmp_path / "proxy"
-    pf.write_text("4242\n7777\n")
-    body = ('_pidfile="%s"\nVPNPID=7777\n'
+    pf.write_text("4242\n7777\n")            # line 1 dnsroute 4242, line 2 owner == our VPNPID
+    body = ('ps() { case "$*" in *7777*) echo "/opt/homebrew/bin/openconnect" ;; '
+            '*) echo "/usr/bin/less" ;; esac; }\n'
+            '_pidfile="%s"\nVPNPID=7777\n'
             '_may_touch_proxy && echo TOUCH || echo LEAVE\n') % pf
     r = _sh(SRC_VPNC, body)
     assert r.returncode == 0, r.stderr
@@ -199,12 +214,15 @@ def test_may_touch_proxy_true_when_owner_is_us(tmp_path):
 
 
 def test_may_touch_proxy_false_for_live_different_openconnect(tmp_path):
-    # A live DIFFERENT openconnect owner -> LEAVE. Stub `ps` (a shell function shadows the
-    # external command) so the owner PID reads as a live openconnect; the invariant must
-    # then refuse to touch the proxy so the other tunnel's state survives.
+    # A live DIFFERENT openconnect owner -> LEAVE. The `ps` stub is ARGUMENT-AWARE: it reports
+    # openconnect ONLY for the owner PID on line 2 (55555), and a non-openconnect for the
+    # dnsroute PID on line 1 (4242). So the LEAVE verdict depends on the invariant reading the
+    # OWNER from line 2 -- if it read line 1 instead, ps would report a non-openconnect and it
+    # would wrongly reclaim (TOUCH). This pins both the liveness probe AND the line-2 read.
     pf = tmp_path / "proxy"
     pf.write_text("4242\n55555\n")   # owner (line 2) 55555, different from VPNPID below
-    body = ('ps() { echo "/opt/homebrew/bin/openconnect"; }\n'
+    body = ('ps() { case "$*" in *55555*) echo "/opt/homebrew/bin/openconnect" ;; '
+            '*) echo "/usr/bin/less" ;; esac; }\n'
             '_pidfile="%s"\nVPNPID=999999\n'
             '_may_touch_proxy && echo TOUCH || echo LEAVE\n') % pf
     r = _sh(SRC_VPNC, body)
@@ -638,3 +656,136 @@ def test_teardown_default_noop_when_not_connected(tmp_path):
     # No openconnect running -> nothing to kill, exit 0 before any signal is sent.
     r = _run_teardown([], tmp_path, pgrep_out="", pgrep_rc=1)
     assert r.returncode == 0
+
+
+# --- bin/openconnect-auto-sso: OC_CONNECT_TEST=1 seam ---------------------------------
+# The connect script runs its whole two-phase flow at top level (config load, startup sweeps,
+# auth, sudo). OC_CONNECT_TEST=1 guards that flow off so sourcing defines ONLY the pure helpers
+# (_shq / apply_launch_budget / _build_vs) and runs the $PROJ ERE-guard -- no side effects. That
+# lets these tests exercise the previously-uncovered connect-script logic offline.
+def test_connect_sources_clean_under_seam():
+    # The seam contract: sourcing under OC_CONNECT_TEST=1 emits nothing and exits 0 (no config
+    # load, no auth, no sudo). Also confirms a metachar-free $PROJ passes the ERE guard.
+    r = _sh(SRC_CONNECT, ':\n')
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == ""
+    assert r.stderr == ""
+
+
+def test_connect_shq_wraps_and_escapes_apostrophe():
+    # _shq single-quotes its arg and splices an embedded ' as '\'' so a space/apostrophe in a
+    # path survives openconnect re-parsing the Phase-2 -s string via sh.
+    r = _sh(SRC_CONNECT, 'printf "%s" "$(_shq "$P")"\n', extra_env={"P": "a b'c"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "'a b'\\''c'"
+
+
+@pytest.mark.parametrize("path", [
+    "/opt/my repo", "/it's/a path", "/a$b/c", "/x;rm -rf/y", "/plain/path", "/tab\tsep",
+])
+def test_connect_shq_roundtrips_through_eval(path):
+    # The real contract: eval'ing the quoted word recovers the ORIGINAL string byte-for-byte,
+    # even with spaces, apostrophes, $, ;, tabs. A broken escape would corrupt the round-trip.
+    body = ('q=$(_shq "$P")\n'
+            'eval "back=$q"\n'
+            '[ "$back" = "$P" ] && echo ROUNDTRIP_OK || echo MISMATCH:"$back"\n')
+    r = _sh(SRC_CONNECT, body, extra_env={"P": path})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "ROUNDTRIP_OK", (path, r.stdout)
+
+
+@pytest.mark.parametrize("mode,expect", [
+    ("keepalive", ["30", "300"]),   # respawned by launchd: give up fast, wait out the throttle
+    ("once", ["300", "300"]),       # at-login but NO respawner: long budget, long boot-net wait
+    ("", ["300", "10"]),            # interactive: long budget, short wait (a human is watching)
+])
+def test_connect_apply_launch_budget_wires_oc_launchd(mode, expect):
+    # The connect script feeds $OC_LAUNCHD (NOT the removed OC_SUPERVISED, not a hardcoded mode)
+    # to recovery_budget. Reverting the wiring would make keepalive/once stop selecting 30/300.
+    body = 'apply_launch_budget\nprintf "%s %s\\n" "$RECONNECT_TIMEOUT" "$NET_WAIT_MAX"\n'
+    r = _sh(SRC_CONNECT, body, extra_env={"OC_LAUNCHD": mode})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == expect
+
+
+def test_connect_apply_launch_budget_config_reconnect_wins():
+    # A config-provided reconnect_timeout (already in the env as RECONNECT_TIMEOUT) is preserved
+    # through the connect script's wiring, not clobbered by the launch-mode default.
+    body = 'RECONNECT_TIMEOUT=77\napply_launch_budget\nprintf "%s\\n" "$RECONNECT_TIMEOUT"\n'
+    r = _sh(SRC_CONNECT, body, extra_env={"OC_LAUNCHD": "keepalive"})
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "77"
+
+
+@pytest.mark.parametrize("bad", [
+    "/tmp/a+b", "/tmp/a|b", "/tmp/a(b)", "/tmp/a*b", "/tmp/a[b]", "/tmp/a{b}", "/tmp/a^b",
+])
+def test_connect_proj_ere_guard_rejects_metachars(bad):
+    # Finding 10: $PROJ is spliced into pgrep/pkill -f patterns (ERE on BSD), so a regex metachar
+    # in the repo path would break/over-broaden the Phase-1 backstop match. The guard runs at
+    # source time (before the seam body), so a metachar $PROJ makes sourcing exit non-zero.
+    r = _sh(SRC_CONNECT, 'echo REACHED_BODY\n', extra_env={"OC_PROJ": bad})
+    assert r.returncode != 0
+    assert "regex metacharacter" in r.stderr
+    assert "REACHED_BODY" not in r.stdout
+
+
+def test_connect_proj_ere_guard_accepts_dotted_path(tmp_path):
+    # A `.` is deliberately ALLOWED (common in paths; inside an otherwise-literal ERE it only
+    # matches its own position). Point $PROJ at a dotted dir whose lib/ is symlinked to the real
+    # repo (so the post-guard `. $PROJ/lib/common.sh` resolves): the guard must PASS, the seam
+    # then skip the body, and sourcing succeed -- proving a dotted path is accepted, not rejected.
+    dotted = tmp_path / "a.b.repo"
+    dotted.mkdir()
+    (dotted / "lib").symlink_to(os.path.join(REPO, "lib"))
+    r = _sh(SRC_CONNECT, 'echo PASSED\n', extra_env={"OC_PROJ": str(dotted)})
+    assert r.returncode == 0, r.stderr
+    assert "PASSED" in r.stdout
+
+
+def test_connect_build_vs_full_includes_flags_and_quotes():
+    # Phase-2 -s assembly: abs paths single-quoted (survive a space when openconnect re-splits
+    # the string via sh), --proxy carries the validated names+port+quoted pidfile, and the
+    # -i/-I/-S/--write-dns toggles all appear when their config vars are on.
+    body = (
+        'PROJ="/opt/my repo"\nVPN_SLICE="/usr/local/bin/vpn-slice"\n'
+        'PROXY_NAMES="a.corp,b.corp"; PROXY_PORT=45353; PROXY_PIDFILE="/var/run/p.45353"\n'
+        'KEEPALIVE_HOST="@dns"; KA_DNS_FILE="/tmp/x.dns"; OC_DUMP=""\n'
+        'ALLOW_INCOMING=1; ROUTE_INTERNAL=1; ROUTE_SPLITS=1; SPLIT_ROUTES="10.0.0.0/8"\n'
+        '_build_vs\nprintf "%s" "$vs"\n'
+    )
+    r = _sh(SRC_CONNECT, body)
+    assert r.returncode == 0, r.stderr
+    vs = r.stdout
+    assert "'/opt/my repo/bin/vpnc-slice'" in vs      # wrapper path quoted (has a space)
+    assert "'/usr/local/bin/vpn-slice'" in vs         # vpn-slice bin quoted
+    assert "--proxy a.corp,b.corp 45353 '/var/run/p.45353'" in vs
+    assert "--write-dns '/tmp/x.dns'" in vs
+    assert " -i" in vs and " -I" in vs and " -S" in vs
+    assert vs.endswith("10.0.0.0/8")                  # explicit split route appended last
+
+
+def test_connect_build_vs_minimal_omits_optional_flags():
+    # With no proxy/keepalive/route flags set, $vs is exactly the quoted wrapper + quoted
+    # vpn-slice bin -- none of --proxy/--write-dns/-i/-I/-S may leak in.
+    body = (
+        'PROJ="/opt/repo"\nVPN_SLICE="/usr/local/bin/vpn-slice"\n'
+        'PROXY_NAMES=""; PROXY_PORT=45353; PROXY_PIDFILE="/var/run/p"\n'
+        'KEEPALIVE_HOST=""; KA_DNS_FILE="/tmp/x"; OC_DUMP=""\n'
+        'ALLOW_INCOMING=0; ROUTE_INTERNAL=0; ROUTE_SPLITS=0; SPLIT_ROUTES=""\n'
+        '_build_vs\nprintf "[%s]" "$vs"\n'
+    )
+    r = _sh(SRC_CONNECT, body)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "['/opt/repo/bin/vpnc-slice' '/usr/local/bin/vpn-slice']"
+
+
+def test_connect_refuse_block_removed():
+    # Step A deleted the "refuse a second instance" block (the _running_oc line-2 probe that
+    # aborted a second run with "already connected"). Assert those removed tokens are gone, so a
+    # regression re-introducing the lockout is caught. The unrelated resolver-sweep warning "an
+    # openconnect is already running" is a DIFFERENT message and is intentionally not matched.
+    with open(CONNECT) as f:
+        src = f.read()
+    assert "_running_oc" not in src
+    assert "already connected" not in src
