@@ -28,14 +28,18 @@ set -eu
 
 # This wrapper always runs as ROOT in production (the vpnc-script under sudo openconnect).
 # $PROJ (two dirs up from $0) locates lib/common.sh + the venv; $RESOLVER_DIR is where the
-# macOS scoped-resolver files live. Both carry test-only overrides (OC_PROJ / RESOLVER_DIR)
-# so the functions can be unit-tested when sourced as the non-root user -- but we IGNORE
-# them when running as root, so nothing on the privileged path (root-sourced common.sh,
-# root-run dnsroute.py, root-written resolver files) can be redirected by a leaked env var,
-# independent of any sudoers env_keep. (Sudo also strips the env; this is defense in depth.)
+# macOS scoped-resolver files live. These carry test-only overrides (OC_PROJ / RESOLVER_DIR /
+# NC_BIN) so the functions can be unit-tested when sourced as the non-root user -- but we
+# IGNORE them when running as root, so nothing on the privileged path (root-sourced
+# common.sh, root-run dnsroute.py, root-written resolver files, the netcat probe) can be
+# redirected by a leaked env var, independent of any sudoers env_keep. (Sudo also strips the
+# env; this is defense in depth.) NC_BIN is forced BEFORE sourcing common.sh so its
+# `${NC_BIN:-...}` keeps the pinned value -- nothing on the root path calls server_reachable
+# today, but pinning it keeps a future root caller (or an env_keep) off an attacker's binary.
 if [ "$(id -u)" = 0 ]; then
     PROJ=$(cd "$(dirname "$0")/.." && pwd)
     RESOLVER_DIR=/etc/resolver
+    NC_BIN=/usr/bin/nc
 else
     PROJ="${OC_PROJ:-$(cd "$(dirname "$0")/.." && pwd)}"
     RESOLVER_DIR="${RESOLVER_DIR:-/etc/resolver}"

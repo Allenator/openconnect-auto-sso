@@ -56,12 +56,34 @@ xml_escape() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; 
 # hijacking the grant. `stat -f` is lstat (no -L), so it reports a symlink as mode
 # `l...`, which we reject -- otherwise the writer (`install -d`) would follow the link
 # to an unchecked target.
+#
+# LIMITATION: `stat -f %Sp` shows only POSIX mode bits, so this is blind to a macOS ACL
+# (e.g. an `everyone allow write` ACE added via `chmod +a`, visible only under `ls -lde`).
+# A dir could thus be ACL-writable while its mode bits look tight. Exploiting that needs the
+# attacker to already own or be root on the path to set the ACL, which is a strictly stronger
+# position than this check defends against -- so it is not a practical escalation, and we keep
+# the check to the mode bits rather than parsing `ls -lde` output on every path component.
 dir_is_safe() {
     _st=$(stat -f '%u %Sp' "$1" 2>/dev/null) || return 1
     _uid=${_st%% *}; _mode=${_st#* }
     [ "$_uid" = 0 ] || return 1                    # root-owned?
     case "$_mode" in
         l*)                 return 1 ;;            # symlink -> install -d follows it elsewhere
+        ?????w*|????????w*) return 1 ;;            # group- or other-writable
+    esac
+    return 0
+}
+
+# True if directory $1 is NOT group- or other-writable. Unlike dir_is_safe this does NOT
+# require root ownership -- it vets the user's OWN repo ($proj), which the login agent runs
+# as the user (bin/openconnect-auto-sso) and which then reaches root via the NOPASSWD
+# openconnect rule. If the repo lived somewhere group/other-writable (a shared clone), a
+# non-owner could plant code there that runs as the victim -> passwordless root. Same POSIX
+# mode-bit check as dir_is_safe (and the same ACL limitation noted above), minus the
+# root-owned requirement. Fails closed if $1 can't be stat'd.
+dir_no_other_write() {
+    _mode=$(stat -f '%Sp' "$1" 2>/dev/null) || return 1
+    case "$_mode" in
         ?????w*|????????w*) return 1 ;;            # group- or other-writable
     esac
     return 0
@@ -106,6 +128,21 @@ verify_safe_ancestors() {
 
 do_install() {
     [ -x "$connect" ] || { echo "error: $connect not found/executable" >&2; exit 1; }
+    # The LaunchAgent runs $connect as YOU on every login, and $connect reaches root via
+    # the NOPASSWD openconnect rule -- so a non-owner who can write into the repo tree gets
+    # passwordless root by planting code the agent then runs. Refuse to install if the repo
+    # root ($proj) or the connect script's own dir is group/other-writable (a shared clone).
+    # We do NOT require root-ownership here (it's the user's repo) -- only that others can't
+    # write it. The normal case (repo under $HOME, user-private) passes.
+    for _d in "$proj" "$(dirname "$connect")"; do
+        dir_no_other_write "$_d" && continue
+        echo "error: $_d is group- or other-writable; refusing to install." >&2
+        echo "       the login agent runs $connect as you and can reach root via the" >&2
+        echo "       NOPASSWD openconnect rule, so a writable repo would let another user" >&2
+        echo "       plant code that runs as you. Move/clone it somewhere private (e.g." >&2
+        echo "       under your home directory, chmod go-w) and re-run." >&2
+        exit 1
+    done
     # A working config must exist first: otherwise RunAtLoad fails every login and
     # KeepAlive would respawn the failing connect forever. Fail loudly here instead.
     cfg="${OC_AUTO_SSO_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/openconnect-auto-sso/config.toml}"
@@ -196,9 +233,19 @@ PLIST
     # Privileged step. Roll back BOTH the sudoers file and the plist if anything
     # below fails, so a partial install never leaves passwordless root with no agent.
     _did_sudoers=n; _did_plist=n; _did_libexec=n
+    # The rollback must NOT silently swallow a failed sudoers removal: that is the one file
+    # whose survival leaves passwordless root behind. Surface it loudly (matching
+    # do_uninstall's "STILL ACTIVE" warning) while still attempting the other cleanups --
+    # each step is isolated so one failure can't abort the rest of the trap. The `if`
+    # condition is exempt from set -e, so a failed `sudo rm` triggers the warning instead
+    # of aborting mid-rollback.
     trap '
         [ "$_did_plist" = y ] && rm -f "$plist" 2>/dev/null || true
-        [ "$_did_sudoers" = y ] && sudo rm -f "$sudoers" 2>/dev/null || true
+        if [ "$_did_sudoers" = y ] && ! sudo rm -f "$sudoers" 2>/dev/null; then
+            echo "ERROR (rollback): could not remove $sudoers -- the passwordless-root" >&2
+            echo "       sudoers rule is STILL ACTIVE. Remove it manually:" >&2
+            echo "       sudo rm -f $sudoers" >&2
+        fi
         [ "$_did_libexec" = y ] && sudo rm -rf "$libexecdir" 2>/dev/null || true
         rm -f "$ptmp" "${stmp:-}" 2>/dev/null || true
     ' EXIT

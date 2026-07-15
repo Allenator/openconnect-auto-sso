@@ -141,6 +141,24 @@ def test_is_dnsroute_matches_real_dnsroute_not_others():
         proc.wait(timeout=5)
 
 
+# --- vpnc-slice: NC_BIN root-gate (off-root the override is still honored) -----------
+def test_vpnc_slice_nonroot_honors_nc_bin_override(tmp_path):
+    # Off the root path (the test runs as non-root), vpnc-slice must NOT pin NC_BIN, so
+    # common.sh's server_reachable can still be stubbed for the wait_for_server tests. The
+    # ROOT branch forces NC_BIN=/usr/bin/nc before sourcing common.sh, making the probe inert
+    # regardless of a future root caller or a sudoers env_keep -- but that can't be unit-tested
+    # without being root (same limitation as the PROJ/RESOLVER_DIR root-gate), so it's verified
+    # by inspection. This test pins the complementary half: the seam survives off the root path.
+    nc = tmp_path / "nc"
+    nc.write_text("#!/bin/sh\nexit 0\n")
+    nc.chmod(0o755)
+    r = _sh(SRC_VPNC, 'printf "%s\\n" "$NC_BIN"\nserver_reachable host 443 && echo REACH\n',
+            extra_env={"NC_BIN": str(nc)})
+    assert r.returncode == 0, r.stderr
+    assert str(nc) in r.stdout      # override survived (non-root branch didn't pin it)
+    assert "REACH" in r.stdout      # and the stub was actually invoked by server_reachable
+
+
 # --- install-autostart: dir_is_safe + verify_safe_ancestors (NOPASSWD-helper guard) ---
 def test_dir_is_safe_rejects_user_owned(tmp_path):
     r = _sh(SRC_INSTALL, 'dir_is_safe "%s" && echo SAFE || echo UNSAFE' % tmp_path)
@@ -175,6 +193,66 @@ def test_verify_safe_ancestors_rejects_unsafe_ancestor(tmp_path):
     r = _sh(SRC_INSTALL, 'verify_safe_ancestors "%s" && echo OK || echo BAD' % leaf)
     assert r.stdout.strip() == "BAD"
     assert "refusing to install" in r.stderr
+
+
+# --- install-autostart: dir_no_other_write ($proj writability guard, D2) --------------
+@pytest.mark.parametrize("mode,expect", [
+    (0o700, "OK"), (0o755, "OK"), (0o750, "OK"), (0o705, "OK"),   # no group/other write
+    (0o770, "NO"), (0o720, "NO"), (0o775, "NO"),                  # group-writable
+    (0o702, "NO"), (0o706, "NO"), (0o707, "NO"),                  # other-writable
+    (0o777, "NO"),                                                # both
+])
+def test_dir_no_other_write(tmp_path, mode, expect):
+    # The connect script is run by the login agent as YOU and reaches root via NOPASSWD
+    # openconnect, so a group/other-writable repo is a passwordless-root vector. Unlike
+    # dir_is_safe this does NOT require root ownership (it's the user's own repo) -- only
+    # that group/other can't write it.
+    d = tmp_path / ("m%o" % mode)
+    d.mkdir()
+    d.chmod(mode)
+    r = _sh(SRC_INSTALL, 'dir_no_other_write "%s" && echo OK || echo NO' % d)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == expect, oct(mode)
+
+
+def test_dir_no_other_write_fails_closed_on_missing(tmp_path):
+    # A path that can't be stat'd must fail closed (treated as unsafe), not accepted.
+    r = _sh(SRC_INSTALL, 'dir_no_other_write "%s" && echo OK || echo NO' % (tmp_path / "nope"))
+    assert r.stdout.strip() == "NO"
+
+
+def test_do_install_refuses_group_or_other_writable_proj(tmp_path):
+    # Integration: do_install must ABORT (before any sudo) when $proj is group/other-writable.
+    # We override $proj/$connect after sourcing and point them at a world-writable fake repo
+    # with an executable connect stub (so the earlier `-x` check passes). The writability
+    # refusal is ordered before every privileged/mutating step, so this never touches sudo.
+    proj = tmp_path / "shared-clone"
+    (proj / "bin").mkdir(parents=True)
+    connect = proj / "bin" / "openconnect-auto-sso"
+    connect.write_text("#!/bin/sh\n:\n")
+    connect.chmod(0o755)
+    proj.chmod(0o777)                                    # world-writable repo root
+    body = ('proj="%s"\nconnect="%s"\ndo_install\n') % (proj, connect)
+    r = _sh(SRC_INSTALL, body)
+    assert r.returncode != 0
+    assert "group- or other-writable" in r.stderr
+    assert "refusing to install" in r.stderr
+
+
+def test_do_install_refuses_writable_connect_dir(tmp_path):
+    # The bin/ dir holding $connect is checked too: a private repo root but a world-writable
+    # bin/ (where the executed script lives) is still a plant-the-binary vector.
+    proj = tmp_path / "repo"
+    (proj / "bin").mkdir(parents=True)
+    connect = proj / "bin" / "openconnect-auto-sso"
+    connect.write_text("#!/bin/sh\n:\n")
+    connect.chmod(0o755)
+    proj.chmod(0o755)                                    # root private...
+    (proj / "bin").chmod(0o777)                          # ...but bin/ world-writable
+    body = ('proj="%s"\nconnect="%s"\ndo_install\n') % (proj, connect)
+    r = _sh(SRC_INSTALL, body)
+    assert r.returncode != 0
+    assert "group- or other-writable" in r.stderr
 
 
 # --- lib/common.sh: server_hostport + wait_for_server ---------------------------------
