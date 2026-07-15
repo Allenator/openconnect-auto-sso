@@ -152,6 +152,8 @@ Run `./install.sh` first so a config exists — `install` refuses to load an age
 tail -f ~/Library/Logs/openconnect-auto-sso.log
 ```
 
+> **Upgrading an existing install.** Re-run `./install-autostart.sh install` (or `install --once`) after pulling changes. The LaunchAgent plist bakes in a copy of `OC_LAUNCHD` and `ThrottleInterval` at install time, so a plist written by an older version keeps stale values — it may lack `OC_LAUNCHD` (or carry a retired variable) and pin an out-of-date throttle window — until you regenerate it.
+
 The agent runs in your GUI session (`Aqua`), so a **warm** cookie connects silently while a **cold** one still pops the SSO window at login. By default it reconnects if the tunnel drops. Note that a *persistent* failure keeps retrying roughly every 5 minutes — for a dead network that cadence comes from the reachability wait (see [Sleep and wake](#sleep-and-wake)), and for an SSO login you keep dismissing it comes from launchd's throttle, which re-pops the login each time; use `--once` (or `uninstall`) if that's not what you want.
 
 Because the agent runs as you but the tunnel runs as root, it can't signal openconnect directly. The teardown helper closes that gap: on **logout** the connect script calls it (via a scoped NOPASSWD rule) to send openconnect a clean disconnect, and `uninstall` stops a running tunnel the same way before removing anything — so neither strands a root tunnel with leftover routes/DNS. (If openconnect is ever `SIGKILL`ed instead — e.g. a crash — that clean path is skipped; a stray `/etc/resolver/<name>` can then block the next connect until you `sudo rm` it, which the startup sweep points out.)
@@ -176,6 +178,8 @@ Environment knobs (browser helper and connect script):
 | `VPN_BROWSER_TIMEOUT_MS` | overall safety timeout (default 300000)            |
 | `OC_AUTO_SSO_CONFIG`     | path to an alternate config file                   |
 | `OC_DUMP`                | dump the server-advertised env vars to this file   |
+| `OC_LAUNCHD`             | auto-start mode, baked into the plist by `install-autostart.sh`: `keepalive` reconnects on drop, `once` connects at login only; unset = interactive. Selects the reconnect budget + network-wait bound (see [Sleep and wake](#sleep-and-wake)) — leave it to the installer, don't set it by hand. |
+| `PHASE1_DEADLINE`        | seconds Phase 1 waits for the SSO helper before aborting a wedged login (default 420) |
 
 ## Scope
 

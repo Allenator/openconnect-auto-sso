@@ -53,11 +53,11 @@ PROFILE_NAME="${PROFILE_NAME:-openconnect-auto-sso}"
 CALLBACK="${CALLBACK:-localhost:29786}"
 KEEPALIVE_HOST="${KEEPALIVE_HOST:-}"
 KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
-# Pick the reconnect budget + network-wait bound from supervisor presence (lib/common.sh
-# owns the rationale). The auto-start agent exports OC_SUPERVISED=1 in its plist; nothing
-# else does, so a lone run keeps openconnect's long in-process budget (nothing would
-# respawn it). An explicit `reconnect_timeout` from the config still wins.
-recovery_budget "${OC_SUPERVISED:-}"
+# Pick the reconnect budget + network-wait bound from OC_LAUNCHD (lib/common.sh owns the
+# rationale). The auto-start agent exports OC_LAUNCHD=keepalive|once in its plist; nothing
+# else does, so a lone run reads as unset and keeps openconnect's long in-process budget
+# (nothing would respawn it). An explicit `reconnect_timeout` from the config still wins.
+recovery_budget "${OC_LAUNCHD:-}"
 ALLOW_INCOMING="${ALLOW_INCOMING:-0}"
 PROXY_NAMES="${PROXY_NAMES:-}"          # DNS names routed via the VPN (proxy + /etc/resolver)
 ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (server-pushed)

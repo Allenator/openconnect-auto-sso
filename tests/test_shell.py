@@ -411,24 +411,34 @@ def test_wait_for_server_recovers_when_server_comes_back(tmp_path):
 
 def test_net_wait_max_is_at_least_throttle_interval():
     # The load-bearing invariant: launchd delays a respawn by (ThrottleInterval - runtime),
-    # so the SUPERVISED wait must outlast the throttle window or an eventual give-up idles
-    # out the rest. recovery_budget owns the supervised NET_WAIT_MAX.
-    r = _sh(SRC_COMMON, 'recovery_budget 1\nprintf "%s %s\\n" "$NET_WAIT_MAX" "$THROTTLE_INTERVAL"\n')
+    # so the keepalive wait must outlast the throttle window or an eventual give-up idles
+    # out the rest. recovery_budget owns the keepalive NET_WAIT_MAX.
+    r = _sh(SRC_COMMON, 'recovery_budget keepalive\nprintf "%s %s\\n" "$NET_WAIT_MAX" "$THROTTLE_INTERVAL"\n')
     assert r.returncode == 0, r.stderr
     net_wait, throttle = (int(x) for x in r.stdout.split())
     assert net_wait >= throttle
 
 
-# --- lib/common.sh: recovery_budget (supervisor-presence -> budget selection) ---
-def test_recovery_budget_supervised():
-    # OC_SUPERVISED=1 (launchd): give up fast (30) and wait out the whole throttle window.
-    r = _sh(SRC_COMMON, 'recovery_budget 1\nprintf "%s %s\\n" "$RECONNECT_TIMEOUT" "$NET_WAIT_MAX"\n')
+# --- lib/common.sh: recovery_budget (OC_LAUNCHD mode -> budget selection) ---
+def test_recovery_budget_keepalive():
+    # keepalive (launchd's KeepAlive respawns us): give up fast (30) and wait out the whole
+    # throttle window (300), so an eventual exit respawns immediately.
+    r = _sh(SRC_COMMON, 'recovery_budget keepalive\nprintf "%s %s\\n" "$RECONNECT_TIMEOUT" "$NET_WAIT_MAX"\n')
     assert r.returncode == 0, r.stderr
     assert r.stdout.split() == ["30", "300"]
 
 
+def test_recovery_budget_once():
+    # --once runs at login but has NO respawner, so it KEEPS the long reconnect budget (300)
+    # yet still waits out a slow boot network (300): the two concerns are decided separately.
+    r = _sh(SRC_COMMON, 'recovery_budget once\nprintf "%s %s\\n" "$RECONNECT_TIMEOUT" "$NET_WAIT_MAX"\n')
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.split() == ["300", "300"]
+
+
 def test_recovery_budget_unsupervised():
-    # No supervisor: keep openconnect's long budget (300) and fail the wait fast (10).
+    # No launchd mode (interactive): keep openconnect's long budget (300) and fail the wait
+    # fast (10) -- a human is watching.
     r = _sh(SRC_COMMON, 'recovery_budget ""\nprintf "%s %s\\n" "$RECONNECT_TIMEOUT" "$NET_WAIT_MAX"\n')
     assert r.returncode == 0, r.stderr
     assert r.stdout.split() == ["300", "10"]
@@ -436,7 +446,7 @@ def test_recovery_budget_unsupervised():
 
 def test_recovery_budget_config_value_wins():
     # An explicit reconnect_timeout (already in the env) must not be overridden.
-    r = _sh(SRC_COMMON, 'RECONNECT_TIMEOUT=77\nrecovery_budget 1\nprintf "%s\\n" "$RECONNECT_TIMEOUT"\n')
+    r = _sh(SRC_COMMON, 'RECONNECT_TIMEOUT=77\nrecovery_budget keepalive\nprintf "%s\\n" "$RECONNECT_TIMEOUT"\n')
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "77"
 

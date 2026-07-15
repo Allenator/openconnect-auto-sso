@@ -214,6 +214,11 @@ do_install() {
 
     # KeepAlive: default reconnect-on-drop; `--once` connects at login only.
     if [ "${1:-}" = "--once" ]; then keepalive="false"; else keepalive="true"; fi
+    # OC_LAUNCHD (baked into the plist) tells the connect script which recovery budget to
+    # use: `keepalive` gets openconnect's short in-process reconnect (KeepAlive respawns a
+    # fresh connect); `once` keeps the long budget (nothing respawns it) but still waits out
+    # a slow boot network. See lib/common.sh recovery_budget.
+    if [ "$keepalive" = "true" ]; then mode="keepalive"; else mode="once"; fi
 
     # Build AND validate the plist in a temp file BEFORE touching sudoers, so a bad
     # plist (e.g. an XML metacharacter in a path) can never leave passwordless root
@@ -246,8 +251,8 @@ do_install() {
         <string>$(xml_escape "$apath")</string>
         <key>HOME</key>
         <string>$(xml_escape "$HOME")</string>
-        <key>OC_SUPERVISED</key>
-        <string>1</string>$_cfg_env
+        <key>OC_LAUNCHD</key>
+        <string>$mode</string>$_cfg_env
     </dict>
     <key>StandardOutPath</key>
     <string>$(xml_escape "$log")</string>

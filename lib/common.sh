@@ -16,40 +16,57 @@ LIBEXEC_DIR='/usr/local/libexec/openconnect-auto-sso'
 TEARDOWN_BIN="$LIBEXEC_DIR/vpn-teardown"
 
 # --- recovery timing ---------------------------------------------------------------
-# These four values are ONE design, so they are owned here rather than scattered:
+# These values are ONE design, so they are owned here rather than scattered. They serve
+# TWO INDEPENDENT concerns, and OC_LAUNCHD ("keepalive" | "once" | unset) drives BOTH:
 #
-# openconnect's in-process reconnect CANNOT survive a macOS sleep -- on wake its socket
-# is still bound to local addresses that no longer exist, so every retry fails ("Can't
-# assign requested address") until its budget expires. A FRESH openconnect connects fine.
-# So when something will restart us (launchd), we give up fast and let that fresh connect
-# happen. Interactively nothing would respawn us, so we keep openconnect's own long budget
-# -- in-process recovery is the only recovery a terminal user has.
+# (1) Respawn budget -> RECONNECT_TIMEOUT. openconnect's in-process reconnect CANNOT
+# survive a macOS sleep -- on wake its socket is still bound to local addresses that no
+# longer exist, so every retry fails ("Can't assign requested address") until the budget
+# expires. A FRESH openconnect connects fine. So we give up FAST (30s) and let a fresh
+# connect happen ONLY when something will respawn us -- that is `keepalive` (launchd's
+# KeepAlive restarts the connect script on exit). With `--once` (KeepAlive=false) and
+# interactively NOTHING respawns us, so we KEEP openconnect's own long budget (300s): a
+# short give-up there would kill a tunnel that a >30s blip should have ridden out, with no
+# restart to recover it. The deciding bit here is "will I be respawned", NOT "am I at login".
 #
-# Before connecting we wait for the server to become REACHABLE instead of exiting into
-# launchd's throttle. NET_WAIT_MAX >= THROTTLE_INTERVAL is the load-bearing invariant:
-# launchd's respawn delay is (THROTTLE_INTERVAL - runtime) -- it calls ThrottleInterval
-# the job's "minimum runtime" -- so a job that stays alive that long always respawns
-# IMMEDIATELY. Exiting earlier would just idle out the rest of the throttle window.
+# (2) Boot network-wait -> NET_WAIT_MAX. Before connecting we wait for the server to become
+# REACHABLE instead of exiting into launchd's throttle. BOTH at-login modes (`once` AND
+# `keepalive`) get the long wait (THROTTLE_INTERVAL): a login run may start before Wi-Fi is
+# up and should wait it out rather than fail. That is why `once` gets the long wait yet
+# keeps the long reconnect budget above -- the two concerns are decided SEPARATELY. For
+# `keepalive`, NET_WAIT_MAX >= THROTTLE_INTERVAL is additionally load-bearing: launchd's
+# respawn delay is (THROTTLE_INTERVAL - runtime) -- it calls ThrottleInterval the job's
+# "minimum runtime" -- so a job that stays alive that long always respawns IMMEDIATELY;
+# exiting earlier would just idle out the rest of the window. Interactively (unset) a human
+# is watching, so we fail the wait fast (10s) and never hang.
 THROTTLE_INTERVAL=300                # plist ThrottleInterval (install-autostart.sh writes it)
 NET_WAIT_MAX="$THROTTLE_INTERVAL"    # cap on the wait below; keep >= THROTTLE_INTERVAL
-RECONNECT_TIMEOUT_SUPERVISED=30      # under launchd: give up fast; KeepAlive reconnects
-RECONNECT_TIMEOUT_INTERACTIVE=300    # no supervisor: openconnect's own default budget
+RECONNECT_TIMEOUT_SUPERVISED=30      # keepalive respawns us: give up fast, take a fresh connect
+RECONNECT_TIMEOUT_INTERACTIVE=300    # nothing respawns us (--once / terminal): openconnect's default
 
-# Decide the reconnect budget + network-wait bound from whether a supervisor will restart
-# us. $1 = "1" when supervised. The auto-start agent sets OC_SUPERVISED=1 in its plist;
-# NOTHING else does, so a lone run (terminal, nohup, cron) is treated as unsupervised and
-# keeps openconnect's long in-process budget -- because nothing would respawn it, and a
-# short give-up there would kill a tunnel a >30s blip should have ridden out. We shorten
-# ONLY when we know something takes over. An explicit reconnect_timeout in the config
-# still wins (this only DEFAULTS it). Owned here so the connect script needs no test seam.
+# Decide the reconnect budget + network-wait bound from OC_LAUNCHD, passed as $1:
+#   keepalive -> respawned:                short give-up (30),  long wait (300).
+#   once      -> at login but NOT respawned: LONG give-up (300), long wait (300).
+#   unset     -> interactive:               long give-up (300),  short wait (10).
+# The auto-start agent sets OC_LAUNCHD in its plist (`keepalive` or `once`); NOTHING else
+# does, so a lone run (terminal, nohup, cron) reads as unset. An explicit reconnect_timeout
+# in the config still wins (this only DEFAULTS it). Owned here so the connect script needs
+# no test seam.
 recovery_budget() {
-    if [ "${1:-}" = 1 ]; then
-        : "${RECONNECT_TIMEOUT:=$RECONNECT_TIMEOUT_SUPERVISED}"
-        NET_WAIT_MAX="$THROTTLE_INTERVAL"    # wait out the throttle window (respawn is free)
-    else
-        : "${RECONNECT_TIMEOUT:=$RECONNECT_TIMEOUT_INTERACTIVE}"
-        NET_WAIT_MAX=10                       # a human is watching; fail fast, don't hang
-    fi
+    case "${1:-}" in
+        keepalive)                                       # launchd's KeepAlive respawns us
+            : "${RECONNECT_TIMEOUT:=$RECONNECT_TIMEOUT_SUPERVISED}"
+            NET_WAIT_MAX="$THROTTLE_INTERVAL"            # wait out the throttle window (respawn is free)
+            ;;
+        once)                                            # runs at login, but NO respawner
+            : "${RECONNECT_TIMEOUT:=$RECONNECT_TIMEOUT_INTERACTIVE}"  # keep the long budget
+            NET_WAIT_MAX="$THROTTLE_INTERVAL"            # boot Wi-Fi may be slow; wait it out
+            ;;
+        *)                                               # interactive / unsupervised
+            : "${RECONNECT_TIMEOUT:=$RECONNECT_TIMEOUT_INTERACTIVE}"
+            NET_WAIT_MAX=10                              # a human is watching; fail fast, don't hang
+            ;;
+    esac
 }
 
 # Split openconnect's server form -- [https://]host[:port][/group] -- into
