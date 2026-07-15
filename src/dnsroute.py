@@ -170,31 +170,32 @@ def servfail_or_silence(query):
     comes up -- stay SILENT so the client's stub resolver retries into success. After
     that, SERVFAIL to fail fast on a genuine outage instead of hanging every lookup.
 
-    Fail-closed assumption (NOT empirically confirmed in this dev environment):
-    this SERVFAIL is returned to macOS on a scoped /etc/resolver/<domain> resolver
-    (`scutil --dns` shows ours as a domain-matched resolver -> nameserver 127.0.0.1).
-    The concern is a split-brain LEAK: if mDNSResponder responds to a scoped-resolver
-    SERVFAIL by failing over to the primary (default-interface) resolver, a proxied
-    name would then resolve via public DNS and the client would reach it off-tunnel.
-    The intended fail-closed fix, IF the leak is confirmed, is to keep returning None
-    (silence) here too, so the stub retries into the same scoped resolver instead of
-    falling out to the primary. That fix was deliberately NOT applied because it is
-    unverified AND its efficacy is uncertain: mDNSResponder penalizes/fails a
-    DNSServer over on TIMEOUT as well as on SERVFAIL, so silence may merely add
-    latency before the same failover -- and it trades away the current fail-fast
-    behavior (a real outage would then hang every lookup). To confirm on a machine
-    with sudo and no live VPN: `echo "nameserver 127.0.0.1\nport 55353" >
-    /etc/resolver/servfailtest`, run a stub on 127.0.0.1:55353 that answers every
-    query with SERVFAIL, `dscacheutil -flushcache`, then `dscacheutil -q host -a name
-    x.servfailtest` (or `dig`) while tcpdumping the default interface -- if the query
-    egresses to the primary DNS, the leak is real and this branch should return None.
+    Scoped-resolver SERVFAIL behavior (EMPIRICALLY TESTED): this SERVFAIL is returned
+    to macOS on a scoped /etc/resolver/<domain> resolver (`scutil --dns` shows ours as
+    a domain-matched resolver -> nameserver 127.0.0.1). The concern was a split-brain
+    LEAK: if mDNSResponder answered a scoped-resolver SERVFAIL by failing over to the
+    primary (default-interface) resolver, a proxied name would resolve via public DNS
+    and the client would reach it off-tunnel. That would have argued for returning None
+    (silence) here so the stub retries the same scoped resolver instead of falling out
+    to the primary.
 
-    _EVER_FORWARDED interaction (worth flagging for the sleep/wake workstream): it is
-    process-global and never resets, so once any reply has EVER been forwarded the
-    grace window no longer applies and this returns SERVFAIL immediately. A long-up
-    tunnel that then loses its VPN DNS (sleep/wake, upstream gone) therefore SERVFAILs
-    at once -- so if the leak above is real, every post-wake DNS gap is a leak window,
-    not just initial bring-up."""
+    Tested on macOS 26.5.2 (Darwin 25.5.0, build 25F84) and NOT observed: with a scoped
+    /etc/resolver/servfailtest pointing at a loopback stub that SERVFAILs every query, a
+    getaddrinfo() for a name under it failed fast with EAI_NONAME and NO query for that
+    name egressed the default interface (tcpdump) -- mDNSResponder honored the scoped
+    SERVFAIL and did not fail over. This also matches the design: a scoped domain has no
+    other authoritative resolver to fall over TO. So the fail-fast SERVFAIL here is safe
+    (it neither hangs a real outage nor leaks off-tunnel), and the silence fix was
+    correctly NOT applied -- it would trade away fail-fast for no benefit. The behavior
+    is macOS-version-specific; to re-validate on a future OS, re-run the harness: a
+    scoped resolver -> always-SERVFAIL loopback stub, getaddrinfo() the name while
+    tcpdumping the default path; a leak would show that name egressing to the primary.
+
+    _EVER_FORWARDED interaction: it is process-global and never resets, so once any
+    reply has EVER been forwarded the grace window no longer applies and this returns
+    SERVFAIL immediately. A long-up tunnel that then loses its VPN DNS (sleep/wake,
+    upstream gone) therefore SERVFAILs at once -- which, per the test above, fails the
+    scoped lookup fast WITHOUT leaking to the primary, the intended behavior."""
     if not _EVER_FORWARDED and (time.monotonic() - _START) < GRACE_SECONDS:
         return None
     return servfail(query)
