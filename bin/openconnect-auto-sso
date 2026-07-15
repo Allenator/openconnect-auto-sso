@@ -19,6 +19,23 @@ while [ -L "$src" ]; do
     case $src in /*) ;; *) src=$dir/$src ;; esac
 done
 PROJ=$(cd "$(dirname "$src")/.." && pwd)
+
+# B10: $PROJ is later spliced into `pgrep -f` / `pkill -f` patterns (the Phase-1
+# dead-man backstop and _end_browser), which BSD/macOS pgrep interprets as an ERE. A
+# regex metacharacter in the path would break the match or over-broaden it (e.g. `|`
+# turns the pattern into a dangerous alternation). `.` is left allowed -- it's common in
+# paths and, inside an otherwise-literal pattern, only matches its own position -- but
+# reject the breaking/over-broadening set early and loudly. The EXIT-trap kill already
+# bounds the orphan; this just keeps the backstop patterns well-formed.
+case $PROJ in
+    *'\'* | *'^'* | *'$'* | *'['* | *']'* | *'('* | *')'* | \
+    *'{'* | *'}'* | *'|'* | *'*'* | *'+'* | *'?'* )
+        echo "error: project path contains a regex metacharacter: $PROJ" >&2
+        echo "       move the repo to a path free of  \\ ^ \$ [ ] ( ) { } | * + ?  and retry." >&2
+        exit 1
+        ;;
+esac
+
 . "$PROJ/lib/common.sh"   # RESOLVER_MARKER, TEARDOWN_BIN, and the recovery timing +
                           # helpers (wait_for_server, RECONNECT_TIMEOUT_*, NET_WAIT_MAX)
 

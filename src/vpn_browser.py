@@ -22,18 +22,20 @@ Environment (all optional; set by bin/vpn-browser / the connect script):
                           above the longest plausible interactive login.
   VPN_BROWSER_DEBUG=1     log lifecycle events to stderr
 """
+import ipaddress
 import os
 import signal
 import subprocess
 import sys
 import time
+import urllib.parse
 
-# QtWebEngine must be imported before the QApplication is constructed.
-from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebEngineCore import QWebEngineProfile, QWebEnginePage, QWebEngineSettings
-from PyQt6.QtNetwork import QNetworkCookie
-from PyQt6.QtWidgets import QApplication
-from PyQt6.QtCore import QUrl, QTimer, QStandardPaths
+# PyQt6 is imported lazily inside main()'s fail-loud guard (see B1/12), NOT at module
+# top. An ImportError here (missing venv / no system PyQt6) would fire before main() ever
+# runs -> fail_parent() would never be called -> openconnect wedges on its callback wait
+# for ~420s. Deferring the import lets that ImportError reach main()'s `except
+# BaseException: fail_parent(...)` so openconnect dies loudly instead. It also keeps the
+# pure helpers below importable (for the unit tests) on a box without PyQt6.
 
 APP_NAME = "openconnect-auto-sso"
 
@@ -61,9 +63,12 @@ def env_int(name, default):
     if raw is None or raw == "":
         return default
     try:
-        return int(raw)
+        val = int(raw)
     except (TypeError, ValueError):
         return default
+    # Clamp to signed int32 (B11): these values feed QTimer.singleShot / QTimer.start,
+    # whose underlying C++ int OverflowErrors at the boundary for anything out of range.
+    return max(-2**31, min(2**31 - 1, val))
 
 
 def parse_callback(spec):
@@ -76,9 +81,20 @@ def parse_callback(spec):
 
 
 def is_host_loopback(host):
-    """True for any spelling of the loopback host (localhost / 127.0.0.0-8 / ::1)."""
+    """True for any spelling of the loopback host (localhost / 127.0.0.0/8 / ::1).
+
+    `localhost` is special-cased (it's a name, not an IP). Everything else is parsed as
+    an IP address so a look-alike hostname -- 127.evil.com, which a `startswith("127.")`
+    string test would wrongly accept -- is rejected (B2). A non-IP or empty host raises
+    ValueError and is treated as not-loopback.
+    """
     h = (host or "").strip().lower()
-    return h in ("localhost", "127.0.0.1", "::1") or h.startswith("127.")
+    if h == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(h).is_loopback
+    except ValueError:
+        return False
 
 
 def is_callback(url, host, port):
@@ -102,8 +118,15 @@ def is_allowed_url(url_str):
     """Only http/https logins may be loaded. The SSO URL comes from the (possibly
     hostile / MITM'd) gateway; a file:// -- or any non-web -- scheme could read the
     on-disk cookie DB. See B4. Refusing unknown schemes is fail-closed.
+
+    Uses stdlib urllib (not QUrl) so it needs no Qt import at module load time -- this
+    runs before Qt is imported inside main() (B12) and in the PyQt6-free unit tests.
     """
-    return QUrl(url_str).scheme().lower() in ("http", "https")
+    try:
+        scheme = urllib.parse.urlsplit(url_str).scheme
+    except ValueError:
+        return False
+    return scheme.lower() in ("http", "https")
 
 
 def _comm_is_openconnect(comm):
@@ -190,12 +213,15 @@ def main(argv):
         # reparented (getppid() != parent_pid) -- signaling then would be pointless and,
         # worse, could hit a reused PID. This makes the SIGTERM safe.
         if parent_is_oc and parent_pid > 1 and os.getppid() == parent_pid:
-            print("[vpn-browser] aborting openconnect (pid %d): %s" % (parent_pid, reason),
-                  file=sys.stderr, flush=True)
+            # Signal FIRST, then log (B13). openconnect is blocked in select(...,NULL)
+            # awaiting this SIGTERM; a stalled or closed stderr must never delay it, so the
+            # os.kill() precedes the print() (which can block on a full/gone pipe).
             try:
                 os.kill(parent_pid, signal.SIGTERM)
             except OSError:
                 pass
+            print("[vpn-browser] aborting openconnect (pid %d): %s" % (parent_pid, reason),
+                  file=sys.stderr, flush=True)
 
     # B4: the login URL comes from the (possibly hostile) gateway. Refuse anything but
     # http/https before we spin up Qt -- a file:// URL could read the on-disk cookie DB.
@@ -222,6 +248,19 @@ def main(argv):
     # parent on the way out. The connect-script deadline backstops a death so early we
     # can't even reach here.
     try:
+        # B12: import Qt HERE, inside the fail-loud guard, not at module top. If the venv
+        # is missing and system python3 lacks PyQt6, the ImportError now lands in the
+        # `except BaseException` below -> fail_parent() aborts openconnect loudly, instead
+        # of the import blowing up before main() and wedging the callback wait ~420s.
+        # QtWebEngine must be imported before the QApplication is constructed.
+        global QApplication, QWebEngineProfile, QWebEnginePage, QWebEngineSettings
+        global QWebEngineView, QNetworkCookie, QUrl, QTimer, QStandardPaths
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+        from PyQt6.QtWebEngineCore import (
+            QWebEngineProfile, QWebEnginePage, QWebEngineSettings)
+        from PyQt6.QtNetwork import QNetworkCookie
+        from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtCore import QUrl, QTimer, QStandardPaths
         return _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
                     idle_ms, hard_ms, log, fail_parent)
     except BaseException:
@@ -276,6 +315,7 @@ def _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
 
     done = {"v": False}          # callback reached -> success, self-closing
     asked_to_stop = {"v": False}  # SIGTERM from the connect script -> expected shutdown
+    hard_timer = {"t": None}     # orphan-cleanup backstop; do_reveal() stops it (B9)
 
     def flush_cookies():
         # A no-op delete forces the cookie store to sync to disk.
@@ -346,6 +386,12 @@ def _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
         if done["v"] or view.isVisible():
             return
         log("revealing window for interaction")
+        # B9: the user is now actively logging in (a password + Duo push can take
+        # minutes). Stop the orphan-cleanup hard timeout so a legitimately slow login is
+        # never killed mid-flow. A truly stuck helper is still bounded by the connect
+        # script's _end_browser / PHASE1_DEADLINE backstops.
+        if hard_timer["t"] is not None:
+            hard_timer["t"].stop()
         set_activation_policy(app, 0)     # become a normal app for interaction
         view.show()
         view.raise_()
@@ -383,13 +429,24 @@ def _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
             idle.start(idle_ms)
 
     def on_url(url):
-        if is_callback(url, cb_host, cb_port):
+        # B3: urlChanged fires at navigation START -- and on a FAILED nav that merely
+        # points at the callback host. Do NOT finish() here: a premature quit before
+        # openconnect actually receives the callback wedges Phase 1. Just keep feeding the
+        # reveal timer; finish() is gated on a SUCCESSFUL load in on_load_finished below.
+        log("navigated:", url.toString())
+        bump()
+
+    def on_load_finished(ok):
+        # B3: self-close only once the callback URL has actually LOADED SUCCESSFULLY.
+        # A failed callback load (ok is False) must NOT finish -- openconnect either
+        # already captured the token (then the connect script's _end_browser ends us on
+        # the success path) or never got it (quitting early would wedge Phase 1). Either
+        # way, not finishing here is the safe choice.
+        if ok and is_callback(view.url(), cb_host, cb_port):
             finish()
-        else:
-            log("navigated:", url.toString())
-            bump()
 
     view.urlChanged.connect(on_url)
+    view.loadFinished.connect(on_load_finished)
     view.page().loadProgress.connect(lambda _p: bump())
 
     log("loading", login_url)
@@ -400,10 +457,15 @@ def _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
         idle.start(idle_ms)               # hidden; reveal only if the flow stalls
 
     # Orphan backstop only: the connect script ends us when Phase 1 finishes.
-    # This must never fire during a legitimate (possibly slow) interactive login.
-    # A non-positive timeout disables it (rather than quitting instantly). (B5d)
+    # This must never fire during a legitimate (possibly slow) interactive login, so
+    # do_reveal() stops it the moment we show the window for interaction (B9). A
+    # non-positive timeout disables it (rather than quitting instantly). (B5d)
     if hard_ms > 0:
-        QTimer.singleShot(hard_ms, app.quit)
+        ht = QTimer()
+        ht.setSingleShot(True)
+        ht.timeout.connect(app.quit)
+        ht.start(hard_ms)
+        hard_timer["t"] = ht
     return app.exec()
 
 

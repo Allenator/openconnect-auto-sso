@@ -49,12 +49,38 @@ def test_env_int_falls_back(monkeypatch):
     assert vb.env_int("OC_TEST_INT", 3500) == 3500           # float string -> no raise
 
 
+def test_env_int_clamps_to_int32(monkeypatch):
+    # B11: values feed QTimer.singleShot / QTimer.start, whose C++ int OverflowErrors
+    # outside signed int32. env_int must clamp so Qt never sees an out-of-range value.
+    monkeypatch.setenv("OC_TEST_INT", str(2**40))
+    assert vb.env_int("OC_TEST_INT", 0) == 2**31 - 1          # above max -> clamped
+    monkeypatch.setenv("OC_TEST_INT", str(-(2**40)))
+    assert vb.env_int("OC_TEST_INT", 0) == -2**31             # below min -> clamped
+    monkeypatch.setenv("OC_TEST_INT", str(2**31 - 1))
+    assert vb.env_int("OC_TEST_INT", 0) == 2**31 - 1          # exactly max -> unchanged
+    monkeypatch.setenv("OC_TEST_INT", str(-2**31))
+    assert vb.env_int("OC_TEST_INT", 0) == -2**31             # exactly min -> unchanged
+    monkeypatch.setenv("OC_TEST_INT", "300000")
+    assert vb.env_int("OC_TEST_INT", 0) == 300000            # in range -> passthrough
+
+
 # --- is_host_loopback ---
 def test_is_host_loopback():
     for h in ("localhost", "LOCALHOST", "127.0.0.1", "127.5.6.7", "::1"):
         assert vb.is_host_loopback(h), h
     for h in ("example.com", "10.0.0.1", "", None, "127a.0.0.1x"):
         assert not vb.is_host_loopback(h), h
+
+
+def test_is_host_loopback_rejects_lookalike_hostnames():
+    # B2: a `h.startswith("127.")` string test wrongly accepts these DNS names that are
+    # NOT the loopback interface. Parsing as an IP rejects them (ValueError -> False).
+    for h in ("127.evil.com", "127.0.0.1.evil.com", "127.0.0.1.nip.io",
+              "localhost.evil.com", "127foo"):
+        assert not vb.is_host_loopback(h), h
+    # ...while every genuine loopback spelling is still accepted.
+    for h in ("127.0.0.1", "127.255.255.254", "::1", "localhost"):
+        assert vb.is_host_loopback(h), h
 
 
 # --- is_callback (loopback-shape tolerant; B5b) ---
@@ -80,6 +106,14 @@ def test_is_callback_wrong_port():
 
 def test_is_callback_non_loopback_host_rejected():
     assert not _cb("https://evil.example:29786/")
+
+
+def test_is_callback_rejects_lookalike_loopback_host():
+    # B2: a look-alike host on the right port must NOT be mistaken for the loopback
+    # callback -- otherwise finish() (self-close) could fire on an attacker-controlled
+    # 127.evil.com redirect. The IP-parse in is_host_loopback closes that bypass.
+    assert not _cb("http://127.evil.com:29786/callback?code=abc")
+    assert not _cb("http://127.0.0.1.evil.com:29786/callback?code=abc")
 
 
 def test_is_callback_custom_host_requires_exact_match():
