@@ -197,13 +197,24 @@ def set_activation_policy(app, policy):
 def write_own_pidfile():
     """Record our PID in $VPN_BROWSER_PIDFILE so the connect script's _end_browser can reap
     EXACTLY this run's helper by PID -- never a concurrent same-repo run's live login (finding
-    8). Best effort: a failure here must not stop the login."""
+    8). Best effort: a failure here must not stop the login.
+
+    Unlink first, then open with O_CREAT|O_TRUNC|O_NOFOLLOW: a pre-planted symlink (or FIFO)
+    at the path can neither redirect our write to another file nor block us on open (finding
+    5). The connect script puts this in a private 0700 dir, so this is defense in depth."""
     path = os.environ.get("VPN_BROWSER_PIDFILE")
     if not path:
         return
     try:
-        with open(path, "w") as fh:
-            fh.write("%d\n" % os.getpid())
+        try:
+            os.unlink(path)          # drop any pre-planted symlink/FIFO first
+        except OSError:
+            pass
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        try:
+            os.write(fd, b"%d\n" % os.getpid())
+        finally:
+            os.close(fd)
     except OSError:
         pass
 
@@ -279,14 +290,14 @@ def main(argv):
         from PyQt6.QtWidgets import QApplication
         from PyQt6.QtCore import QUrl, QTimer, QStandardPaths
         return _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
-                    idle_ms, hard_ms, log, fail_parent)
+                    idle_ms, hard_ms, log, fail_parent, parent_pid, parent_is_oc)
     except BaseException:
         fail_parent("fatal error starting the SSO browser")
         raise
 
 
 def _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
-         idle_ms, hard_ms, log, fail_parent):
+         idle_ms, hard_ms, log, fail_parent, parent_pid, parent_is_oc):
     app = QApplication([argv[0]])
     app.setApplicationName(APP_NAME)
     # Deliberately NO setOrganizationName: with an org name set, Qt derives the
@@ -383,6 +394,30 @@ def _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
         if not done["v"] and not asked_to_stop["v"]:
             fail_parent("SSO browser closed before authentication completed")
     app.aboutToQuit.connect(on_about_to_quit)
+
+    # C3 (findings 10/11): watch for our openconnect parent dying. openconnect posix_spawn()s
+    # us and blocks in select(...,NULL) awaiting its loopback callback -- so while a login is
+    # in progress it is ALIVE and STILL our parent (getppid() == parent_pid). Only once it
+    # exits (Phase 1 finished, it crashed, or a re-spawn orphaned an earlier helper) are we
+    # reparented and getppid() changes. Quitting then reaps an orphan cleanly -- including a
+    # SHOW-mode helper (whose hard timer we skip -- finding 11) and an earlier helper a
+    # re-spawn left behind (finding 10). We route it through the SAME graceful flush + linger
+    # as SIGTERM (not a bare quit) so that, in the tiny window before the connect script's
+    # SIGTERM reaches us, a just-earned cookie is still durably committed (B2). Guarded on
+    # done/asked_to_stop so a self-close or an in-flight SIGTERM shutdown is never preempted.
+    # Meaningful only when our parent WAS openconnect; a dev run under a shell is left alone.
+    if parent_is_oc and parent_pid > 1:
+        def on_parent_check():
+            if done["v"] or asked_to_stop["v"]:
+                return
+            if os.getppid() != parent_pid:
+                asked_to_stop["v"] = True
+                log("openconnect parent %d exited; flushing and quitting" % parent_pid)
+                flush_cookies()
+                QTimer.singleShot(TERM_GRACE_MS, app.quit)
+        ppid_watch = QTimer()
+        ppid_watch.timeout.connect(on_parent_check)
+        ppid_watch.start(1000)
 
     idle = QTimer()
     idle.setSingleShot(True)

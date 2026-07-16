@@ -9,38 +9,44 @@
 set -eu
 
 # --- locate the project (works when symlinked into ~/.local/bin) -------------
-# Normally $0-derived (following any symlink chain). Honor the OC_PROJ override ONLY under
-# the test seam (OC_CONNECT_TEST=1); a stray/poisoned OC_PROJ in a real run must NOT be able
-# to redirect $PROJ, which selects lib/common.sh and the vpn-browser/vpnc-slice helpers.
-if [ "${OC_CONNECT_TEST:-}" = 1 ] && [ -n "${OC_PROJ:-}" ]; then
-    PROJ="$OC_PROJ"
-else
-    src=$0
-    _n=0
-    while [ -L "$src" ]; do
-        _n=$((_n + 1))
-        [ "$_n" -gt 40 ] && { echo "error: too many symlink levels resolving $0" >&2; exit 1; }
-        dir=$(cd "$(dirname "$src")" && pwd)
-        src=$(readlink "$src")
-        case $src in /*) ;; *) src=$dir/$src ;; esac
-    done
-    PROJ=$(cd "$(dirname "$src")/.." && pwd)
-fi
+# Resolve our OWN real path by following any symlink chain. Used BOTH to derive $PROJ and to
+# key the test-seam guard below on the REAL file, so a differently-named symlink can bypass
+# neither (finding 7). Runs unconditionally (even under the seam) so the guard always has it.
+src=$0
+_n=0
+while [ -L "$src" ]; do
+    _n=$((_n + 1))
+    [ "$_n" -gt 40 ] && { echo "error: too many symlink levels resolving $0" >&2; exit 1; }
+    dir=$(cd "$(dirname "$src")" && pwd)
+    src=$(readlink "$src")
+    case $src in /*) ;; *) src=$dir/$src ;; esac
+done
 
 # The OC_CONNECT_TEST seam (used further below) exists ONLY for the test harness to SOURCE
 # this file and exercise the pure helpers. If it leaks into a real EXECUTED run, the whole
 # connect flow would be guarded off and the script would exit 0 having done nothing -- a
-# silent no-op, the worst failure for a VPN tool. When executed, $0 is this script's path;
-# when sourced with `.`, $0 stays the caller's ("sh" under the harness). Refuse loudly on the
-# executed-with-the-var-set case. (No $PROJ-metacharacter guard is needed: the backstop /
-# _end_browser match by a fixed literal + `grep -F` on the full path, never $PROJ-as-regex.)
+# silent no-op, the worst failure for a VPN tool -- and a poisoned OC_PROJ could then redirect
+# $PROJ (which selects lib/common.sh and the vpn-browser/vpnc-slice helpers). Refuse LOUDLY
+# here, keyed on our RESOLVED basename ($src, symlinks followed) and BEFORE sourcing anything
+# from $PROJ: a real EXECUTED run resolves to openconnect-auto-sso even via a renamed symlink
+# and is caught (finding 7/10); a `.`-source leaves $0 as the caller's ("sh" under the
+# harness), whose basename is never ours, so the seam tests are unaffected.
 if [ "${OC_CONNECT_TEST:-}" = 1 ]; then
-    case ${0##*/} in
+    case ${src##*/} in
         openconnect-auto-sso)
             echo "error: OC_CONNECT_TEST=1 is set but this connect script is being EXECUTED," >&2
             echo "       not sourced by the test harness -- refusing to silently no-op. Unset it." >&2
             exit 1 ;;
     esac
+fi
+
+# Normally $PROJ is $src-derived. Honor the OC_PROJ override ONLY under the test seam
+# (OC_CONNECT_TEST=1 -- proven a SOURCED run by the guard above); a stray/poisoned OC_PROJ in
+# a real run must NOT redirect $PROJ (which selects lib/common.sh + the helper scripts).
+if [ "${OC_CONNECT_TEST:-}" = 1 ] && [ -n "${OC_PROJ:-}" ]; then
+    PROJ="$OC_PROJ"
+else
+    PROJ=$(cd "$(dirname "$src")/.." && pwd)
 fi
 
 . "$PROJ/lib/common.sh"   # RESOLVER_MARKER, TEARDOWN_BIN, and the recovery timing +
@@ -189,12 +195,22 @@ PROXY_NAMES="${PROXY_NAMES:-}"          # DNS names routed via the VPN (proxy + 
 ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (server-pushed)
 ROUTE_SPLITS="${ROUTE_SPLITS:-0}"       # also add the server's split-include subnets
 PROXY_PORT="${PROXY_PORT:-45353}"       # loopback port for the DNS-routing proxy
-KA_DNS_FILE="${TMPDIR:-/tmp}/openconnect-auto-sso.dns.$$"     # keepalive @dns target
-# Per-run helper pidfile ($$ = THIS connect run). The SSO helper writes its own PID here on
-# startup so _end_browser can reap EXACTLY this run's helper by PID -- not every same-repo
-# helper by argv pattern, which would kill a CONCURRENT run's live login mid-flow (the
-# launchd agent + a manual run both in Phase 1). See finding 8 / _end_browser below.
-VPN_BROWSER_PIDFILE="${TMPDIR:-/tmp}/openconnect-auto-sso.helper.$$"
+# Private per-run scratch dir (0700, unpredictable name). Holds the helper pidfile, the
+# keepalive @dns target, the Phase-1 auth capture, and the backstop flag -- so none live in
+# world-writable /tmp (finding 5), where an unset TMPDIR (ssh/cron) would otherwise put them
+# and a pre-planted symlink/FIFO could redirect or block a write. mktemp -d makes it per-run,
+# so the files inside need no $$; the EXIT trap rm -rf's it. (KA_DNS_FILE is written by the
+# ROOT wrapper via sudo -- root can create inside our 0700 dir, and we own the dir so we can
+# still remove it on exit.)
+_rundir=$(mktemp -d "${TMPDIR:-/tmp}/oc-sso.XXXXXX") \
+    || { echo "error: could not create a private run directory" >&2; exit 1; }
+KA_DNS_FILE="$_rundir/dns"                  # keepalive @dns target (root wrapper writes it)
+# Helper pidfile: the SSO helper records its own PID here so _end_browser reaps EXACTLY this
+# run's helper by PID -- not every same-repo helper by argv pattern, which would kill a
+# CONCURRENT run's live login mid-flow (the launchd agent + a manual run both in Phase 1).
+# Inside $_rundir (private 0700), and the helper opens it O_NOFOLLOW (src/vpn_browser.py).
+# See finding 8 / _end_browser below.
+VPN_BROWSER_PIDFILE="$_rundir/helper.pid"
 # Proxy state file (PER-PORT path, keyed on $PROXY_PORT): line 1 = the dnsroute PID,
 # line 2 = the owning openconnect PID (VPNPID). A stable per-port path lets a fresh run on
 # the SAME port reason about a PREVIOUS run's proxy -- reclaim our own (in-process
@@ -330,7 +346,7 @@ COOKIE=''; HOST=''; CONNECT_URL=''; FINGERPRINT=''; RESOLVE=''
 # which previously left the hidden helper alive (its pkill sat after the `|| exit` and
 # the trap covered only INT/TERM) -- B5a. Replaced once Phase 2 owns cleanup.
 trap '_end_browser; exit 130' INT TERM
-trap '{ [ -n "${_p1_wd:-}" ] && kill "$_p1_wd" 2>/dev/null; } || true; _end_browser' EXIT
+trap '{ [ -n "${_p1_wd:-}" ] && kill "$_p1_wd" 2>/dev/null; } || true; _end_browser; rm -rf "${_rundir:-}" 2>/dev/null || true' EXIT
 
 # Dead-man backstop for a helper that dies WITHOUT reaching openconnect's loopback
 # callback AND without signaling (exec-fail / crash / SIGKILL): openconnect's callback
@@ -462,7 +478,7 @@ fi
 # for sudo inside a trap is worse).
 trap '
     [ -n "${KA_PID:-}" ] && kill "$KA_PID" 2>/dev/null || true
-    rm -f "$KA_DNS_FILE" 2>/dev/null || true
+    rm -rf "${_rundir:-}" 2>/dev/null || true
 ' EXIT
 
 echo ">> connecting tunnel (sudo)" >&2

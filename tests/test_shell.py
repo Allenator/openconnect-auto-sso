@@ -840,6 +840,45 @@ def test_connect_refuses_when_executed_with_seam_var():
     assert "EXECUTED" in r.stderr
 
 
+def test_connect_refuses_when_executed_via_renamed_symlink(tmp_path):
+    # Finding 7: the executed-refuse now keys on the RESOLVED basename (symlinks followed), so a
+    # differently-NAMED symlink to the connect script can no longer bypass it. The old ${0##*/}
+    # guard saw "vpnvpn" (!= openconnect-auto-sso) and silently no-op'd; the resolved guard
+    # follows the link to openconnect-auto-sso and refuses. (Executing the symlink runs the real
+    # script with $0 = the symlink path, which the resolution loop chases to the real file.)
+    link = tmp_path / "vpnvpn"
+    link.symlink_to(CONNECT)
+    r = subprocess.run([str(link)], capture_output=True, text=True,
+                       env=dict(os.environ, OC_CONNECT_TEST="1"), timeout=30)
+    assert r.returncode != 0
+    assert "EXECUTED" in r.stderr
+
+
+def test_install_refuses_when_executed_with_seam_var():
+    # Finding 7/10: OC_INSTALL_TEST=1 is a SOURCING seam. If it leaks into a real EXECUTED run
+    # the dispatch is skipped -> the installer silently does nothing (and a poisoned OC_PROJ
+    # could redirect $proj). Executing it with the var set must refuse LOUDLY, before sourcing
+    # common.sh or touching sudo. Pass the read-only `status` subcommand so a regression that
+    # reached dispatch still couldn't mutate anything.
+    r = subprocess.run([os.path.join(REPO, "install-autostart.sh"), "status"],
+                       capture_output=True, text=True,
+                       env=dict(os.environ, OC_INSTALL_TEST="1"), timeout=30)
+    assert r.returncode != 0
+    assert "EXECUTED" in r.stderr
+
+
+def test_vpnc_slice_refuses_when_executed_with_seam_var():
+    # Finding 7/10: OC_VPNC_SLICE_TEST=1 is a SOURCING seam. If it leaks into a real EXECUTED
+    # run (the root vpnc-script under openconnect) the directive loop + exec are skipped ->
+    # routes/DNS silently never set up. Executing it with the var set must refuse LOUDLY, before
+    # sourcing common.sh or running any directive.
+    r = subprocess.run([os.path.join(REPO, "bin", "vpnc-slice")],
+                       capture_output=True, text=True,
+                       env=dict(os.environ, OC_VPNC_SLICE_TEST="1"), timeout=30)
+    assert r.returncode != 0
+    assert "EXECUTED" in r.stderr
+
+
 def test_end_browser_reaps_only_the_recorded_pid(tmp_path):
     # Finding 8: _end_browser reaps EXACTLY the PID this run's helper recorded in
     # $VPN_BROWSER_PIDFILE -- NEVER a concurrent same-repo run's helper (a DIFFERENT live PID

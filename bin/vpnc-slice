@@ -26,6 +26,21 @@
 #                               down on disconnect (kill PIDFILE + remove the files).
 set -eu
 
+# OC_VPNC_SLICE_TEST=1 is a SOURCING-only seam for the test harness (it skips the directive
+# loop + exec so sourcing has no side effects). If it leaks into a real EXECUTED run -- this
+# wrapper is the root vpnc-script under openconnect -- the routes/DNS would silently never be
+# set up. Refuse LOUDLY here, BEFORE sourcing. openconnect always invokes us by our real path
+# ($PROJ/bin/vpnc-slice, basename vpnc-slice, no renamed-symlink path); a `.`-source leaves $0
+# as the caller's ("sh" under the harness), so the seam is unaffected. (finding 7/10)
+if [ "${OC_VPNC_SLICE_TEST:-}" = 1 ]; then
+    case ${0##*/} in
+        vpnc-slice)
+            echo "error: OC_VPNC_SLICE_TEST=1 is set but vpnc-slice is being EXECUTED, not" >&2
+            echo "       sourced by the test harness -- refusing to silently no-op. Unset it." >&2
+            exit 1 ;;
+    esac
+fi
+
 # This wrapper always runs as ROOT in production (the vpnc-script under sudo openconnect).
 # $PROJ (two dirs up from $0) locates lib/common.sh + the venv; $RESOLVER_DIR is where the
 # macOS scoped-resolver files live. These carry test-only overrides (OC_PROJ / RESOLVER_DIR /

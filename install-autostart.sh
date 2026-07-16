@@ -25,6 +25,22 @@
 #   install --once   connect once at login, do NOT auto-reconnect
 set -eu
 
+# OC_INSTALL_TEST=1 is a SOURCING-only seam for the test harness (it skips the dispatch at the
+# bottom so sourcing has no side effects). If it leaks into a real EXECUTED run the installer
+# would silently do nothing -- and a poisoned OC_PROJ could then redirect $proj (-> a foreign
+# lib/common.sh and the libexec/vpn-teardown SOURCE that gets root-installed under a NOPASSWD
+# rule). Refuse LOUDLY here, BEFORE sourcing anything from $proj. Executed: $0 is this script
+# (basename install-autostart.sh -- openconnect never invokes it, so no renamed-symlink path);
+# sourced with `.`: $0 stays the caller's ("sh" under the harness), so the seam is unaffected.
+if [ "${OC_INSTALL_TEST:-}" = 1 ]; then
+    case ${0##*/} in
+        install-autostart.sh)
+            echo "error: OC_INSTALL_TEST=1 is set but install-autostart.sh is being EXECUTED," >&2
+            echo "       not sourced by the test harness -- refusing to silently no-op. Unset it." >&2
+            exit 1 ;;
+    esac
+fi
+
 # $proj locates lib/common.sh AND the libexec/vpn-teardown helper this script installs as
 # root with a NOPASSWD rule -- so it selects the SOURCE of a passwordless-root binary and
 # must NOT come from the ambient environment during a real install. Always derive it from

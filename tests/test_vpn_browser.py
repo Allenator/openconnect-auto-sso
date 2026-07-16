@@ -192,3 +192,21 @@ def test_write_own_pidfile_noop_without_env(tmp_path, monkeypatch):
     monkeypatch.delenv("VPN_BROWSER_PIDFILE", raising=False)
     vb.write_own_pidfile()   # must not raise
     assert not (tmp_path / "helper.pid").exists()
+
+
+def test_write_own_pidfile_refuses_symlink_target(tmp_path, monkeypatch):
+    # Finding 5: a pre-planted symlink at the pidfile path must NOT redirect our write to its
+    # target. Unlink-first + O_NOFOLLOW replace the symlink with a fresh 0600 regular file and
+    # write our PID there, leaving the pointed-at target untouched. (A plain open("w") would
+    # follow the link and clobber the target -- the mutation this pins.)
+    import os
+    target = tmp_path / "target"
+    target.write_text("ORIGINAL\n")
+    link = tmp_path / "helper.pid"
+    os.symlink(str(target), str(link))
+    monkeypatch.setenv("VPN_BROWSER_PIDFILE", str(link))
+    vb.write_own_pidfile()
+    assert target.read_text() == "ORIGINAL\n", "must NOT follow the symlink to its target"
+    assert not os.path.islink(str(link)), "planted symlink should be replaced by a real file"
+    assert link.read_text().strip() == str(os.getpid())
+    assert (link.stat().st_mode & 0o077) == 0, "pidfile must not be group/other-accessible"
