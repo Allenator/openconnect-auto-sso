@@ -190,7 +190,7 @@ _rundir=$(mktemp -d "${TMPDIR:-/tmp}/oc-sso.XXXXXX") \
 # found exit 1; a signal during wait_for_server's up-to-300s window) would otherwise leak the
 # 0700 dir (finding 7). The Phase-1 traps (below) later REPLACE these.
 trap 'rm -rf "${_rundir:-}" 2>/dev/null || true' EXIT
-trap 'rm -rf "${_rundir:-}" 2>/dev/null; exit 130' INT TERM
+trap 'rm -rf "${_rundir:-}" 2>/dev/null || true; exit 130' INT TERM
 KA_DNS_FILE="$_rundir/dns"                  # keepalive @dns target (root wrapper writes it)
 # Helper pidfile: the SSO helper records its own PID here so _end_browser reaps EXACTLY this
 # run's helper by PID -- not every same-repo helper by argv pattern, which would kill a
