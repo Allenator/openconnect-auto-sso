@@ -57,7 +57,7 @@ Config is a TOML file at `~/.config/openconnect-auto-sso/config.toml` (outside t
 | `allow_incoming` | bool | `true` allows incoming from the VPN (no pf firewall) so iCloud Private Relay keeps working (default `false`). |
 | `keepalive_host` | string | Host to ping through the tunnel to avoid idle-disconnects. `"@dns"` auto-targets the VPN's own pushed DNS server (recommended); or a specific in-VPN host. `""` = off. |
 | `keepalive_interval` | int | Seconds between keepalive pings (default 30). |
-| `reconnect_timeout` | int | Seconds openconnect retries in-process after a drop before giving up and exiting (`0` = give up at once). The default depends on context: **30** under the auto-start agent (something will restart it) and **300** for a manual run (nothing will). See [Sleep and wake](#sleep-and-wake). |
+| `reconnect_timeout` | int | Seconds openconnect retries in-process after a drop before giving up and exiting (`0` = give up at once). The default depends on launch mode: **30** under the `KeepAlive` auto-start agent (launchd respawns a fresh connect) and **300** under `install --once` or a manual run (nothing will restart it). See [Sleep and wake](#sleep-and-wake). |
 | `profile_name` | string | Qt persistent-profile storage key. Usually leave default. |
 | `callback` | string | openconnect external-browser callback `host:port`. Rarely changed. |
 
@@ -112,7 +112,7 @@ Many VPN servers disconnect a tunnel that carries no traffic (openconnect report
 
 openconnect's built-in reconnect cannot survive a macOS sleep: on wake its socket is still bound to local addresses that no longer exist, so every retry fails (`Can't assign requested address`) until its retry budget expires — and only then does it exit. A *fresh* openconnect process connects fine. So the recovery strategy is to give up quickly and let a fresh connect take over, rather than to keep reconnecting.
 
-That only makes sense when something will actually restart you, so `reconnect_timeout` defaults by context: **30 s under the auto-start agent** (launchd's `KeepAlive` respawns the connect script) and **300 s for a manual run** — openconnect's own default — because a terminal user has no supervisor, and in-process recovery is the only recovery they have. Set `reconnect_timeout` explicitly to override either.
+That only makes sense when something will actually restart you, so `reconnect_timeout` defaults by launch mode: **30 s under the `KeepAlive` auto-start agent** (launchd respawns the connect script) and **300 s under `install --once` or a manual run** — openconnect's own default — because nothing respawns those, so in-process recovery is the only recovery they have. Set `reconnect_timeout` explicitly to override either.
 
 Before authenticating, the connect script waits for the VPN server to become **reachable** (up to 5 minutes under the agent, 10 s in a terminal). It is a TCP probe rather than a default-route check, so it also covers "the Wi-Fi is up but the WAN is down" and DNS that isn't ready yet. Waiting beats exiting: launchd delays a respawn by `ThrottleInterval` *minus* how long the job ran, so a job that waits the outage out respawns immediately, whereas one that fails fast idles out the remainder. (A captive portal that redirects the VPN port can still make the probe report "reachable" — it is a readiness gate, not a guarantee; Phase 1 then reports the real error.)
 

@@ -27,21 +27,21 @@ else
     PROJ=$(cd "$(dirname "$src")/.." && pwd)
 fi
 
-# B10: $PROJ is later spliced into `pgrep -f` / `pkill -f` patterns (the Phase-1
-# dead-man backstop and _end_browser), which BSD/macOS pgrep interprets as an ERE. A
-# regex metacharacter in the path would break the match or over-broaden it (e.g. `|`
-# turns the pattern into a dangerous alternation). `.` is left allowed -- it's common in
-# paths and, inside an otherwise-literal pattern, only matches its own position -- but
-# reject the breaking/over-broadening set early and loudly. The EXIT-trap kill already
-# bounds the orphan; this just keeps the backstop patterns well-formed.
-case $PROJ in
-    *'\'* | *'^'* | *'$'* | *'['* | *']'* | *'('* | *')'* | \
-    *'{'* | *'}'* | *'|'* | *'*'* | *'+'* | *'?'* )
-        echo "error: project path contains a regex metacharacter: $PROJ" >&2
-        echo "       move the repo to a path free of  \\ ^ \$ [ ] ( ) { } | * + ?  and retry." >&2
-        exit 1
-        ;;
-esac
+# The OC_CONNECT_TEST seam (used further below) exists ONLY for the test harness to SOURCE
+# this file and exercise the pure helpers. If it leaks into a real EXECUTED run, the whole
+# connect flow would be guarded off and the script would exit 0 having done nothing -- a
+# silent no-op, the worst failure for a VPN tool. When executed, $0 is this script's path;
+# when sourced with `.`, $0 stays the caller's ("sh" under the harness). Refuse loudly on the
+# executed-with-the-var-set case. (No $PROJ-metacharacter guard is needed: the backstop /
+# _end_browser match by a fixed literal + `grep -F` on the full path, never $PROJ-as-regex.)
+if [ "${OC_CONNECT_TEST:-}" = 1 ]; then
+    case ${0##*/} in
+        openconnect-auto-sso)
+            echo "error: OC_CONNECT_TEST=1 is set but this connect script is being EXECUTED," >&2
+            echo "       not sourced by the test harness -- refusing to silently no-op. Unset it." >&2
+            exit 1 ;;
+    esac
+fi
 
 . "$PROJ/lib/common.sh"   # RESOLVER_MARKER, TEARDOWN_BIN, and the recovery timing +
                           # helpers (wait_for_server, RECONNECT_TIMEOUT_*, NET_WAIT_MAX)
@@ -235,8 +235,9 @@ OPENCONNECT=$(command -v openconnect || true)
 # launchd that burns a throttled retry (respawn is delayed by THROTTLE_INTERVAL minus our
 # runtime). So WAIT for the server to actually be reachable instead: staying alive is
 # always cheaper than exiting into the throttle. wait_for_server (and NET_WAIT_MAX, already
-# sized by recovery_budget above: the full throttle window when supervised, a short bound
-# otherwise) live in lib/common.sh. Best-effort: on timeout we fall through under `|| true`
+# sized by recovery_budget above: the full throttle window under either launch-agent mode
+# (keepalive or once), a short bound for a manual run) live in lib/common.sh. Best-effort: on
+# timeout we fall through under `|| true`
 # and let Phase 1 report the real error -- WITHOUT the `|| true`, a set -eu abort here would
 # kill the whole connect on a slow network, the opposite of "wait and proceed".
 wait_for_server "$SERVER" || true
@@ -255,19 +256,36 @@ authenticate() {
 
 COOKIE=''; HOST=''; CONNECT_URL=''; FINGERPRINT=''; RESOLVE=''
 
+# Find our processes robustly: `pgrep -f` treats its pattern as an ERE, so we must NOT
+# splice $PROJ (any path char, incl. regex metacharacters) into it. Instead pgrep on a fixed
+# metachar-free literal ($1) to get candidates, then confirm each one's FULL argv with
+# `grep -qF -- $2` (fixed string). Robust to any path -- no path restriction needed.
+_pids_matching() {   # $1 = metachar-free pgrep -f substring; $2 = fixed full string to confirm
+    pgrep -f "$1" 2>/dev/null | while read -r _p; do
+        ps -p "$_p" -o command= 2>/dev/null | grep -qF -- "$2" && printf '%s\n' "$_p"
+    done
+}
+
+# Full argv fragments that identify OUR SSO helper and OUR Phase-1 openconnect (confirmed
+# with grep -F above). The helper's argv carries "$PROJ/src/vpn_browser.py"; Phase-1
+# openconnect's carries "--external-browser=$PROJ/bin/vpn-browser".
+_HELPER_FULL="$PROJ/src/vpn_browser.py"
+_P1_FULL="external-browser=$PROJ/bin/vpn-browser"
+
 # End the SSO browser helper: SIGTERM it and WAIT for it to exit, rather than a
 # fire-and-forget kill. Chromium batches cookie commits (~30s), and the helper needs a
 # moment (its SIGTERM handler flushes and lingers ~1.5s) to durably write the session
 # cookie the login just earned -- killing it the instant Phase 1 ends can drop it (B2).
 # Bounded, then force-killed, so a wedged helper can never stall us. Safe to call
 # repeatedly: a no-op once the helper is gone.
-_HELPER_PAT="$PROJ/src/vpn_browser.py"
 _end_browser() {
-    pkill -TERM -f "$_HELPER_PAT" 2>/dev/null || return 0   # nothing running
+    _hp=$(_pids_matching vpn_browser "$_HELPER_FULL")
+    [ -n "$_hp" ] || return 0                                # nothing running
+    kill -TERM $_hp 2>/dev/null || true
     _i=0
-    while pgrep -f "$_HELPER_PAT" >/dev/null 2>&1; do
+    while _hp=$(_pids_matching vpn_browser "$_HELPER_FULL"); [ -n "$_hp" ]; do
         _i=$((_i + 1))
-        [ "$_i" -ge 8 ] && { pkill -KILL -f "$_HELPER_PAT" 2>/dev/null || true; break; }
+        [ "$_i" -ge 8 ] && { kill -KILL $_hp 2>/dev/null || true; break; }
         sleep 1
     done
 }
@@ -281,18 +299,24 @@ trap '{ [ -n "${_p1_wd:-}" ] && kill "$_p1_wd" 2>/dev/null; } || true; _end_brow
 # Dead-man backstop for a helper that dies WITHOUT reaching openconnect's loopback
 # callback AND without signaling (exec-fail / crash / SIGKILL): openconnect's callback
 # listener is select(...,NULL) -- no timeout -- and never watches the helper, so it
-# (and the auth capture below) would block forever. Kill a Phase-1 openconnect that
-# outlives the deadline. The pattern matches only openconnect (its argv carries
-# --external-browser=<...>/bin/vpn-browser), never the helper (…/src/vpn_browser.py).
-# Sized WELL above the helper's own ~300s self-timeout plus the longest plausible
-# interactive login (password + Duo can take minutes), so it NEVER interrupts a real
-# login -- purely a last resort for an already-dead helper. See B1.
+# (and the auth capture below) would block forever. After the deadline, abort a Phase-1
+# openconnect ONLY IF the helper is truly GONE -- a live helper means a real (possibly
+# slow: password + Duo can take minutes) login is in progress, which must NEVER be killed
+# (this mirrors the browser's own B9 hard-timer suspension on reveal). So this fires purely
+# as a last resort for an already-dead helper, not on a slow-but-live login. See B1.
 PHASE1_DEADLINE="${PHASE1_DEADLINE:-420}"
-_p1_pat="external-browser=$PROJ/bin/vpn-browser"
+# Validate the (documented) knob: a non-integer makes `sleep` fail -> set -e disables the
+# whole backstop; 0/negative makes it fire against the just-started login. Fall back to 420.
+case $PHASE1_DEADLINE in
+    ''|*[!0-9]*) PHASE1_DEADLINE=420 ;;
+    *) [ "$PHASE1_DEADLINE" -gt 0 ] || PHASE1_DEADLINE=420 ;;
+esac
 ( sleep "$PHASE1_DEADLINE"
-  if pgrep -f "$_p1_pat" >/dev/null 2>&1; then
-      echo "error: Phase 1 exceeded ${PHASE1_DEADLINE}s; the SSO helper looks dead -- aborting." >&2
-      pkill -TERM -f "$_p1_pat" 2>/dev/null || true
+  _oc=$(_pids_matching external-browser "$_P1_FULL")
+  _hp=$(_pids_matching vpn_browser "$_HELPER_FULL")
+  if [ -n "$_oc" ] && [ -z "$_hp" ]; then
+      echo "error: Phase 1 stalled ${PHASE1_DEADLINE}s with the SSO helper gone -- aborting." >&2
+      kill -TERM $_oc 2>/dev/null || true
   fi ) &
 _p1_wd=$!
 

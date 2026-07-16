@@ -110,7 +110,13 @@ _may_touch_proxy() {
     _owner=$(_proxy_owner)
     [ -z "$_owner" ] && return 0                                   # no owner recorded
     [ "$_owner" = "${VPNPID:-}" ] && return 0                      # our own (incl. in-process reconnect)
-    ps -p "$_owner" -o comm= 2>/dev/null | grep -q openconnect && return 1   # a live DIFFERENT tunnel
+    # Is the recorded owner a LIVE openconnect? Compare the process's BASENAME to
+    # "openconnect" EXACTLY -- a substring grep would also match a reused PID now belonging
+    # to e.g. an "openconnect-sso"/"openconnect-gui" process (whose path contains the
+    # substring), wrongly reading a dead record as a live tunnel and refusing to reclaim /
+    # tear down stale state. `ps -o comm=` works cross-user (unlike kill -0 on a root PID).
+    _comm=$(ps -p "$_owner" -o comm= 2>/dev/null)
+    [ "${_comm##*/}" = openconnect ] && return 1                   # a live DIFFERENT tunnel
     return 0                                                       # owner dead / reused -> reclaimable
 }
 
@@ -142,14 +148,18 @@ _proxy_connect() {
 
     # These are unset only if the server pushed no IPv4 DNS / no tun device; guard
     # them (bare refs abort under set -u) and skip DNS-routing rather than crash.
+    # No proxy is coming up on these branches. Sweep our OWN now-stale port files (so routed
+    # domains degrade to default DNS rather than black-holing) -- but ONLY when the ownership
+    # invariant permits: never delete a live DIFFERENT same-port tunnel's /etc/resolver files
+    # (finding 14). _may_touch_proxy in an `if` keeps set -e happy on its false branch.
     _up=${INTERNAL_IP4_DNS:-}; _dev=${TUNDEV:-}
     if [ -z "$_up" ] || [ -z "$_dev" ]; then
-        _sweep_our_resolvers   # no proxy coming up -> don't leave dead-port files
+        if _may_touch_proxy; then _sweep_our_resolvers; fi
         echo ">> no VPN DNS/tun device pushed; DNS-routing disabled for:$_domains" >&2
         return 0
     fi
     if [ -z "$_domains" ]; then
-        _sweep_our_resolvers
+        if _may_touch_proxy; then _sweep_our_resolvers; fi
         echo ">> no domains to DNS-route (@server advertised none); proxy not started" >&2
         return 0
     fi
@@ -173,13 +183,18 @@ _proxy_connect() {
         sleep 0.1; _i=$((_i + 1))
     done
     if [ ! -f "$_ready" ]; then
-        # Warn-only. Kill ONLY the proxy WE just spawned ($_pid) -- it is ours and failed
-        # to signal ready. Do NOT rm the pidfile or sweep /etc/resolver files here: on a
-        # shared port that state may belong to a live DIFFERENT tunnel that won the bind,
-        # and our bind simply lost with EADDRINUSE (finding 14). Leave the winner's
-        # pidfile, .ready, and resolver files intact; this tunnel just runs without
-        # DNS-routing.
+        # Kill ONLY the proxy WE just spawned ($_pid) -- it is ours and failed to signal
+        # ready. Then, IF the ownership invariant permits (our own dead proxy from an
+        # in-process reconnect, or an orphan -- NOT a live DIFFERENT tunnel that won the
+        # bind), clear our now-dead-port pidfile + /etc/resolver files so routed domains
+        # degrade to default DNS instead of black-holing at a port with nothing listening.
+        # If a live winner owns the port, leave its pidfile, .ready, and resolver files
+        # intact -- our bind simply lost with EADDRINUSE (finding 14).
         kill "$_pid" 2>/dev/null || true
+        if _may_touch_proxy; then
+            rm -f "$_pidfile" 2>/dev/null || true
+            _sweep_our_resolvers
+        fi
         echo "WARNING: DNS-routing proxy failed to bind 127.0.0.1:$_port" \
              "(port busy, invalid, or dnspython missing); DNS-routing disabled." >&2
         return 0

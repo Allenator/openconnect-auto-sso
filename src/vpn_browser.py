@@ -460,7 +460,13 @@ def _run(argv, login_url, profile_name, cb_host, cb_port, show_always,
     # This must never fire during a legitimate (possibly slow) interactive login, so
     # do_reveal() stops it the moment we show the window for interaction (B9). A
     # non-positive timeout disables it (rather than quitting instantly). (B5d)
-    if hard_ms > 0:
+    #
+    # In show mode (VPN_BROWSER_SHOW=1, a debug knob) the window is shown up front, so
+    # on_idle/do_reveal never run and the timer would never be stopped -- it would then
+    # fire mid-login and (via on_about_to_quit -> fail_parent) SIGTERM openconnect. Skip
+    # arming it entirely when showing: a human is watching, and _end_browser / the connect
+    # script's PHASE1_DEADLINE still bound a truly stuck helper. (B9)
+    if hard_ms > 0 and not show_always:
         ht = QTimer()
         ht.setSingleShot(True)
         ht.timeout.connect(app.quit)

@@ -50,50 +50,35 @@ user=$(id -un)
 find_bin() { command -v "$1" 2>/dev/null; }
 xml_escape() { printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'; }
 
-# True if $1 is a safe home for a NOPASSWD-granted root binary: a real directory (not
-# a symlink), root-owned, and NOT group/other-writable. A helper reachable through a
-# user-writable OR symlinked path component could be swapped for arbitrary root code,
-# hijacking the grant. `stat -f` is lstat (no -L), so it reports a symlink as mode
-# `l...`, which we reject -- otherwise the writer (`install -d`) would follow the link
-# to an unchecked target.
+# Per-component safety predicate for a NOPASSWD-root path. $2 = space-separated list of
+# allowed owner UIDs. A component is safe iff it is owned by one of those UIDs, is NOT a
+# symlink, and is NOT group/other-writable -- because a component another user can own,
+# rename, replace, or symlink-redirect lets them swap in code that runs as root (or as the
+# login-agent user, who reaches root via the NOPASSWD openconnect rule). `stat -f` is lstat
+# (no -L), so a symlink shows mode `l...` and is rejected -- otherwise the writer (`install
+# -d`) or executor would follow the link to an unchecked target. Fails closed if $1 can't be
+# stat'd. The space-padded `case` avoids partial UID matches (" 100 " vs " 1000 ").
 #
 # LIMITATION: `stat -f %Sp` shows only POSIX mode bits, so this is blind to a macOS ACL
 # (e.g. an `everyone allow write` ACE added via `chmod +a`, visible only under `ls -lde`).
 # A dir could thus be ACL-writable while its mode bits look tight. Exploiting that needs the
-# attacker to already own or be root on the path to set the ACL, which is a strictly stronger
-# position than this check defends against -- so it is not a practical escalation, and we keep
-# the check to the mode bits rather than parsing `ls -lde` output on every path component.
-dir_is_safe() {
-    _st=$(stat -f '%u %Sp' "$1" 2>/dev/null) || return 1
-    _uid=${_st%% *}; _mode=${_st#* }
-    [ "$_uid" = 0 ] || return 1                    # root-owned?
-    case "$_mode" in
-        l*)                 return 1 ;;            # symlink -> install -d follows it elsewhere
-        ?????w*|????????w*) return 1 ;;            # group- or other-writable
-    esac
-    return 0
-}
-
-# Per-component predicate for the user's OWN repo path. Like dir_is_safe, but the owner may
-# be root OR the invoking user ($uid) -- the repo is legitimately user-owned, so requiring
-# root ownership (as dir_is_safe does for the root teardown helper) would be wrong. A
-# component owned by a DIFFERENT non-root user is still unsafe: they can rename/replace it and
-# redirect the login agent's code -> passwordless root (the agent runs the connect script as
-# you and reaches root via the NOPASSWD openconnect rule). Rejects a symlinked component
-# (`stat -f` is lstat, so a symlink reports mode `l...`) and any group/other-writable
-# component -- the same POSIX mode-bit check as dir_is_safe (and the same ACL limitation noted
-# above), plus the owner-is-root-or-me rule. Fails closed if $1 can't be stat'd.
-dir_ok_for_repo() {
+# attacker to already own or be root on the path to set the ACL, a strictly stronger position
+# than this defends against -- so we keep the check to the mode bits.
+_dir_component_safe() {
     _st=$(stat -f '%u %Sp' "$1" 2>/dev/null) || return 1
     _owner=${_st%% *}; _mode=${_st#* }
-    _wantuid=${uid:-$(id -u)}
-    [ "$_owner" = 0 ] || [ "$_owner" = "$_wantuid" ] || return 1   # root- or self-owned only
+    case " $2 " in *" $_owner "*) ;; *) return 1 ;; esac   # owned by an allowed UID?
     case "$_mode" in
-        l*)                 return 1 ;;            # symlink -> writer follows it elsewhere
+        l*)                 return 1 ;;            # symlink -> writer/executor follows it elsewhere
         ?????w*|????????w*) return 1 ;;            # group- or other-writable
     esac
     return 0
 }
+# The root teardown helper's path must be root-owned throughout; the user's OWN repo path may
+# be owned by root OR you ($uid), but never a DIFFERENT non-root user (who could redirect the
+# login agent's code -> passwordless root). Same symlink + mode-bit rules for both.
+dir_is_safe()     { _dir_component_safe "$1" 0; }
+dir_ok_for_repo() { _dir_component_safe "$1" "0 ${uid:-$(id -u)}"; }
 
 # Shared ancestor walk for the two install-time path guards. Emit the FIRST existing
 # component of directory path $1 (walking / down to the leaf) for which the predicate
@@ -116,64 +101,61 @@ _first_bad_ancestor() {
     done
 }
 
-# Verify EVERY existing component of directory path $1 (from / down to the leaf) is a
-# safe home for a NOPASSWD-granted root binary -- else it could be swapped for attacker
-# code, hijacking the grant. A single loose or symlinked ancestor is enough, since
-# unlink/rename is governed by the *parent's* write bit, not the leaf's. Deriving the
-# chain from the path (rather than a hardcoded pair) keeps it from drifting off the
-# real install location. Returns 0 if all-safe; prints the offender and returns 1 if not.
-verify_safe_ancestors() {
-    # Fail closed on a non-absolute (or empty) path -- the walk below assumes a leading /.
+# Verify EVERY existing component of path $1 (from / down to the leaf) passes predicate $2
+# (a function name) -- else a non-owner could swap that component for code that runs as root
+# (or as the login-agent user, who reaches root via NOPASSWD openconnect). unlink/rename is
+# governed by the *parent's* write bit, so one loose/symlinked/foreign-owned ancestor is
+# enough to refuse. Deriving the chain from the path (not a hardcoded pair) keeps it from
+# drifting off the real install location. On failure prints "error: <offender> $3" and
+# returns 1; returns 0 if all-safe.
+_verify_ancestors() {
+    # Fail closed on a non-absolute (or empty) path -- the walk assumes a leading /.
     case $1 in
         /*) ;;
         *)  echo "error: refusing to install under non-absolute path '$1'" >&2; return 1 ;;
     esac
-    _bad=$(_first_bad_ancestor "$1" dir_is_safe)
-    if [ -n "$_bad" ]; then
-        echo "error: $_bad is not root-owned, is group/other-writable, or is a" >&2
-        echo "       symlink; refusing to install a passwordless-root helper under it." >&2
-        return 1
-    fi
-    return 0
+    _bad=$(_first_bad_ancestor "$1" "$2")
+    [ -n "$_bad" ] || return 0
+    echo "error: $_bad $3" >&2
+    return 1
 }
-
-# Verify EVERY existing component of the user's repo path $1 (from / down to the leaf) is
-# safe to host the login agent's code -- root- or self-owned, not a symlink, not
-# group/other-writable (see dir_ok_for_repo). Parallels verify_safe_ancestors and shares the
-# same walk, differing ONLY in the per-component owner rule: the repo is user-owned, so an
-# ancestor owned by root or by YOU is fine, but one owned by a different non-root user (or one
-# a non-owner can write/rename/symlink-redirect) lets them plant code the agent runs as you
-# -> passwordless root. Returns 0 if all-safe; prints the offender and returns 1 if not.
+# Root teardown helper: every component must be root-owned (its NOPASSWD grant can't be
+# hijacked). User's repo: every component must be root- or self-owned (see dir_ok_for_repo).
+verify_safe_ancestors() {
+    _verify_ancestors "$1" dir_is_safe \
+        "is not root-owned, is group/other-writable, or is a symlink; refusing to install a passwordless-root helper under it."
+}
 verify_repo_ancestors() {
-    # Fail closed on a non-absolute (or empty) path -- the walk below assumes a leading /.
-    case $1 in
-        /*) ;;
-        *)  echo "error: refusing to install under non-absolute path '$1'" >&2; return 1 ;;
-    esac
-    _bad=$(_first_bad_ancestor "$1" dir_ok_for_repo)
-    if [ -n "$_bad" ]; then
-        echo "error: $_bad is group/other-writable, a symlink, or owned by another user;" >&2
-        echo "       refusing to install. The login agent runs the connect script as you and" >&2
-        echo "       reaches root via the NOPASSWD openconnect rule, so any repo-path" >&2
-        echo "       component another user can write, rename, or redirect lets them plant" >&2
-        echo "       code that runs as you (passwordless root). Move the repo somewhere" >&2
-        echo "       private (under your home, chmod go-w) and re-run." >&2
-        return 1
-    fi
-    return 0
+    _verify_ancestors "$1" dir_ok_for_repo \
+        "is group/other-writable, a symlink, or owned by another user; refusing to install. A non-owner who can alter any repo-path component plants code the login agent runs as you (-> passwordless root). Move the repo somewhere private (under your home, chmod go-w) and re-run."
 }
 
 do_install() {
     [ -x "$connect" ] || { echo "error: $connect not found/executable" >&2; exit 1; }
     # The LaunchAgent runs $connect as YOU on every login, and $connect reaches root via the
     # NOPASSWD openconnect rule -- so a non-owner who can write, rename, or symlink-redirect
-    # ANY component of the repo path gets passwordless root by planting code the agent then
-    # runs. verify_repo_ancestors walks every existing component from / down to the leaf and
-    # refuses if any is group/other-writable, a symlink, or owned by a user other than root or
-    # you. We do NOT require root-ownership here (it's the user's repo) -- only that no OTHER
-    # user can subvert the path. The normal case (repo under $HOME, user-private) passes.
-    for _d in "$proj" "$(dirname "$connect")"; do
-        verify_repo_ancestors "$_d" || exit 1
+    # ANY component the agent (as you) or the ROOT vpnc-script wrapper sources/execs gets
+    # passwordless root by planting code that then runs. First verify $proj and every ancestor
+    # from / down (unlink/rename is governed by the parent, so an ancestor is enough).
+    verify_repo_ancestors "$proj" || exit 1
+    # $proj is now vetted, so its INTERIOR only needs each component's OWN mode checked (a safe
+    # $proj prevents these being unlinked/replaced). Vet every dir + file the agent or the root
+    # wrapper sources/execs -- root sources lib/common.sh and execs .venv/bin/python +
+    # src/dnsroute.py; the agent execs the bin/ scripts + src/*.py. A group/other-writable,
+    # symlinked, or foreign-owned one of these is direct code-exec as you (-> passwordless root)
+    # or as root. .venv may not exist yet (install.sh builds it); skip whatever is absent. (We
+    # vet .venv/bin rather than the python symlink inside it, which legitimately points at the
+    # system/Homebrew interpreter -- swapping that symlink needs write on .venv/bin.)
+    for _c in bin lib src .venv .venv/bin \
+              bin/openconnect-auto-sso bin/vpnc-slice bin/vpn-browser \
+              lib/common.sh src/dnsroute.py src/vpn_browser.py src/loadconfig.py; do
+        [ -e "$proj/$_c" ] || continue
+        dir_ok_for_repo "$proj/$_c" && continue
+        echo "error: $proj/$_c is group/other-writable, a symlink, or owned by another user;" >&2
+        echo "       refusing to install -- the login agent or root wrapper runs code from it," >&2
+        echo "       so a non-owner who can alter it gets code execution as you (passwordless" >&2
+        echo "       root) or as root. chmod go-w (and fix ownership) and re-run." >&2
+        exit 1
     done
     # A working config must exist first: otherwise RunAtLoad fails every login and
     # KeepAlive would respawn the failing connect forever. Fail loudly here instead.
@@ -290,8 +272,12 @@ PLIST
     echo ">> installing the root teardown helper + sudoers rule (password once)..."
     # Root-owned teardown helper -- so its NOPASSWD grant can't be hijacked by
     # editing a user-writable file. Install it BEFORE the rule that references it.
+    # Only mark libexecdir for rollback if THIS run creates it. On a reinstall/upgrade the dir
+    # already exists (and belongs to the working install); a rollback must not `rm -rf` it and
+    # take out the live teardown helper. `[ -d ] && ... || true` keeps set -e happy.
+    _pre_libexec=n; [ -d "$libexecdir" ] && _pre_libexec=y || true
     sudo install -d -o root -g wheel -m 0755 "$libexecdir"
-    _did_libexec=y     # created the dir -> roll it back even if the copy below fails
+    [ "$_pre_libexec" = y ] || _did_libexec=y   # created it -> roll it back if a later step fails
     sudo install -o root -g wheel -m 0755 "$teardown_src" "$teardown_bin"
     echo "   $teardown_bin"
 

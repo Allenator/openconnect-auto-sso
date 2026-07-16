@@ -256,20 +256,35 @@ def test_may_touch_proxy_true_for_reused_non_openconnect_owner(tmp_path):
     assert r.stdout.strip() == "TOUCH"
 
 
-# --- vpnc-slice: failed-bind path leaves a same-port winner's state intact (finding 14) --
-def test_failed_bind_leaves_pidfile_and_resolvers_intact(tmp_path):
-    # When our dnsroute fails to bind (the port is held by a live DIFFERENT tunnel), the
-    # connect pass must WARN ONLY -- never rm the pidfile or sweep /etc/resolver files, which
-    # would nuke the winner's DNS. Stub `nohup` so dnsroute never starts (no ready-file),
-    # drive _proxy_connect into the failed-bind branch, and assert the pre-existing pidfile
-    # + resolver file survive untouched.
+def test_may_touch_proxy_true_for_openconnect_lookalike_owner(tmp_path):
+    # Finding 6: a reused owner PID belonging to an "openconnect-sso" / "openconnect-gui"
+    # process -- whose comm CONTAINS the substring "openconnect" but is NOT openconnect (this
+    # user runs openconnect-sso) -- must read as reclaimable. The old `grep -q openconnect`
+    # substring match wrongly LEFT it; the basename-exact compare correctly TOUCHes it.
+    pf = tmp_path / "proxy"
+    pf.write_text("4242\n55555\n")
+    body = ('ps() { echo "/opt/homebrew/bin/openconnect-sso"; }\n'
+            '_pidfile="%s"\nVPNPID=999999\n'
+            '_may_touch_proxy && echo TOUCH || echo LEAVE\n') % pf
+    r = _sh(SRC_VPNC, body)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "TOUCH"
+
+
+# --- vpnc-slice: failed-bind path is ownership-gated (findings 2 + 14) -----------------
+def test_failed_bind_leaves_a_live_winners_state_intact(tmp_path):
+    # Finding 14: when our dnsroute fails to bind because a live DIFFERENT tunnel holds the
+    # port, WARN ONLY -- never rm the pidfile or sweep the winner's /etc/resolver files. Make
+    # _may_touch_proxy see a LIVE different owner by stubbing `ps` so the recorded owner (55555)
+    # reads as an openconnect; stub `nohup` so dnsroute never starts (failed-bind branch).
     resolv = tmp_path / "resolver"
     resolv.mkdir()
-    _mk_resolver(resolv / "keep.corp", 45353)     # a winner's resolver file (our marker+port)
+    _mk_resolver(resolv / "keep.corp", 45353)     # the winner's resolver file (our marker+port)
     pf = tmp_path / "proxy"
-    pf.write_text("4242\n55555\n")                # a winner's pidfile (owner 55555)
+    pf.write_text("4242\n55555\n")                # the winner's pidfile (dnsroute 4242, owner 55555)
     body = (
         'nohup() { :; }\n'                        # dnsroute never starts -> failed-bind path
+        'ps() { case "$*" in *55555*) echo /opt/homebrew/bin/openconnect;; esac; }\n'
         '_names="keep.corp"\n'
         'CISCO_SPLIT_DNS=""; CISCO_DEF_DOMAIN=""\n'
         'INTERNAL_IP4_DNS="10.0.0.53"; TUNDEV="utun-test"; VPNGATEWAY="10.0.0.1"\n'
@@ -282,9 +297,35 @@ def test_failed_bind_leaves_pidfile_and_resolvers_intact(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "DONE" in r.stdout
     assert "failed to bind" in r.stderr
-    assert pf.exists(), "failed-bind wrongly deleted the pidfile"
-    assert pf.read_text() == "4242\n55555\n", "failed-bind wrongly rewrote the pidfile"
-    assert (resolv / "keep.corp").exists(), "failed-bind wrongly swept a resolver file"
+    assert pf.read_text() == "4242\n55555\n", "failed-bind wrongly rewrote the winner's pidfile"
+    assert (resolv / "keep.corp").exists(), "failed-bind wrongly swept the winner's resolver file"
+
+
+def test_failed_bind_sweeps_our_own_dead_port_files(tmp_path):
+    # Finding 2: on OUR OWN failed rebind (recorded owner == our VPNPID, or a dead/absent
+    # owner), the failed-bind path MUST clear our now-dead-port pidfile + resolver files so
+    # routed domains degrade to default DNS instead of black-holing at a port nothing binds.
+    resolv = tmp_path / "resolver"
+    resolv.mkdir()
+    _mk_resolver(resolv / "mine.corp", 45353)
+    pf = tmp_path / "proxy"
+    pf.write_text("4242\n999999\n")               # recorded owner == our VPNPID below
+    body = (
+        'nohup() { :; }\n'                        # dnsroute never starts -> failed-bind path
+        'ps() { :; }\n'                           # no live owner anywhere
+        '_names="mine.corp"\n'
+        'CISCO_SPLIT_DNS=""; CISCO_DEF_DOMAIN=""\n'
+        'INTERNAL_IP4_DNS="10.0.0.53"; TUNDEV="utun-test"; VPNGATEWAY="10.0.0.1"\n'
+        'VPNPID=999999\n'                         # we own the record (in-process reconnect)
+        '_port=45353\n_pidfile="%s"\n'
+        '_proxy_connect\n'
+        'echo DONE\n'
+    ) % pf
+    r = _sh(SRC_VPNC, body, extra_env={"RESOLVER_DIR": str(resolv)})
+    assert r.returncode == 0, r.stderr
+    assert "failed to bind" in r.stderr
+    assert not pf.exists(), "failed-bind should remove our own dead-port pidfile"
+    assert not (resolv / "mine.corp").exists(), "failed-bind should sweep our own dead-port file"
 
 
 # --- vpnc-slice: NC_BIN root-gate (off-root the override is still honored) -----------
@@ -355,7 +396,7 @@ def test_verify_safe_ancestors_rejects_unsafe_ancestor(tmp_path):
 ])
 def test_dir_ok_for_repo_mode_bits(tmp_path, mode, expect):
     # Self-owned dir: the owner check passes (it's YOURS), so only the group/other-write bits
-    # decide -- the same table dir_no_other_write used, now on the owner-aware predicate.
+    # decide -- exercising the shared _dir_component_safe mode-bit case via the repo predicate.
     d = tmp_path / ("m%o" % mode)
     d.mkdir()
     d.chmod(mode)
@@ -483,6 +524,30 @@ def test_do_install_refuses_writable_connect_dir(tmp_path):
     assert r.returncode != 0
     assert "group/other-writable" in r.stderr
     assert "refusing to install" in r.stderr
+
+
+def test_do_install_refuses_group_or_other_writable_interior_dir(tmp_path):
+    # Finding 1: the ROOT vpnc-slice wrapper sources $proj/lib/common.sh and execs
+    # $proj/src/dnsroute.py + $proj/.venv/bin/python as root, so those INTERIOR dirs must be
+    # unsubvertable too -- not just $proj and $proj/bin. A private repo root but a world-writable
+    # lib/ (whose common.sh root sources) is a plant-code-as-root vector; do_install must refuse.
+    proj = tmp_path / "repo"
+    (proj / "bin").mkdir(parents=True)
+    (proj / "lib").mkdir()
+    (proj / "lib" / "common.sh").write_text(":\n")
+    connect = proj / "bin" / "openconnect-auto-sso"
+    connect.write_text("#!/bin/sh\n:\n")
+    connect.chmod(0o755)
+    proj.chmod(0o755); (proj / "bin").chmod(0o755)       # root + bin/ private...
+    (proj / "lib").chmod(0o777)                          # ...but lib/ world-writable
+    rp = os.path.realpath(str(proj))
+    body = ('proj="%s"\nconnect="%s/bin/openconnect-auto-sso"\ndo_install\n') % (rp, rp)
+    r = _sh(SRC_INSTALL, body)
+    assert r.returncode != 0
+    # "runs code from it" is UNIQUE to the interior-component message (the ancestor-walk
+    # refusal shares "group/other-writable"), pinning the failure to the interior /lib check.
+    assert "runs code from it" in r.stderr
+    assert rp + "/lib" in r.stderr
 
 
 # --- lib/common.sh: server_hostport + wait_for_server ---------------------------------
@@ -717,30 +782,34 @@ def test_connect_apply_launch_budget_config_reconnect_wins():
     assert r.stdout.strip() == "77"
 
 
-@pytest.mark.parametrize("bad", [
-    "/tmp/a+b", "/tmp/a|b", "/tmp/a(b)", "/tmp/a*b", "/tmp/a[b]", "/tmp/a{b}", "/tmp/a^b",
+@pytest.mark.parametrize("name", [
+    "a+b", "a|b", "a(b)", "a*b", "a[b]", "a{b}", "a^b", "a.b",
 ])
-def test_connect_proj_ere_guard_rejects_metachars(bad):
-    # Finding 10: $PROJ is spliced into pgrep/pkill -f patterns (ERE on BSD), so a regex metachar
-    # in the repo path would break/over-broaden the Phase-1 backstop match. The guard runs at
-    # source time (before the seam body), so a metachar $PROJ makes sourcing exit non-zero.
-    r = _sh(SRC_CONNECT, 'echo REACHED_BODY\n', extra_env={"OC_PROJ": bad})
-    assert r.returncode != 0
-    assert "regex metacharacter" in r.stderr
-    assert "REACHED_BODY" not in r.stdout
-
-
-def test_connect_proj_ere_guard_accepts_dotted_path(tmp_path):
-    # A `.` is deliberately ALLOWED (common in paths; inside an otherwise-literal ERE it only
-    # matches its own position). Point $PROJ at a dotted dir whose lib/ is symlinked to the real
-    # repo (so the post-guard `. $PROJ/lib/common.sh` resolves): the guard must PASS, the seam
-    # then skip the body, and sourcing succeed -- proving a dotted path is accepted, not rejected.
-    dotted = tmp_path / "a.b.repo"
-    dotted.mkdir()
-    (dotted / "lib").symlink_to(os.path.join(REPO, "lib"))
-    r = _sh(SRC_CONNECT, 'echo PASSED\n', extra_env={"OC_PROJ": str(dotted)})
+def test_connect_metachar_proj_path_sources_fine(tmp_path, name):
+    # Finding 7: the old B10 $PROJ-metacharacter guard is GONE -- the backstop / _end_browser now
+    # match by a fixed literal + grep -F, never splicing $PROJ into an ERE -- so a repo path with
+    # regex metacharacters (common on macOS: "Projects (work)", "C++") sources and runs fine.
+    # Point $PROJ at such a dir whose lib/ symlinks to the real repo and confirm the seam sources
+    # cleanly (body reached) instead of refusing.
+    proj = tmp_path / name
+    proj.mkdir()
+    (proj / "lib").symlink_to(os.path.join(REPO, "lib"))
+    r = _sh(SRC_CONNECT, 'echo REACHED_BODY\n', extra_env={"OC_PROJ": str(proj)})
     assert r.returncode == 0, r.stderr
-    assert "PASSED" in r.stdout
+    assert "REACHED_BODY" in r.stdout
+
+
+def test_connect_refuses_when_executed_with_seam_var():
+    # Finding 10: OC_CONNECT_TEST=1 is a SOURCING seam for tests. If it leaks into a real
+    # EXECUTED run, the whole connect flow would be guarded off and the script would exit 0
+    # having done nothing (a silent no-op -- the worst failure for a VPN tool). Executing the
+    # script with the var set must refuse LOUDLY (non-zero + a clear message). ($0 basename is
+    # the script name when executed, but "sh" when the harness sources it -- so the seam tests
+    # above are unaffected.)
+    r = subprocess.run([CONNECT], capture_output=True, text=True,
+                       env=dict(os.environ, OC_CONNECT_TEST="1"), timeout=30)
+    assert r.returncode != 0
+    assert "EXECUTED" in r.stderr
 
 
 def test_connect_build_vs_full_includes_flags_and_quotes():

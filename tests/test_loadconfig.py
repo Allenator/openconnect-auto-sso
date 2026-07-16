@@ -185,8 +185,8 @@ def test_reconnect_timeout_absurdly_large_rejected():
 
 
 def test_absent_reconnect_timeout_emits_no_variable():
-    # The connect script's context-dependent default (30 supervised / 300 interactive)
-    # only works if loadconfig stays SILENT when the key is absent.
+    # The connect script's launch-mode default (30 under KeepAlive / 300 under --once or
+    # interactive) only works if loadconfig stays SILENT when the key is absent.
     r = _run_cli('server = "x"\n')
     assert r.returncode == 0, r.stderr
     assert "RECONNECT_TIMEOUT" not in r.stdout

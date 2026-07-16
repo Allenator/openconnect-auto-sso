@@ -223,6 +223,13 @@ def _is_bogus_scope(ip):
         addr = ipaddress.ip_address(ip)
     except ValueError:
         return True
+    # Normalize an IPv4-mapped IPv6 address (e.g. ::ffff:127.0.0.1) to its IPv4 form BEFORE
+    # classifying: on Python < 3.13, IPv6Address.is_loopback/is_link_local do NOT see through
+    # the ::ffff: prefix, so a v4-mapped loopback/link-local answer would slip this filter and
+    # become a root-installed route. requires-python is >=3.12, so cover the 3.12 case here.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
     return (addr.is_loopback or addr.is_link_local
             or addr.is_multicast or addr.is_unspecified)
 

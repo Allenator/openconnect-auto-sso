@@ -54,12 +54,12 @@ server = "vpn.example.com"
 # keepalive_interval = 30
 
 # How long openconnect retries in-process after a drop before giving up (seconds; 0 = give
-# up at once). There is no single default: it is 30 under the auto-start agent (something
-# will restart it) and 300 for a manual run (nothing will), so leaving this unset is
-# usually right. openconnect cannot reconnect across a macOS sleep -- a fresh connect is
-# what actually recovers -- and an outage longer than this ends the tunnel. Read
-# "Sleep and wake" in the README before pinning a value here.
-# reconnect_timeout = 30      # 300 when run interactively; unset = pick automatically
+# up at once). There is no single default: it is 30 under the KeepAlive auto-start agent
+# (which respawns a fresh connect) and 300 under `install --once` or a manual run (nothing
+# restarts those), so leaving this unset is usually right. openconnect cannot reconnect
+# across a macOS sleep -- a fresh connect is what actually recovers -- and an outage longer
+# than this ends the tunnel. Read "Sleep and wake" in the README before pinning a value here.
+# reconnect_timeout = 30      # 300 under --once/manual; unset = pick automatically
 
 # Advanced (usually leave default):
 # profile_name = "openconnect-auto-sso"   # Qt persistent-profile storage key
