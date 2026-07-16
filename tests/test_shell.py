@@ -742,28 +742,73 @@ def test_verify_repo_interior_refuses_foreign_owned(tmp_path):
     assert r.stdout.strip() == "BAD"
 
 
-# Round-4 findings 1/2/6 rewrite -- the full 9-case matrix. The deep-.pth / clean-python-symlink /
-# src-symlink / foreign-owner cases are covered above; the remaining cases follow.
+# Round-5 fail-closed matrix (updated from round 4: a writable .so and a writable non-.venv/.lock
+# data file now REFUSE). The deep-.pth / clean-python-symlink / src-symlink / foreign-owner cases
+# are covered above; the remaining cases follow.
 def test_verify_repo_interior_accepts_stock_repo_with_uv_lock():
     # Case 1 (finding 1, DEPLOY-BLOCKER): the REAL repo -- which carries uv's own .venv/.lock at
-    # mode 0666 -- must PASS. A group/other-writable DATA file (not *.py/*.pth/*.sh, not exec) is
-    # no code-exec vector, so it must not block a stock install (the old -perm -0002 arm flagged
-    # .venv/.lock and refused every real install; `chmod go-w` is undone by the next `uv sync`).
+    # mode 0666 -- must PASS. .venv/.lock is the single writable-file carve-out; every OTHER
+    # group/other-writable entry now fails closed (see the .so / data-file REFUSE cases above), so
+    # this test is also the MUTATION-CHECK for the exemption: dropping the `! -path './.venv/.lock'`
+    # clause makes the real repo refuse. (`chmod go-w` on .venv/.lock is undone by the next `uv sync`.)
     r = _sh(SRC_INSTALL, 'verify_repo_interior "$OC_PROJ" && echo OK || echo BAD')
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "OK", r.stderr
 
 
-def test_verify_repo_interior_accepts_writable_noncode_data_file(tmp_path):
-    # Case 3: a group/other-writable NON-code data file (name not *.py/*.pth/*.sh, no exec bit)
-    # in an otherwise tight tree must PASS -- the writable-FILE check is scoped to code files
-    # root/agent actually sources or execs (finding 1). A generic name (not .lock) proves it is
-    # the code-file scoping, not a .venv/.lock special-case.
+def test_verify_repo_interior_refuses_writable_noncode_data_file(tmp_path):
+    # Case 3 (round-5 FLIP -- was PASS in round 4): a group/other-writable NON-code data file
+    # whose name is NOT the one exempt path (./.venv/.lock) is now REFUSED. The check is
+    # FAIL-CLOSED: it no longer allowlists "code" by extension/exec-bit (which silently blessed a
+    # writable .so/.pyc a python load pulls in by content), so a generic writable data file --
+    # e.g. a planted `data.lock` -- fails closed rather than being blessed.
     proj = os.path.realpath(str(tmp_path / "repo"))
     os.makedirs(proj + "/.venv/lib")
     with open(proj + "/.venv/lib/data.lock", "w") as f:
         f.write("x\n")
-    os.chmod(proj + "/.venv/lib/data.lock", 0o666)      # world-writable, but NOT a code file
+    os.chmod(proj + "/.venv/lib/data.lock", 0o666)      # world-writable data file (not exempt)
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "BAD"
+    assert proj + "/.venv/lib/data.lock" in r.stderr
+
+
+def test_verify_repo_interior_refuses_writable_so(tmp_path):
+    # Case 2 (round-5 FLIP -- was PASS in round 4, THE bug): a group/other-writable native
+    # extension (.so, also .dylib/.pyc/.pyo) deep under .venv/lib/.../site-packages is REFUSED.
+    # A python load dlopen's a .so and imports a .pyc by CONTENT, not name, so the round-4
+    # extension allowlist (*.py/*.pth/*.sh + exec bit) silently BLESSED a writable .so -- a
+    # root-code-exec vector. The fail-closed arm now flags it. (MUTATION-CHECK: reverting to the
+    # old code-file allowlist makes this test fail, because a .so has no allowlisted extension and
+    # no exec bit.)
+    proj = os.path.realpath(str(tmp_path / "repo"))
+    deep = proj + "/.venv/lib/python3.13/site-packages/_c"
+    os.makedirs(deep)
+    so = deep + "/_speedup.cpython-313-darwin.so"
+    with open(so, "wb") as f:
+        f.write(b"\x00")                                # a native extension, no exec bit, not *.py
+    os.chmod(so, 0o666)                                 # world-writable .so (dlopen target)
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "BAD"
+    assert so in r.stderr
+
+
+def test_verify_repo_interior_accepts_venv_lock_exemption(tmp_path):
+    # Case 5: the ONE writable-file exemption is exactly ./.venv/.lock (uv's world-writable lock,
+    # mode 0666, re-created by every `uv sync`). A synthetic tree whose only writable entry is
+    # .venv/.lock must PASS -- pinning the single carve-out that keeps a STOCK repo installable.
+    # (MUTATION-CHECK sibling: dropping the exemption makes the stock-repo test fail; this pins
+    # the exemption path hermetically, independent of the real repo's state.)
+    proj = os.path.realpath(str(tmp_path / "repo"))
+    os.makedirs(proj + "/bin")
+    os.makedirs(proj + "/.venv")
+    with open(proj + "/bin/openconnect-auto-sso", "w") as f:
+        f.write("#!/bin/sh\n:\n")
+    os.chmod(proj + "/bin/openconnect-auto-sso", 0o755)
+    with open(proj + "/.venv/.lock", "w") as f:
+        f.write("")
+    os.chmod(proj + "/.venv/.lock", 0o666)              # the one exempt world-writable file
     r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "OK", r.stderr

@@ -162,18 +162,20 @@ verify_repo_ancestors() {
 # What is flagged (find is -P, so symlinks are NOT followed):
 #   - a SYMLINK anywhere, EXCEPT a DIRECT child of .venv/bin (the interpreter links uv makes,
 #     pointing at the system/Homebrew python; swapping one needs write on .venv/bin, whose own
-#     dir mode the dir arm below checks). fnmatch `*` crosses `/`, so the exemption is pinned to
-#     DIRECT children via `! -path './.venv/bin/*/*'` -- a planted .venv/bin/sub/evil is NOT
-#     exempt (finding 2a).
+#     dir mode the writable arm below catches). fnmatch `*` crosses `/`, so the exemption is
+#     pinned to DIRECT children via `! -path './.venv/bin/*/*'` -- a planted .venv/bin/sub/evil
+#     is NOT exempt (finding 2a).
 #   - a FOREIGN-owned entry (! -user 0 ! -user $uid = owned by neither root nor you): a foreign
 #     non-root user who could redirect the code.
-#   - a group/other-writable DIR (-perm -0020/-0002): its write bit lets a non-owner unlink or
-#     replace what's inside.
-#   - a group/other-writable FILE, but ONLY a CODE file root/agent actually sources or execs
-#     (exec bit set, or name *.py / *.pth / *.sh). A benign group/other-writable DATA file (uv's
-#     own .venv/.lock, mode 0666, re-created by every `uv sync`) is NOT a code-exec vector --
-#     root/agent never runs it, and a safe parent DIR already stops it being replaced -- so it
-#     must NOT block a STOCK repo (finding 1).
+#   - ANY group/other-writable entry (-perm -0020/-0002), file OR dir, EXCEPT the one known-benign
+#     world-writable file uv creates (.venv/.lock, mode 0666, re-created by every `uv sync`). This
+#     is FAIL-CLOSED, on purpose: an earlier round allowlisted "code" files by extension/exec-bit
+#     (*.py/*.pth/*.sh + the exec bit) and so BLESSED a group/other-writable .so/.dylib (dlopen)
+#     or .pyc/.pyo (bytecode) -- root-code-exec vectors a python load pulls in by CONTENT, not
+#     name. Flagging EVERY writable entry (a writable DIR also lets a non-owner unlink/replace
+#     what's inside) means the next unknown writable format fails CLOSED with a clear message
+#     instead of being silently blessed; only the exact ./.venv/.lock is exempt so a STOCK repo
+#     still installs (finding 1).
 #
 # Robustness (findings 2b + 6): find runs in a subshell that `cd "$_p"` FIRST and uses RELATIVE
 # roots + LITERAL `./.venv/bin/*` patterns, so a glob metacharacter or space in $_p can never
@@ -199,10 +201,7 @@ verify_repo_interior() {
             \( \
                \( -type l ! \( -path './.venv/bin/*' ! -path './.venv/bin/*/*' \) \) \
                -o \( ! -user 0 ! -user "$_uid" \) \
-               -o \( -type d \( -perm -0020 -o -perm -0002 \) \) \
-               -o \( -type f \( -perm -0020 -o -perm -0002 \) \
-                     \( -perm -0100 -o -perm -0010 -o -perm -0001 \
-                        -o -name '*.py' -o -name '*.pth' -o -name '*.sh' \) \) \
+               -o \( \( -perm -0020 -o -perm -0002 \) ! -path './.venv/.lock' \) \
             \) -print 2>/dev/null) || exit 4           # find errored (unreadable subtree) -> fail closed
         [ -n "$_found" ] || exit 0                      # nothing flagged -> clean
         printf '%s\n' "$_found" | head -n1              # first offender (relative "./...")
