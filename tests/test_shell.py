@@ -1279,10 +1279,22 @@ def _stub_connect_env(tmp_path):
         "#!/bin/sh\n"
         "trap 'rm -f \"$HELPER_ALIVE\"; exit 0' TERM INT\n"
         "touch \"$HELPER_ALIVE\"\n"
-        "[ -n \"${VPN_BROWSER_PIDFILE:-}\" ] && printf '%s\\n' \"$$\" > \"$VPN_BROWSER_PIDFILE\"\n"
+        # $2 = mode: short | long | longnopid. A 'nopid' mode SKIPS the pidfile write, simulating
+        # write_own_pidfile's best-effort write FAILING while the helper is still LIVE -- finding
+        # 5's secondary pgrep-child check must then keep the backstop from killing a real login.
         "case \"$2\" in\n"
-        "  long) while :; do sleep 1; done ;;\n"
-        "  *)    rm -f \"$HELPER_ALIVE\"; exit 0 ;;\n"    # short: pidfile then exit
+        "  *nopid*) : ;;\n"
+        "  *) [ -n \"${VPN_BROWSER_PIDFILE:-}\" ] && printf '%s\\n' \"$$\" > \"$VPN_BROWSER_PIDFILE\" ;;\n"
+        "esac\n"
+        "case \"$2\" in\n"
+        # long: stay alive until signalled, but SELF-EXIT if orphaned (PPID -> 1 once openconnect
+        # dies) -- mirrors vpn_browser.py's parent-death watch, and stops a pidfile-less helper
+        # (longnopid) leaking past teardown when _end_browser has no recorded PID to reap.
+        "  long*) while :; do\n"
+        "           [ \"$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')\" = 1 ] && { rm -f \"$HELPER_ALIVE\"; exit 0; }\n"
+        "           sleep 1\n"
+        "         done ;;\n"
+        "  *)     rm -f \"$HELPER_ALIVE\"; exit 0 ;;\n"    # short: pidfile then exit
         "esac\n")
     helper.chmod(0o755)
 
@@ -1307,6 +1319,17 @@ def _stub_connect_env(tmp_path):
         "        while :; do sleep 1; done ;;\n"
         "      dead)\n"
         "        sh \"$STUB_HELPER\" \"$HELPER_MARKER\" short >/dev/null 2>&1 &\n"
+        # Reap the short-lived helper, then busy-wait with NO live child -- faithfully
+        # mirroring real openconnect blocking in select(NULL) with a DEAD helper. A `sleep`
+        # loop would leave a live `sleep` child that finding 5's `pgrep -P` correctly reads as
+        # "login still live", so the backstop would (rightly) never fire on it.
+        "        wait\n"
+        "        while :; do :; done ;;\n"
+        "      livenopid)\n"
+        # A LIVE helper (openconnect's direct child) whose pidfile write FAILED: the helper stays
+        # up but records no PID, so the backstop's pidfile check reads "helper gone". Finding 5's
+        # secondary `pgrep -P` must see openconnect's live child and stand down (never kill it).
+        "        sh \"$STUB_HELPER\" \"$HELPER_MARKER\" longnopid >/dev/null 2>&1 &\n"
         "        while :; do sleep 1; done ;;\n"
         "    esac ;;\n"
         "  *' --cookie-on-stdin '*)\n"
@@ -1433,3 +1456,90 @@ def test_phase1_dead_helper_is_aborted_at_deadline(tmp_path):
     assert "authentication failed" in r.stderr
     assert not m["phase2"].exists(), "must NOT reach Phase 2 on a failed auth"
     assert _wait_gone(m["oc_alive"]), "backstop should have TERMed the wedged openconnect"
+
+
+def test_phase1_live_helper_without_pidfile_not_killed(tmp_path):
+    # Finding 5: write_own_pidfile is best-effort (swallows OSError). If the pidfile write FAILS
+    # while the helper is LIVE (openconnect's direct child), the backstop's pidfile-based check
+    # reads "helper gone" -- but a secondary `pgrep -P "$_oc_pid"` sees openconnect's live child
+    # and stands down, so a real (possibly slow) login is NEVER killed just because its pidfile
+    # never got written. openconnect must survive well past the deadline. (Mutation-checked:
+    # removing the pgrep line lets the backstop kill this live login.)
+    env, m = _stub_connect_env(tmp_path)
+    env["STUB_MODE"] = "livenopid"
+    env["PHASE1_DEADLINE"] = "2"
+    proc = subprocess.Popen([CONNECT], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, env=env, text=True)
+    try:
+        end = time.time() + 10
+        while time.time() < end and not (m["oc_alive"].exists() and m["helper_alive"].exists()):
+            time.sleep(0.05)
+        assert m["oc_alive"].exists() and m["helper_alive"].exists(), "Phase 1 never came up"
+        time.sleep(4)                          # well past the 2s deadline
+        assert m["oc_alive"].exists(), "backstop wrongly killed a live login whose pidfile write failed"
+        assert proc.poll() is None, "script exited though the login was still live"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    assert _wait_gone(m["oc_alive"]) and _wait_gone(m["helper_alive"])
+
+
+def test_backstop_survives_failed_stderr_write_and_still_kills(tmp_path):
+    # Finding 3: the backstop's `echo "Phase 1 stalled" >&2` sits immediately before the
+    # `kill -TERM` that frees a wedged openconnect, guarded with `|| true`. A FAILED stderr write
+    # (ENOSPC, or EPIPE with SIGPIPE ignored) must NOT, under the subshell's set -e, abort BEFORE
+    # that kill -- else openconnect wedges and `wait` hangs the connect forever. Reproduce it on
+    # the REAL dead-helper flow: run with SIGPIPE IGNORED (so a broken-pipe write returns EPIPE
+    # rather than signalling) and CLOSE the stderr read end once Phase 1 is up, so the backstop's
+    # later stderr write fails. With `|| true` the kill still fires -> `wait` returns -> the script
+    # EXITS; removing the `|| true` makes it hang (this test then times out). Mutation-checked.
+    import signal
+    env, m = _stub_connect_env(tmp_path)
+    env["STUB_MODE"] = "dead"
+    env["PHASE1_DEADLINE"] = "3"
+    proc = subprocess.Popen(
+        [CONNECT], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+        env=env, text=True,
+        preexec_fn=lambda: signal.signal(signal.SIGPIPE, signal.SIG_IGN))
+    try:
+        # Read stderr until Phase 1 is authenticating, THEN break the stderr pipe (close our read
+        # end) so the backstop's later `echo >&2` fails with EPIPE (SIGPIPE ignored -> a return
+        # code, not a fatal signal -- exactly the ENOSPC/EPIPE class finding 3 guards against).
+        end = time.time() + 10
+        seen = False
+        while time.time() < end:
+            line = proc.stderr.readline()
+            if not line:
+                break
+            if "authenticating to test.example" in line:
+                seen = True
+                break
+        assert seen, "never reached Phase 1"
+        proc.stderr.close()                     # break the pipe -> backstop's stderr write EPIPEs
+        proc.wait(timeout=15)                   # with `|| true` the kill still runs -> script exits
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    assert proc.returncode is not None and proc.returncode != 0, "script did not exit (backstop stalled?)"
+    assert _wait_gone(m["oc_alive"]), "backstop must still TERM openconnect after a failed stderr write"
+
+
+def test_oc_pid_cleared_after_wait_reaps_openconnect():
+    # Finding 4: after `wait "$_oc_pid"` reaps the Phase-1 openconnect, its PID is FREED (and may
+    # be reused). The INT/TERM trap raw-`kill`s `${_oc_pid:-}`, so a signal in the post-wait /
+    # _end_browser window (before Phase 2 replaces the trap) would signal a freed/reused PID. The
+    # fix clears `_oc_pid=''` immediately after the wait, making the trap's `kill` a safe no-op.
+    # This guard is STRUCTURAL: the bug only manifests under PID reuse, which a test cannot force
+    # deterministically -- so we pin that the clear directly follows the auth-rc capture (mutation:
+    # deleting the `_oc_pid=''` line makes this fail).
+    import re
+    with open(CONNECT) as f:
+        src = f.read()
+    m = re.search(
+        r'if wait "\$_oc_pid"; then _auth_rc=0; else _auth_rc=\$\?; fi[^\n]*\n\s*_oc_pid=\'\'',
+        src)
+    assert m, "expected `_oc_pid=''` to clear the reaped PID immediately after the wait (finding 4)"

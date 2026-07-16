@@ -185,6 +185,12 @@ PROXY_PORT="${PROXY_PORT:-45353}"       # loopback port for the DNS-routing prox
 # still remove it on exit.)
 _rundir=$(mktemp -d "${TMPDIR:-/tmp}/oc-sso.XXXXXX") \
     || { echo "error: could not create a private run directory" >&2; exit 1; }
+# MINIMAL cleanup traps, armed the instant $_rundir exists -- its own EXIT/signal traps aren't
+# installed until Phase 1 (~150 lines below), so an exit or signal in the gap (openconnect-not-
+# found exit 1; a signal during wait_for_server's up-to-300s window) would otherwise leak the
+# 0700 dir (finding 7). The Phase-1 traps (below) later REPLACE these.
+trap 'rm -rf "${_rundir:-}" 2>/dev/null || true' EXIT
+trap 'rm -rf "${_rundir:-}" 2>/dev/null; exit 130' INT TERM
 KA_DNS_FILE="$_rundir/dns"                  # keepalive @dns target (root wrapper writes it)
 # Helper pidfile: the SSO helper records its own PID here so _end_browser reaps EXACTLY this
 # run's helper by PID -- not every same-repo helper by argv pattern, which would kill a
@@ -316,7 +322,15 @@ COOKIE=''; HOST=''; CONNECT_URL=''; FINGERPRINT=''; RESOLVE=''
 # Preserve the tty on fd 3 for openconnect's UNTRUSTED-CERT prompt: backgrounding a child
 # reassigns its stdin to /dev/null, and Phase 1 passes no --servercert, so that prompt is
 # real -- the bg openconnect reads the tty via <&3. Released before Phase 2's --cookie-on-stdin.
-exec 3<&0
+# A niche spawner that CLOSES fd 0 (rather than /dev/null'ing it) makes a bare `exec 3<&0` fail;
+# `exec` is a special built-in, so a failed redirection ABORTS the whole connect (finding 11) --
+# and a trailing `|| ...` can't catch it (the shell has already exited), while `exec 3<&0
+# 2>/dev/null` would PERMANENTLY silence stderr (the `2>` on a command-less exec outlives it). So
+# probe fd 0's dup-ability in a SUBSHELL first (its exec-exit + the stderr suppression stay
+# confined there -- `n<&n` is a no-op some shells never fail, hence a high fd), then dup the real
+# stdin onto fd 3 only if it is open, else fall back to /dev/null (no tty for the cert prompt,
+# exactly as when backgrounded).
+if ( exec 7<&0 ) 2>/dev/null; then exec 3<&0; else exec 3</dev/null; fi
 
 # Validate the (documented) deadline knob: a non-integer makes `sleep` fail -> set -e would
 # disable the whole backstop; 0/negative would fire it against the just-started login. -> 420.
@@ -347,6 +361,9 @@ trap 'rm -f "${_p1_flag:-}" 2>/dev/null; kill "${_oc_pid:-}" 2>/dev/null || true
 # Background openconnect so we HOLD its real pid ($!). Keep its stdin (the tty, via fd 3) and
 # its stderr (the terminal); capture STDOUT ONLY -- the eval-able COOKIE=/HOST=/FINGERPRINT=/
 # RESOLVE= lines. NOT 2>&1: stderr (progress/prompts) would corrupt `eval "$auth_out"`.
+# TRADEOFF (finding 9): backgrounding forces the session cookie briefly to disk here (the old
+# foreground capture kept it in memory). ACCEPTED as inherent to backgrounding, mitigated by the
+# 0600 tempfile inside the 0700 $_rundir and unlinked the instant it is read (below).
 _authtmp=$(mktemp "$_rundir/oc-auth.XXXXXX")
 if [ -n "$PROTOCOL" ]; then
     "$OPENCONNECT" --protocol="$PROTOCOL" \
@@ -377,12 +394,22 @@ _oc_pid=$!
     if [ -n "$_rec" ] && kill -0 "$_rec" 2>/dev/null && pid_argv_has "$_rec" "$_HELPER_FULL"; then
         exit 0                                  # slow-but-live login -> never kill it
     fi
-    echo "error: Phase 1 stalled ${PHASE1_DEADLINE}s with the SSO helper gone -- aborting." >&2
+    # Secondary liveness check (finding 5): write_own_pidfile is best-effort (it swallows
+    # OSError), so an ABSENT pidfile can mean "helper LIVE but its write failed", not "helper
+    # gone". Before killing a possibly-real login, confirm OUR openconnect has NO live child --
+    # the helper is openconnect's DIRECT child (bin/vpn-browser exec's python). A guarded `if`,
+    # NOT `pgrep ... && exit 0` (which would trip the subshell's set -e on a no-match, the
+    # finding-3 class); a live child means the login is real -> stand down.
+    if pgrep -P "$_oc_pid" >/dev/null 2>&1; then exit 0; fi
+    # `|| true` (finding 3): a failed stderr write (ENOSPC/EPIPE) must NOT, under the subshell's
+    # set -e, abort BEFORE the kill below -- that would leave openconnect wedged and hang `wait`.
+    echo "error: Phase 1 stalled ${PHASE1_DEADLINE}s with the SSO helper gone -- aborting." >&2 || true
     kill -TERM "$_oc_pid" 2>/dev/null || true
 ) &
 _p1_wd=$!
 
 if wait "$_oc_pid"; then _auth_rc=0; else _auth_rc=$?; fi   # set-e-safe capture of openconnect's rc
+_oc_pid=''                            # openconnect reaped -> clear so the INT/TERM trap can't raw-kill a FREED/reused pid (finding 4)
 
 rm -f "$_p1_flag"                     # disarm WITHOUT signaling (finding 9): the backstop self-exits on its next tick
 wait "$_p1_wd" 2>/dev/null || true    # reap the backstop by wait (its remembered status; never signals -> reuse-proof)
