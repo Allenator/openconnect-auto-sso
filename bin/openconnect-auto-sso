@@ -88,66 +88,47 @@ _build_vs() {
 }
 
 # --- Phase-1 helper reaping (defined here so the seam can unit-test the run-scoping) --------
-# Find our processes robustly: `pgrep -f` treats its pattern as an ERE, so we must NOT
-# splice $PROJ (any path char, incl. regex metacharacters) into it. Instead pgrep on a fixed
-# metachar-free literal ($1) to get candidates, then confirm each one's FULL argv with
-# `grep -qF -- $2` (fixed string). Robust to any path -- no path restriction needed.
-_pids_matching() {   # $1 = metachar-free pgrep -f substring; $2 = fixed full string to confirm
-    # The OUTPUT is the result, never the exit status. The trailing `|| true` is REQUIRED (a
-    # following `return 0` does NOT suffice): the pipeline's status is the LAST candidate's
-    # `grep -qF` (1 when that candidate isn't ours), and under `set -e` that aborts AT the
-    # pipeline -- before any later statement runs -- which silently killed a
-    # `_x=$(_pids_matching ...)` caller: a successful connect died before Phase 2, and the
-    # backstop self-disabled. (The test harness masked it by running bodies under `set +eu`.)
-    pgrep -f "$1" 2>/dev/null | while read -r _p; do
-        ps -p "$_p" -o command= 2>/dev/null | grep -qF -- "$2" && printf '%s\n' "$_p"
-    done || true
-}
-
-# Full argv fragments that identify OUR SSO helper and OUR Phase-1 openconnect (confirmed
-# with grep -F above). The helper's argv carries "$PROJ/src/vpn_browser.py"; Phase-1
-# openconnect's carries "--external-browser=$PROJ/bin/vpn-browser".
+# Full argv fragments that identify OUR SSO helper and OUR Phase-1 openconnect (re-confirmed
+# via pid_argv_has, lib/common.sh). The helper's argv carries "$PROJ/src/vpn_browser.py";
+# Phase-1 openconnect's carries "--external-browser=$PROJ/bin/vpn-browser". Phase 1 now holds
+# both real run-scoped PIDs (openconnect is backgrounded -> $!, the helper writes the pidfile),
+# so reaping needs NO argv-pattern process scan (no pgrep, which matched editors/pytest and
+# couldn't tell concurrent runs apart) -- these literals are only a per-PID re-confirm guarding
+# against PID reuse.
 _HELPER_FULL="$PROJ/src/vpn_browser.py"
 _P1_FULL="external-browser=$PROJ/bin/vpn-browser"
 
-# Filter a whitespace-separated PID list ($1) to those still alive AND still our helper
-# (re-confirm argv, so a PID reused during the TERM->KILL wait window is never signaled).
-_alive_pids() {
-    for _q in $1; do
-        kill -0 "$_q" 2>/dev/null || continue
-        ps -p "$_q" -o command= 2>/dev/null | grep -qF -- "$_HELPER_FULL" && printf '%s ' "$_q"
-    done || true   # OUTPUT is the result; `|| true` stops the loop's last status aborting a set -e caller
-}
-
-# End the SSO browser helper: SIGTERM it and WAIT for it to exit, rather than a
-# fire-and-forget kill. Chromium batches cookie commits (~30s), and the helper needs a
-# moment (its SIGTERM handler flushes and lingers ~1.5s) to durably write the session
-# cookie the login just earned -- killing it the instant Phase 1 ends can drop it (B2).
-# Bounded, then force-killed, so a wedged helper can never stall us. Safe to call
-# repeatedly: a no-op once the helper is gone.
+# End the SSO browser helper: SIGTERM it and WAIT for it to exit, rather than a fire-and-forget
+# kill. Chromium batches cookie commits (~30s), and the helper needs a moment (its SIGTERM
+# handler flushes and lingers ~1.5s) to durably write the session cookie the login just earned
+# -- killing it the instant Phase 1 ends can drop it (B2). Bounded, then force-killed, so a
+# wedged helper can never stall us. Idempotent: a no-op once the helper is gone (the
+# trap-chained 2nd call reads no live PID and returns 0).
 #
-# Reap by the EXACT PID this run's helper recorded in $VPN_BROWSER_PIDFILE (confirmed ours
-# via argv, so a reused PID can't be hit) -- so a concurrent same-repo run's live helper is
-# NEVER touched (finding 8). Fall back to the argv-pattern reap only if no recorded, live,
-# confirmed-ours PID exists (e.g. the helper crashed before writing it), so a helper is never
-# leaked. Removes the pidfile once done.
+# Reaps EXACTLY the PID this run's helper recorded in $VPN_BROWSER_PIDFILE, re-confirmed ours
+# via pid_argv_has so a reused PID can't be hit. NO argv-pattern fallback: a concurrent
+# same-repo run's live helper (a DIFFERENT PID whose argv also matches) is NEVER touched
+# (findings 3/8). Removes the pidfile once done. Reads the pidfile with the `read` builtin
+# (no `cat` fork) guarded by `[ -f ]`, so a planted FIFO at the path can't stall it.
 _end_browser() {
     _pf=${VPN_BROWSER_PIDFILE:-}
-    _rec=$([ -n "$_pf" ] && cat "$_pf" 2>/dev/null || true)
-    if [ -n "$_rec" ] && kill -0 "$_rec" 2>/dev/null \
-       && ps -p "$_rec" -o command= 2>/dev/null | grep -qF -- "$_HELPER_FULL"; then
-        _hp=$_rec                                            # run-scoped: exactly our helper
-    else
-        _hp=$(_pids_matching vpn_browser "$_HELPER_FULL")    # fallback: no recorded PID
+    _rec=""; [ -n "$_pf" ] && [ -f "$_pf" ] && { read -r _rec < "$_pf"; } 2>/dev/null || true
+    # Nothing recorded OR the recorded PID is not alive -> our helper already exited (self-close
+    # after the callback, crash, or a prior _end_browser call). Clean up and return; NEVER
+    # pattern-reap (that killed a concurrent run's helper -- finding 3).
+    if [ -z "$_rec" ] || ! kill -0 "$_rec" 2>/dev/null; then
+        [ -n "$_pf" ] && rm -f "$_pf" 2>/dev/null || true
+        return 0
     fi
-    if [ -z "$_hp" ]; then [ -n "$_pf" ] && rm -f "$_pf" 2>/dev/null || true; return 0; fi
-    kill -TERM $_hp 2>/dev/null || true
-    _i=0
-    while _live=$(_alive_pids "$_hp"); [ -n "$_live" ]; do
-        _i=$((_i + 1))
-        [ "$_i" -ge 8 ] && { kill -KILL $_live 2>/dev/null || true; break; }
-        sleep 1
-    done
+    if pid_argv_has "$_rec" "$_HELPER_FULL"; then          # PID-reuse guard
+        kill -TERM "$_rec" 2>/dev/null || true             # graceful -> helper flushes cookie (B2)
+        _i=0
+        while kill -0 "$_rec" 2>/dev/null; do
+            _i=$((_i + 1))
+            [ "$_i" -ge 8 ] && { pid_argv_has "$_rec" "$_HELPER_FULL" && kill -KILL "$_rec" 2>/dev/null || true; break; }
+            sleep 1
+        done
+    fi
     [ -n "$_pf" ] && rm -f "$_pf" 2>/dev/null || true
 }
 
@@ -330,57 +311,90 @@ wait_for_server "$SERVER" || true
 
 # --- Phase 1: authenticate as the current user (no sudo, no root browser) ----
 echo ">> authenticating to $SERVER" >&2
-authenticate() {
-    if [ -n "$PROTOCOL" ]; then
-        "$OPENCONNECT" --protocol="$PROTOCOL" \
-            --external-browser="$PROJ/bin/vpn-browser" --authenticate "$SERVER"
-    else
-        "$OPENCONNECT" \
-            --external-browser="$PROJ/bin/vpn-browser" --authenticate "$SERVER"
-    fi
-}
 
 COOKIE=''; HOST=''; CONNECT_URL=''; FINGERPRINT=''; RESOLVE=''
+# Preserve the tty on fd 3 for openconnect's UNTRUSTED-CERT prompt: backgrounding a child
+# reassigns its stdin to /dev/null, and Phase 1 passes no --servercert, so that prompt is
+# real -- the bg openconnect reads the tty via <&3. Released before Phase 2's --cookie-on-stdin.
+exec 3<&0
 
-# Reap the helper on ANY exit from Phase 1. The EXIT trap also covers a FAILED Phase 1,
-# which previously left the hidden helper alive (its pkill sat after the `|| exit` and
-# the trap covered only INT/TERM) -- B5a. Replaced once Phase 2 owns cleanup.
-trap '_end_browser; exit 130' INT TERM
-trap '{ [ -n "${_p1_wd:-}" ] && kill "$_p1_wd" 2>/dev/null; } || true; _end_browser; rm -rf "${_rundir:-}" 2>/dev/null || true' EXIT
-
-# Dead-man backstop for a helper that dies WITHOUT reaching openconnect's loopback
-# callback AND without signaling (exec-fail / crash / SIGKILL): openconnect's callback
-# listener is select(...,NULL) -- no timeout -- and never watches the helper, so it
-# (and the auth capture below) would block forever. After the deadline, abort a Phase-1
-# openconnect ONLY IF the helper is truly GONE -- a live helper means a real (possibly
-# slow: password + Duo can take minutes) login is in progress, which must NEVER be killed
-# (this mirrors the browser's own B9 hard-timer suspension on reveal). So this fires purely
-# as a last resort for an already-dead helper, not on a slow-but-live login. See B1.
+# Validate the (documented) deadline knob: a non-integer makes `sleep` fail -> set -e would
+# disable the whole backstop; 0/negative would fire it against the just-started login. -> 420.
 PHASE1_DEADLINE="${PHASE1_DEADLINE:-420}"
-# Validate the (documented) knob: a non-integer makes `sleep` fail -> set -e disables the
-# whole backstop; 0/negative makes it fire against the just-started login. Fall back to 420.
 case $PHASE1_DEADLINE in
     ''|*[!0-9]*) PHASE1_DEADLINE=420 ;;
     *) [ "$PHASE1_DEADLINE" -gt 0 ] || PHASE1_DEADLINE=420 ;;
 esac
-( sleep "$PHASE1_DEADLINE"
-  _oc=$(_pids_matching external-browser "$_P1_FULL")
-  _hp=$(_pids_matching vpn_browser "$_HELPER_FULL")
-  if [ -n "$_oc" ] && [ -z "$_hp" ]; then
-      echo "error: Phase 1 stalled ${PHASE1_DEADLINE}s with the SSO helper gone -- aborting." >&2
-      kill -TERM $_oc 2>/dev/null || true
-  fi ) &
+
+# Dead-man backstop, ARMED by a flag file that EXISTS; DISARMED by removing it. Correctness
+# NEVER depends on signaling a pid: openconnect frees a reaped bg child's pid, so a raw
+# `kill $pid` could hit a reused pid (finding 9) -- so we disarm by REMOVING the flag and reap
+# the backstop with `wait`, never a kill. Init the temps the traps reference BEFORE arming (set -u).
+_p1_flag="$_rundir/p1armed"
+_authtmp=''; _oc_pid=''; _p1_wd=''
+: > "$_p1_flag"
+
+# EXIT (covers a FAILED Phase 1 too -- B5a): drop the flag + auth tempfile, reap the helper,
+# remove the run dir. The whole body is guarded `{ ...; } || true` so a failing rm can't trip
+# set -e and skip _end_browser. Replaced once Phase 2 owns cleanup.
+trap '{ rm -f "${_p1_flag:-}" "${_authtmp:-}" 2>/dev/null; _end_browser; rm -rf "${_rundir:-}" 2>/dev/null; } || true' EXIT
+# INT/TERM: disarm, then TERM OUR openconnect (guarded -- an unguarded failing kill would abort
+# the trap and skip _end_browser), then reap the helper and exit. The kill is ESSENTIAL under
+# launchd (bootout SIGTERMs only this script, not the bg openconnect) and harmless in a terminal
+# (Ctrl-C already reached openconnect via the foreground process group).
+trap 'rm -f "${_p1_flag:-}" 2>/dev/null; kill "${_oc_pid:-}" 2>/dev/null || true; _end_browser; exit 130' INT TERM
+
+# Background openconnect so we HOLD its real pid ($!). Keep its stdin (the tty, via fd 3) and
+# its stderr (the terminal); capture STDOUT ONLY -- the eval-able COOKIE=/HOST=/FINGERPRINT=/
+# RESOLVE= lines. NOT 2>&1: stderr (progress/prompts) would corrupt `eval "$auth_out"`.
+_authtmp=$(mktemp "$_rundir/oc-auth.XXXXXX")
+if [ -n "$PROTOCOL" ]; then
+    "$OPENCONNECT" --protocol="$PROTOCOL" \
+        --external-browser="$PROJ/bin/vpn-browser" --authenticate "$SERVER" <&3 >"$_authtmp" &
+else
+    "$OPENCONNECT" \
+        --external-browser="$PROJ/bin/vpn-browser" --authenticate "$SERVER" <&3 >"$_authtmp" &
+fi
+_oc_pid=$!
+
+# The backstop fires ONLY IF, at the deadline and STILL armed, OUR openconnect is alive AND OUR
+# helper is truly gone -- both re-confirmed by argv on the EXACT pids (a reused oc-pid can't
+# make us kill an innocent; a reused helper-pid can't fake "alive"). openconnect's callback
+# listener is select(...,NULL) -- no timeout -- and never watches the helper, so a helper that
+# dies WITHOUT reaching the callback AND without signaling (exec-fail / crash / SIGKILL) would
+# otherwise wedge `wait "$_oc_pid"` below forever. A live helper means a real (possibly slow:
+# password + Duo) login -- NEVER killed (mirrors the browser's own B9 hard-timer suspension). B1.
+(
+    _n=0
+    while [ "$_n" -lt "$PHASE1_DEADLINE" ]; do
+        [ -e "$_p1_flag" ] || exit 0            # disarmed (Phase 1 finished) -> stand down
+        sleep 1; _n=$((_n + 1))
+    done
+    [ -e "$_p1_flag" ] || exit 0
+    kill -0 "$_oc_pid" 2>/dev/null || exit 0    # our openconnect already gone -> nothing to abort
+    pid_argv_has "$_oc_pid" "$_P1_FULL" || exit 0            # reused oc-pid -> not ours -> stand down
+    _rec=$(cat "$VPN_BROWSER_PIDFILE" 2>/dev/null || true)   # GUARDED (helper-gone == pidfile absent)
+    if [ -n "$_rec" ] && kill -0 "$_rec" 2>/dev/null && pid_argv_has "$_rec" "$_HELPER_FULL"; then
+        exit 0                                  # slow-but-live login -> never kill it
+    fi
+    echo "error: Phase 1 stalled ${PHASE1_DEADLINE}s with the SSO helper gone -- aborting." >&2
+    kill -TERM "$_oc_pid" 2>/dev/null || true
+) &
 _p1_wd=$!
 
-auth_out=$(authenticate) || { echo "error: authentication failed" >&2; exit 1; }
+if wait "$_oc_pid"; then _auth_rc=0; else _auth_rc=$?; fi   # set-e-safe capture of openconnect's rc
 
-kill "$_p1_wd" 2>/dev/null || true   # auth finished in time: cancel the backstop
-wait "$_p1_wd" 2>/dev/null || true
+rm -f "$_p1_flag"                     # disarm WITHOUT signaling (finding 9): the backstop self-exits on its next tick
+wait "$_p1_wd" 2>/dev/null || true    # reap the backstop by wait (its remembered status; never signals -> reuse-proof)
 _p1_wd=''
 
-# Phase 1 done, so the SSO browser is no longer needed. Some servers complete the
-# SSO server-side (no localhost callback), so the helper cannot self-close -- end it
-# here (terminate-then-wait, so its just-earned cookie is durably flushed first).
+auth_out=$(cat "$_authtmp"); rm -f "$_authtmp"; _authtmp=''
+[ "$_auth_rc" = 0 ] || { echo "error: authentication failed" >&2; exit 1; }
+exec 3<&-                             # release the preserved stdin before Phase 2's --cookie-on-stdin
+
+# Phase 1 done, so the SSO browser is no longer needed. Some servers complete the SSO
+# server-side (no localhost callback), so the helper cannot self-close -- end it here
+# (terminate-then-wait, so its just-earned cookie is durably flushed first).
 _end_browser
 
 # Phase 2 signal handling. In a terminal, Ctrl-C reaches the root openconnect child

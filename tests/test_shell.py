@@ -943,10 +943,12 @@ def test_vpnc_slice_refuses_when_executed_with_seam_var():
 
 
 def test_end_browser_reaps_only_the_recorded_pid(tmp_path):
-    # Finding 8: _end_browser reaps EXACTLY the PID this run's helper recorded in
+    # Findings 3/8: _end_browser reaps EXACTLY the PID this run's helper recorded in
     # $VPN_BROWSER_PIDFILE -- NEVER a concurrent same-repo run's helper (a DIFFERENT live PID
-    # whose argv also matches). Stub kill/ps/pgrep so we observe targets without real signals;
-    # `kill -0 <p>` reports alive until <p> is TERM'd (a per-PID dead marker) so the wait ends.
+    # whose argv also matches), and NEVER via a process scan. Stub kill/ps so we observe targets
+    # without real signals; `kill -0 <p>` reports alive until <p> is TERM'd (a per-PID dead
+    # marker) so the wait ends. pgrep is stubbed to a LOUD marker: the new PID-only reaper must
+    # never invoke it (the old argv-pattern fallback did).
     H = "/x/src/vpn_browser.py"
     pf = tmp_path / "helper.pid"; pf.write_text("11111\n")   # OUR recorded helper PID
     kl = tmp_path / "killlog"; dm = str(tmp_path / "dead.")
@@ -955,8 +957,8 @@ def test_end_browser_reaps_only_the_recorded_pid(tmp_path):
         '  -0) [ -f "%s$1" ] && return 1; return 0 ;;\n'
         '  *) for _p in "$@"; do echo "$_s $_p" >> "%s"; : > "%s$_p"; done ;;\n'
         'esac; }\n'
-        'ps() { case "$*" in *11111*|*22222*) echo "/py %s u" ;; esac; }\n'
-        'pgrep() { echo 22222; }\n'         # a DIFFERENT run's LIVE helper (fallback would find it)
+        'ps() { case "$*" in *11111*) echo "/py %s u" ;; esac; }\n'
+        'pgrep() { echo PGREP_CALLED >&2; }\n'   # must NOT be reached (no pattern fallback)
         'sleep() { :; }\n'
         '_HELPER_FULL="%s"\nVPN_BROWSER_PIDFILE="%s"\n'
         '_end_browser\necho DONE\n'
@@ -964,58 +966,64 @@ def test_end_browser_reaps_only_the_recorded_pid(tmp_path):
     r = _sh(SRC_CONNECT, body)
     assert r.returncode == 0, r.stderr
     assert "DONE" in r.stdout
+    assert "PGREP_CALLED" not in r.stderr, "must never process-scan (findings 3/8)"
     killed = kl.read_text() if kl.exists() else ""
     assert "11111" in killed, "must reap the recorded helper PID"
-    assert "22222" not in killed, "must NOT touch a concurrent run's live helper (finding 8)"
     assert not pf.exists(), "pidfile removed after reaping"
 
 
-def test_end_browser_falls_back_to_pattern_when_no_recorded_pid(tmp_path):
-    # If the helper crashed BEFORE writing its pidfile (no recorded PID), _end_browser still
-    # reaps it via the argv pattern -- a helper is never leaked.
+def test_end_browser_no_pattern_reap_without_recorded_pid(tmp_path):
+    # Findings 3/6: the old argv-pattern fallback is GONE. If the helper crashed BEFORE writing
+    # its pidfile (no recorded PID), _end_browser must do NOTHING -- never a process scan that
+    # could kill a CONCURRENT same-repo run's live helper. A leaked crashed-early helper is the
+    # far lesser evil than cross-run collateral; the parent-death watch in vpn_browser.py + the
+    # backstop already bound a genuinely stuck helper.
     H = "/x/src/vpn_browser.py"
-    kl = tmp_path / "killlog"; dm = str(tmp_path / "dead.")
+    kl = tmp_path / "killlog"
     body = (
-        'kill() { _s=$1; shift; case "$_s" in\n'
-        '  -0) [ -f "%s$1" ] && return 1; return 0 ;;\n'
-        '  *) for _p in "$@"; do echo "$_s $_p" >> "%s"; : > "%s$_p"; done ;;\n'
-        'esac; }\n'
-        'ps() { case "$*" in *33333*) echo "/py %s u" ;; esac; }\n'
-        'pgrep() { echo 33333; }\n'
+        'kill() { echo "$@" >> "%s"; }\n'        # any signal at all is logged
+        'ps() { echo "/py %s u" ; }\n'           # a matching process exists...
+        'pgrep() { echo 33333; }\n'              # ...and a scan WOULD find it
         'sleep() { :; }\n'
         '_HELPER_FULL="%s"\nVPN_BROWSER_PIDFILE="%s"\n'     # pidfile path does NOT exist
         '_end_browser\necho DONE\n'
-    ) % (dm, kl, dm, H, H, str(tmp_path / "nope.pid"))
+    ) % (str(kl), H, H, str(tmp_path / "nope.pid"))
     r = _sh(SRC_CONNECT, body)
     assert r.returncode == 0, r.stderr
+    assert "DONE" in r.stdout
     killed = kl.read_text() if kl.exists() else ""
-    assert "33333" in killed, "fallback pattern reap should still kill the crashed-early helper"
+    assert "33333" not in killed, "must NOT pattern-reap a helper it never recorded (finding 3)"
 
 
-def test_pids_matching_no_set_e_abort_when_last_candidate_not_ours():
-    # Finding 1 regression, under STRICT set -eu (the relaxed default masks it): _pids_matching
-    # must exit 0 even when pgrep's LAST candidate fails the argv confirm, or the bare assignment
-    # `_hp=$(_pids_matching ...)` aborts the caller -- which silently killed a successful connect
-    # before Phase 2 and disabled the backstop.
+def test_end_browser_skips_reused_pid_that_fails_argv(tmp_path):
+    # PID-reuse guard (finding 9): the recorded PID is ALIVE but its argv is NOT our helper (the
+    # pid was freed and reused by an unrelated process). _end_browser must NOT signal it --
+    # pid_argv_has fails -> skip the kill entirely, only remove the pidfile.
+    pf = tmp_path / "helper.pid"; pf.write_text("11111\n")
+    kl = tmp_path / "killlog"
     body = (
-        'pgrep() { echo 99999; }\n'                              # one candidate...
-        'ps() { echo "/usr/bin/vim /other/vpn_browser.py"; }\n'  # ...whose argv is NOT ours
-        '_hp=$(_pids_matching vpn_browser "/x/src/vpn_browser.py")\n'
-        'echo "REACHED hp=[$_hp]"\n'
-    )
-    r = _sh(SRC_CONNECT, body, strict=True)
+        'kill() { case "$1" in -0) return 0 ;; *) echo "$@" >> "%s" ;; esac; }\n'   # -0: always alive
+        'ps() { echo "/usr/bin/vim /some/other/file" ; }\n'    # argv is NOT our helper
+        'sleep() { :; }\n'
+        '_HELPER_FULL="/x/src/vpn_browser.py"\nVPN_BROWSER_PIDFILE="%s"\n'
+        '_end_browser\necho DONE\n'
+    ) % (str(kl), str(pf))
+    r = _sh(SRC_CONNECT, body)
     assert r.returncode == 0, r.stderr
-    assert "REACHED hp=[]" in r.stdout          # no abort, and no false-positive PID
+    assert "DONE" in r.stdout
+    killed = kl.read_text() if kl.exists() else ""
+    assert "11111" not in killed, "must NOT signal a reused PID whose argv isn't our helper"
+    assert not pf.exists(), "pidfile still removed"
 
 
-def test_end_browser_no_set_e_abort_on_unconfirmed_candidate():
-    # Finding 1 regression, end to end under strict set -eu: _end_browser's fallback branch
-    # (`_hp=$(_pids_matching ...)`) must not abort when pgrep returns a non-ours candidate.
+def test_end_browser_no_set_e_abort_without_recorded_pid():
+    # Under STRICT set -eu (the relaxed default masks errexit regressions): with no recorded PID
+    # (pidfile absent), _end_browser must return cleanly (read-guard + early-return), not abort
+    # the caller. The old landmine was a `_hp=$(_pids_matching ...)` whose failing pipeline
+    # aborted a successful connect before Phase 2; the PID-only reaper removes that class.
     body = (
-        'VPN_BROWSER_PIDFILE="/nonexistent/helper.pid"\n'         # no recorded PID -> fallback
+        'VPN_BROWSER_PIDFILE="/nonexistent/helper.pid"\n'         # no recorded PID
         '_HELPER_FULL="/x/src/vpn_browser.py"\n'
-        'pgrep() { echo 99999; }\n'
-        'ps() { echo "/usr/bin/vim /other/vpn_browser.py"; }\n'   # not ours -> nothing to reap
         'kill() { :; }\n'
         '_end_browser\necho DONE\n'
     )
@@ -1070,3 +1078,178 @@ def test_connect_refuse_block_removed():
         src = f.read()
     assert "_running_oc" not in src
     assert "already connected" not in src
+
+
+# --- bin/openconnect-auto-sso: Phase-1 PID-capture flow (stub-openconnect integration) ---
+# These run the REAL connect script end-to-end (it is always `set -eu`, so they double as the
+# strict-mode check) with a stub `openconnect` + `sudo` + `nc` on PATH and a minimal config.
+# The stub openconnect prints the eval-able COOKIE=... to stdout (Phase 1) / consumes the cookie
+# (Phase 2), and spawns a stub helper that writes $VPN_BROWSER_PIDFILE (the connect script sets +
+# exports it) and carries the vpn_browser.py marker in its argv so pid_argv_has confirms it. The
+# stubs touch/rm liveness marker files (via TERM traps) so the test can see who was killed.
+def _stub_connect_env(tmp_path):
+    bindir = tmp_path / "sbin"; bindir.mkdir()
+    mark = tmp_path / "mark"; mark.mkdir()
+    oc_alive = mark / "oc_alive"
+    helper_alive = mark / "helper_alive"
+    phase2 = mark / "phase2"
+
+    helper = bindir / "stub-helper"
+    helper.write_text(
+        "#!/bin/sh\n"
+        "trap 'rm -f \"$HELPER_ALIVE\"; exit 0' TERM INT\n"
+        "touch \"$HELPER_ALIVE\"\n"
+        "[ -n \"${VPN_BROWSER_PIDFILE:-}\" ] && printf '%s\\n' \"$$\" > \"$VPN_BROWSER_PIDFILE\"\n"
+        "case \"$2\" in\n"
+        "  long) while :; do sleep 1; done ;;\n"
+        "  *)    rm -f \"$HELPER_ALIVE\"; exit 0 ;;\n"    # short: pidfile then exit
+        "esac\n")
+    helper.chmod(0o755)
+
+    oc = bindir / "openconnect"
+    oc.write_text(
+        "#!/bin/sh\n"
+        # Real openconnect killed by a signal exits non-zero; mirror that (143) so the connect
+        # script's auth-rc capture sees a FAILURE when the backstop TERMs a wedged openconnect.
+        "trap 'rm -f \"$OC_ALIVE\"; exit 143' TERM INT\n"
+        "case \" $* \" in\n"
+        "  *' --authenticate '*)\n"
+        "    touch \"$OC_ALIVE\"\n"
+        "    case \"${STUB_MODE:-normal}\" in\n"
+        "      normal)\n"
+        "        sh \"$STUB_HELPER\" \"$HELPER_MARKER\" short >/dev/null 2>&1 &\n"
+        "        sleep 0.5\n"
+        "        printf 'COOKIE=abc123\\nHOST=test.example\\n"
+        "CONNECT_URL=https://test.example/cb\\nFINGERPRINT=sha256:deadbeef\\n'\n"
+        "        rm -f \"$OC_ALIVE\"; exit 0 ;;\n"
+        "      slow)\n"
+        "        sh \"$STUB_HELPER\" \"$HELPER_MARKER\" long >/dev/null 2>&1 &\n"
+        "        while :; do sleep 1; done ;;\n"
+        "      dead)\n"
+        "        sh \"$STUB_HELPER\" \"$HELPER_MARKER\" short >/dev/null 2>&1 &\n"
+        "        while :; do sleep 1; done ;;\n"
+        "    esac ;;\n"
+        "  *' --cookie-on-stdin '*)\n"
+        "    cat >/dev/null 2>&1 || true\n"
+        "    printf '%s\\n' \"$*\" > \"$PHASE2_MARKER\"\n"
+        "    exit 0 ;;\n"
+        "esac\n")
+    oc.chmod(0o755)
+
+    sudo = bindir / "sudo"
+    sudo.write_text("#!/bin/sh\n[ \"$1\" = -n ] && shift\nexec \"$@\"\n")
+    sudo.chmod(0o755)
+
+    nc = bindir / "nc"
+    nc.write_text("#!/bin/sh\nexit 0\n")          # server always "reachable"
+    nc.chmod(0o755)
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('server = "test.example"\n')
+
+    env = dict(os.environ)
+    env["PATH"] = "%s:%s" % (bindir, env["PATH"])
+    env["OC_AUTO_SSO_CONFIG"] = str(cfg)
+    env["NC_BIN"] = str(nc)
+    env["STUB_HELPER"] = str(helper)
+    env["HELPER_MARKER"] = os.path.join(REPO, "src", "vpn_browser.py")
+    env["OC_ALIVE"] = str(oc_alive)
+    env["HELPER_ALIVE"] = str(helper_alive)
+    env["PHASE2_MARKER"] = str(phase2)
+    for leak in ("OC_CONNECT_TEST", "OC_PROJ", "OC_LAUNCHD"):
+        env.pop(leak, None)
+    return env, dict(oc_alive=oc_alive, helper_alive=helper_alive, phase2=phase2)
+
+
+def _wait_gone(path, timeout=8.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if not path.exists():
+            return True
+        time.sleep(0.05)
+    return not path.exists()
+
+
+def test_phase1_normal_completion_captures_cookie_and_reaches_phase2(tmp_path):
+    # Normal completion: the backgrounded openconnect's STDOUT is captured, eval'd (COOKIE set),
+    # and Phase 2 runs with the captured FINGERPRINT/CONNECT_URL. rc 0, no stray helper. Proves
+    # the whole set -eu flow does not abort on the happy path.
+    env, m = _stub_connect_env(tmp_path)
+    env["STUB_MODE"] = "normal"
+    env["PHASE1_DEADLINE"] = "20"
+    r = subprocess.run([CONNECT], capture_output=True, text=True, env=env,
+                       stdin=subprocess.DEVNULL, timeout=30)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert m["phase2"].exists(), "Phase 2 never ran -> cookie capture/eval failed"
+    p2 = m["phase2"].read_text()
+    assert "--cookie-on-stdin" in p2
+    assert "sha256:deadbeef" in p2, "captured FINGERPRINT not passed to Phase 2"
+    assert "https://test.example/cb" in p2, "captured CONNECT_URL not passed to Phase 2"
+    assert _wait_gone(m["oc_alive"]) and _wait_gone(m["helper_alive"])
+
+
+def test_phase1_sigterm_kills_openconnect_and_helper(tmp_path):
+    # launchd path: a SIGTERM to the SCRIPT (bootout) must TERM the backgrounded openconnect
+    # (bootout doesn't) AND reap the helper, then exit -- so neither is orphaned. Big deadline so
+    # the backstop can't be what kills them.
+    env, m = _stub_connect_env(tmp_path)
+    env["STUB_MODE"] = "slow"
+    env["PHASE1_DEADLINE"] = "60"
+    proc = subprocess.Popen([CONNECT], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, env=env, text=True)
+    try:
+        # Wait until Phase 1 is live (both stubs up).
+        end = time.time() + 10
+        while time.time() < end and not (m["oc_alive"].exists() and m["helper_alive"].exists()):
+            time.sleep(0.05)
+        assert m["oc_alive"].exists() and m["helper_alive"].exists(), "Phase 1 never came up"
+        proc.terminate()                       # SIGTERM to the connect script
+        proc.wait(timeout=15)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+    assert proc.returncode == 130, "TERM trap should exit 130"
+    assert _wait_gone(m["oc_alive"]), "openconnect left alive after SIGTERM (launchd orphan)"
+    assert _wait_gone(m["helper_alive"]), "helper left alive after SIGTERM"
+
+
+def test_phase1_slow_live_helper_not_killed_at_deadline(tmp_path):
+    # A slow-but-live login (helper alive) must NEVER be killed by the backstop, even past the
+    # deadline -- password + Duo can take minutes. openconnect stays alive; the script blocks on
+    # `wait`. We confirm openconnect survives well past the deadline, then tear down.
+    env, m = _stub_connect_env(tmp_path)
+    env["STUB_MODE"] = "slow"
+    env["PHASE1_DEADLINE"] = "2"
+    proc = subprocess.Popen([CONNECT], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, env=env, text=True)
+    try:
+        end = time.time() + 10
+        while time.time() < end and not m["oc_alive"].exists():
+            time.sleep(0.05)
+        assert m["oc_alive"].exists(), "Phase 1 never came up"
+        time.sleep(4)                          # well past the 2s deadline
+        assert m["oc_alive"].exists(), "backstop wrongly killed a slow-but-LIVE login"
+        assert proc.poll() is None, "script exited though the login was still live"
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    assert _wait_gone(m["oc_alive"]) and _wait_gone(m["helper_alive"])
+
+
+def test_phase1_dead_helper_is_aborted_at_deadline(tmp_path):
+    # A helper that died WITHOUT reaching the callback (recorded pid now dead) wedges openconnect
+    # forever (its callback wait is select(NULL)). The backstop must fire at the deadline: TERM
+    # openconnect so `wait` returns and Phase 1 fails loudly, instead of hanging forever.
+    env, m = _stub_connect_env(tmp_path)
+    env["STUB_MODE"] = "dead"
+    env["PHASE1_DEADLINE"] = "2"
+    r = subprocess.run([CONNECT], capture_output=True, text=True, env=env,
+                       stdin=subprocess.DEVNULL, timeout=30)
+    assert r.returncode != 0
+    assert "Phase 1 stalled" in r.stderr, "backstop did not fire on a dead helper"
+    assert "authentication failed" in r.stderr
+    assert not m["phase2"].exists(), "must NOT reach Phase 2 on a failed auth"
+    assert _wait_gone(m["oc_alive"]), "backstop should have TERMed the wedged openconnect"

@@ -15,6 +15,22 @@ RESOLVER_MARKER='# openconnect-auto-sso'
 LIBEXEC_DIR='/usr/local/libexec/openconnect-auto-sso'
 TEARDOWN_BIN="$LIBEXEC_DIR/vpn-teardown"
 
+# True if process $1's FULL argv (ps -o command=) contains the fixed string $2. The single
+# place the "is this PID still really ours?" check lives, so the connect script's backstop +
+# _end_browser and vpnc-slice's _is_dnsroute can't drift. Used to RE-CONFIRM a PID right before
+# signaling it: a bg child's PID is freed the moment it's reaped, so a raw kill could hit a
+# reused PID -- matching the full argv first makes that impossible. `grep -qF`: $2 is a literal
+# (a path, which may hold regex metacharacters), never an ERE. The pipeline runs inside an `if`
+# so a no-match (grep rc 1) returns cleanly instead of tripping a caller's `set -e`, whatever
+# the call context. Empty/absent PID -> not ours (return 1).
+pid_argv_has() {
+    [ -n "${1:-}" ] || return 1
+    if ps -p "$1" -o command= 2>/dev/null | grep -qF -- "$2"; then
+        return 0
+    fi
+    return 1
+}
+
 # --- recovery timing ---------------------------------------------------------------
 # These values are ONE design, so they are owned here rather than scattered. They serve
 # TWO INDEPENDENT concerns, and OC_LAUNCHD ("keepalive" | "once" | unset) drives BOTH:
