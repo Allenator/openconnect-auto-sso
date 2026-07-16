@@ -578,6 +578,69 @@ def test_do_install_refuses_group_or_other_writable_libexec(tmp_path):
     assert rp + "/libexec" in r.stderr
 
 
+# --- install-autostart: verify_repo_interior (Phase B recursive vet) -------------------
+# The enumerated top-level list is replaced by a recursive find over the code roots; these
+# pin the properties that matters -- deep files ARE walked, the legit .venv/bin interpreter
+# symlink IS exempt, and symlink/foreign-owner refusals still fire anywhere under the tree.
+def test_verify_repo_interior_refuses_deep_writable_venv_file(tmp_path):
+    # Phase B core: a group/other-writable file DEEP under .venv/lib/.../site-packages (a .pth
+    # root's python executes) is refused -- the recursive walk catches what the old enumerated
+    # top-level list (which checked only .venv/.venv/bin/.venv/lib themselves) missed.
+    proj = os.path.realpath(str(tmp_path / "repo"))
+    deep = proj + "/.venv/lib/python3.13/site-packages"
+    os.makedirs(deep)
+    pth = deep + "/evil.pth"
+    with open(pth, "w") as f:
+        f.write("import os\n")
+    os.chmod(pth, 0o666)                              # world-writable .pth
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "BAD"
+    assert pth in r.stderr
+
+
+def test_verify_repo_interior_accepts_clean_tree_with_venv_python_symlink(tmp_path):
+    # A clean interior with the LEGIT .venv/bin/python interpreter symlink must be ACCEPTED --
+    # the symlink is exempted (it points at the system/Homebrew python). Everything else is a
+    # non-symlink, not group/other-writable, and self-owned. (This is the case the full sudo
+    # install path can't reach, which is why verify_repo_interior is split out.)
+    proj = os.path.realpath(str(tmp_path / "repo"))
+    os.makedirs(proj + "/bin")
+    os.makedirs(proj + "/.venv/bin")
+    with open(proj + "/bin/openconnect-auto-sso", "w") as f:
+        f.write("#!/bin/sh\n:\n")
+    os.chmod(proj + "/bin/openconnect-auto-sso", 0o755)
+    os.symlink("/usr/bin/python3", proj + "/.venv/bin/python")   # the interpreter link uv makes
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "OK"
+
+
+def test_verify_repo_interior_refuses_symlink_outside_venv_bin(tmp_path):
+    # A symlink ANYWHERE except under .venv/bin is refused (only the interpreter links are
+    # exempt) -- e.g. a src/ file swapped for a symlink to attacker code. The old enumerated
+    # list only named src/*.py, so a NEW/renamed src symlink could slip past; the walk catches it.
+    proj = os.path.realpath(str(tmp_path / "repo"))
+    os.makedirs(proj + "/src")
+    os.symlink("/etc/hosts", proj + "/src/evil.py")
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.stdout.strip() == "BAD"
+    assert proj + "/src/evil.py" in r.stderr
+
+
+def test_verify_repo_interior_refuses_foreign_owned(tmp_path):
+    # A file owned by neither root nor you is refused. A truly foreign-owned file needs root to
+    # create, so spoof $uid to a bogus value: our own self-owned files then read as foreign,
+    # exercising the `! -user 0 ! -user $uid` arm (same trick as the ancestor foreign-owner test).
+    proj = os.path.realpath(str(tmp_path / "repo"))
+    os.makedirs(proj + "/bin")
+    with open(proj + "/bin/openconnect-auto-sso", "w") as f:
+        f.write("#!/bin/sh\n:\n")
+    os.chmod(proj + "/bin/openconnect-auto-sso", 0o755)
+    r = _sh(SRC_INSTALL, 'uid=424242\nverify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.stdout.strip() == "BAD"
+
+
 # --- lib/common.sh: server_hostport + wait_for_server ---------------------------------
 # common.sh is constants + functions with no main body, so it needs NO test seam --
 # sourcing it directly is safe.

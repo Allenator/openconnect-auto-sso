@@ -146,6 +146,41 @@ verify_repo_ancestors() {
         "is group/other-writable, a symlink, or owned by another user; refusing to install. A non-owner who can alter any repo-path component plants code the login agent runs as you (-> passwordless root). Move the repo somewhere private (under your home, chmod go-w) and re-run."
 }
 
+# Recursively vet the INTERIOR of an already-ancestor-vetted repo $1: every file/dir under the
+# code roots the login agent (as you) or the ROOT vpnc-script wrapper sources/execs/copies must
+# be unsubvertable. root sources lib/common.sh, execs .venv/bin/python + src/dnsroute.py, and
+# COPIES libexec/vpn-teardown to the root-owned NOPASSWD helper; the agent execs the bin/
+# scripts + src/*.py. A group/other-writable, symlinked, or foreign-owned file ANYWHERE under
+# these is direct code-exec as you (-> passwordless root) or as root -- including a file DEEP
+# under .venv/lib/.../site-packages (a .pth root's python executes), which an enumerated
+# top-level list would miss. The recursive find is self-maintaining: a new src/ file or a deep
+# venv path is covered automatically. Roots absent before install.sh builds .venv are skipped
+# (find errors suppressed). Split out so the harness can exercise the ACCEPTED case too (which
+# can't run the full sudo install path). Returns 0 if clean; prints + returns 1 on the first bad.
+#
+# Predicate: -perm -0020/-0002 = group/other-writable; ! -user 0 ! -user $uid = owned by
+# neither root nor you (a foreign non-root user who could redirect the code). find defaults to
+# -P (no symlink following), so a symlinked start point/component is reported as -type l and
+# rejected -- EXCEPT the legit interpreter links under .venv/bin (they point at the system/
+# Homebrew python; swapping one needs write on .venv/bin, whose own mode the non-symlink arm
+# checks). The whole OR is grouped so -print applies to BOTH arms (a bare `A -o B -print` would
+# bind -print to B only and silently skip the symlink arm). head -n1 -> report the first offender.
+verify_repo_interior() {
+    _p=$1
+    _bad=$(find "$_p/bin" "$_p/lib" "$_p/src" "$_p/libexec" "$_p/.venv" \
+        \( \( -type l ! -path "$_p/.venv/bin/*" \) \
+           -o \( ! -type l \( -perm -0020 -o -perm -0002 \
+                              -o \( ! -user 0 ! -user "${uid:-$(id -u)}" \) \) \) \) \
+        -print 2>/dev/null | head -n1)
+    [ -z "$_bad" ] || {
+        echo "error: $_bad is group/other-writable, a symlink, or owned by another user;" >&2
+        echo "       refusing to install -- the login agent or root wrapper runs code from it," >&2
+        echo "       so a non-owner who can alter it gets code execution as you (passwordless" >&2
+        echo "       root) or as root. chmod go-w (and fix ownership) and re-run." >&2
+        return 1
+    }
+}
+
 do_install() {
     [ -x "$connect" ] || { echo "error: $connect not found/executable" >&2; exit 1; }
     # The LaunchAgent runs $connect as YOU on every login, and $connect reaches root via the
@@ -154,32 +189,12 @@ do_install() {
     # passwordless root by planting code that then runs. First verify $proj and every ancestor
     # from / down (unlink/rename is governed by the parent, so an ancestor is enough).
     verify_repo_ancestors "$proj" || exit 1
-    # $proj is now vetted, so its INTERIOR only needs each component's OWN mode checked (a safe
-    # $proj prevents these being unlinked/replaced). Vet every dir + file the agent or the root
-    # wrapper sources/execs -- root sources lib/common.sh, execs .venv/bin/python + src/dnsroute.py,
-    # and COPIES libexec/vpn-teardown to the root-owned NOPASSWD helper; the agent execs the bin/
-    # scripts + src/*.py. A group/other-writable, symlinked, or foreign-owned one of these is
-    # direct code-exec as you (-> passwordless root) or as root. .venv may not exist yet (install.sh
-    # builds it); skip whatever is absent. (We vet .venv/bin rather than the python symlink inside
-    # it, which legitimately points at the system/Homebrew interpreter -- swapping that symlink
-    # needs write on .venv/bin.)
-    #
-    # NOTE (step-3 follow-up): this is an ENUMERATED list; it checks each named dir's OWN mode but
-    # NOT its whole subtree -- e.g. a group-writable file DEEP under .venv/lib/.../site-packages
-    # (a .pth that root's python executes) would pass. A recursive walk of the code roots is the
-    # self-maintaining fix and is planned; this list closes the concrete high-value paths.
-    for _c in bin lib src libexec .venv .venv/bin .venv/lib \
-              bin/openconnect-auto-sso bin/vpnc-slice bin/vpn-browser \
-              lib/common.sh src/dnsroute.py src/vpn_browser.py src/loadconfig.py \
-              libexec/vpn-teardown; do
-        [ -e "$proj/$_c" ] || continue
-        dir_ok_for_repo "$proj/$_c" && continue
-        echo "error: $proj/$_c is group/other-writable, a symlink, or owned by another user;" >&2
-        echo "       refusing to install -- the login agent or root wrapper runs code from it," >&2
-        echo "       so a non-owner who can alter it gets code execution as you (passwordless" >&2
-        echo "       root) or as root. chmod go-w (and fix ownership) and re-run." >&2
-        exit 1
-    done
+    # $proj is now vetted, so its INTERIOR only needs each component's OWN mode/owner checked (a
+    # safe $proj prevents these being unlinked/replaced). Recursively walk every code root the
+    # agent or root wrapper sources/execs/copies (see verify_repo_interior): a group/other-
+    # writable, symlinked, or foreign-owned file ANYWHERE under them -- including deep under
+    # .venv/lib -- is code-exec as you (-> passwordless root) or as root.
+    verify_repo_interior "$proj" || exit 1
     # A working config must exist first: otherwise RunAtLoad fails every login and
     # KeepAlive would respawn the failing connect forever. Fail loudly here instead.
     cfg="${OC_AUTO_SSO_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/openconnect-auto-sso/config.toml}"
