@@ -412,6 +412,31 @@ def test_clear_proxy_state_leaves_live_different_owner(tmp_path):
     assert (resolv / "keep.corp").exists(), "winner's resolver file left intact"
 
 
+def test_sweep_our_resolvers_no_unset_abort_without_port(tmp_path):
+    # Finding 8: _sweep_our_resolvers derefs $_port, guarded ${_port:-} consistently with the
+    # sibling _proxy_pid/_proxy_owner. A caller WITHOUT proxy context (the test harness sourcing
+    # this file) must no-op, not abort the pass under set -u. A marked+port resolver file makes the
+    # loop actually reach the $_port deref. (Mutation: a bare $_port aborts here under strict.)
+    resolv = tmp_path / "resolver"; resolv.mkdir()
+    _mk_resolver(resolv / "mine.corp", 45353)                # marked+port -> loop reaches $_port
+    body = '_sweep_our_resolvers\necho DONE\n'               # _port NEVER set
+    r = _sh(SRC_VPNC, body, extra_env={"RESOLVER_DIR": str(resolv)}, strict=True)
+    assert r.returncode == 0, r.stderr
+    assert "DONE" in r.stdout
+    assert (resolv / "mine.corp").exists(), "no _port -> whole-line 'port ' matches nothing -> unswept"
+
+
+def test_clear_proxy_state_no_unset_abort_without_pidfile(tmp_path):
+    # Finding 8: _clear_proxy_state derefs $_pidfile in its rm, guarded so a caller without proxy
+    # context no-ops instead of aborting under set -u (and never rm's a stray ./.ready from CWD).
+    # (Mutation: a bare $_pidfile aborts here under strict.)
+    resolv = tmp_path / "resolver"; resolv.mkdir()
+    body = '_clear_proxy_state\necho DONE\n'                 # neither _pidfile nor _port set
+    r = _sh(SRC_VPNC, body, extra_env={"RESOLVER_DIR": str(resolv)}, strict=True)
+    assert r.returncode == 0, r.stderr
+    assert "DONE" in r.stdout
+
+
 # --- vpnc-slice: NC_BIN root-gate (off-root the override is still honored) -----------
 def test_vpnc_slice_nonroot_honors_nc_bin_override(tmp_path):
     # Off the root path (the test runs as non-root), vpnc-slice must NOT pin NC_BIN, so

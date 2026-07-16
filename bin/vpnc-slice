@@ -81,7 +81,7 @@ _sweep_our_resolvers() {
     for _rf in "$RESOLVER_DIR"/*; do
         [ -f "$_rf" ] || continue
         grep -qxF -- "$RESOLVER_MARKER" "$_rf" 2>/dev/null || continue
-        grep -qxF -- "port $_port" "$_rf" 2>/dev/null || continue
+        grep -qxF -- "port ${_port:-}" "$_rf" 2>/dev/null || continue
         if [ -n "$_keep" ]; then
             case "$_keep" in *" ${_rf##*/} "*) continue ;; esac  # still current -- keep
         fi
@@ -117,8 +117,10 @@ _proxy_domains() {
 # line 2. _is_dnsroute confirms a PID is really OUR dnsroute before we signal it as root
 # -- matched on the FULL "$PROJ/src/dnsroute.py" argv (not a bare "dnsroute.py" substring
 # an unrelated process could carry), guarding against PID reuse (via pid_argv_has, the shared
-# per-PID argv re-confirm in lib/common.sh -- finding 13). ${_pidfile:-} so a caller that has
-# not set it (e.g. the standalone resolver-sweep path) reads "no record", not a set -u abort.
+# per-PID argv re-confirm in lib/common.sh -- finding 13). ${_pidfile:-} so a caller that has not
+# set it reads "no record", not a set -u abort. In PRODUCTION every caller sets $_pidfile (from the
+# --proxy directive args); this guard exists only for the TEST harness, which sources this file and
+# exercises these helpers in isolation -- there is no production "caller without proxy context".
 _proxy_pid()   { [ -f "${_pidfile:-}" ] && sed -n 1p "$_pidfile" 2>/dev/null || true; }
 _proxy_owner() { [ -f "${_pidfile:-}" ] && sed -n 2p "$_pidfile" 2>/dev/null || true; }
 _is_dnsroute() { pid_argv_has "${1:-}" "$PROJ/src/dnsroute.py"; }
@@ -156,7 +158,10 @@ _clear_proxy_state() {
     _may_touch_proxy || return 0
     _old=$(_proxy_pid)
     _is_dnsroute "$_old" && kill "$_old" 2>/dev/null || true
-    rm -f "$_pidfile" "$_pidfile.ready" 2>/dev/null || true
+    # ${_pidfile:-} guard, consistent with _proxy_pid/_proxy_owner: a caller without proxy context
+    # (the test harness) no-ops instead of aborting under set -u -- and skipping the rm entirely
+    # avoids removing a stray "./.ready" from CWD when $_pidfile is empty.
+    [ -n "${_pidfile:-}" ] && rm -f "$_pidfile" "$_pidfile.ready" 2>/dev/null || true
     _sweep_our_resolvers
 }
 

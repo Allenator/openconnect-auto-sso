@@ -344,8 +344,9 @@ esac
 # NEVER depends on signaling a pid: openconnect frees a reaped bg child's pid, so a raw
 # `kill $pid` could hit a reused pid (finding 9) -- so we disarm by REMOVING the flag and reap
 # the backstop with `wait`, never a kill. Init the temps the traps reference BEFORE arming (set -u).
+# (_p1_wd is NOT trap-referenced and is always $!-assigned before its lone `wait`, so it needs no init.)
 _p1_flag="$_rundir/p1armed"
-_authtmp=''; _oc_pid=''; _p1_wd=''
+_authtmp=''; _oc_pid=''
 : > "$_p1_flag"
 
 # EXIT (covers a FAILED Phase 1 too -- B5a): drop the flag + auth tempfile, reap the helper,
@@ -413,7 +414,6 @@ _oc_pid=''                            # openconnect reaped -> clear so the INT/T
 
 rm -f "$_p1_flag"                     # disarm WITHOUT signaling (finding 9): the backstop self-exits on its next tick
 wait "$_p1_wd" 2>/dev/null || true    # reap the backstop by wait (its remembered status; never signals -> reuse-proof)
-_p1_wd=''
 
 auth_out=$(cat "$_authtmp"); rm -f "$_authtmp"; _authtmp=''
 [ "$_auth_rc" = 0 ] || { echo "error: authentication failed" >&2; exit 1; }
@@ -493,7 +493,8 @@ fi
 # script's PID and stops when we exit (belt-and-suspenders with the EXIT trap).
 if [ -n "$KEEPALIVE_HOST" ]; then
     if [ "$KEEPALIVE_HOST" = "@dns" ]; then
-        rm -f "$KA_DNS_FILE"   # the wrapper writes the VPN's pushed DNS server here
+        # KA_DNS_FILE ($_rundir/dns) is written by the ROOT wrapper once the tunnel is up; the
+        # rundir is a fresh mktemp -d nothing wrote before now, so no stale file to clear here.
         echo ">> keepalive: ping the VPN's DNS server every ${KEEPALIVE_INTERVAL}s" >&2
     else
         echo ">> keepalive: ping $KEEPALIVE_HOST every ${KEEPALIVE_INTERVAL}s" >&2
@@ -510,9 +511,10 @@ if [ -n "$KEEPALIVE_HOST" ]; then
     KA_PID=$!
 fi
 
-# Clean up on exit: stop the keepalive pinger and remove the keepalive temp file. The
-# DNS-routing proxy and its pidfile are owned by ROOT (the wrapper starts the proxy and
-# writes the pidfile under /var/run), so this unprivileged trap can neither signal the
+# Clean up on exit: stop the keepalive pinger and rm -rf the private run dir (which holds the
+# keepalive @dns target among other per-run temps). The DNS-routing proxy and its pidfile are
+# owned by ROOT (the wrapper starts the proxy and writes the pidfile under /var/run), so this
+# unprivileged trap can neither signal the
 # proxy nor unlink the pidfile -- both are left to the wrapper's disconnect pass, and
 # failing that (a hard kill with no disconnect) to the proxy's own device watchdog (~15s
 # after the utun disappears), with the /var/run pidfile reclaimed at the next reboot.

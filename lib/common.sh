@@ -15,20 +15,25 @@ RESOLVER_MARKER='# openconnect-auto-sso'
 LIBEXEC_DIR='/usr/local/libexec/openconnect-auto-sso'
 TEARDOWN_BIN="$LIBEXEC_DIR/vpn-teardown"
 
-# True if process $1's FULL argv (ps -o command=) contains the fixed string $2. The single
-# place the "is this PID still really ours?" check lives, so the connect script's backstop +
-# _end_browser and vpnc-slice's _is_dnsroute can't drift. Used to RE-CONFIRM a PID right before
-# signaling it: a bg child's PID is freed the moment it's reaped, so a raw kill could hit a
-# reused PID -- matching the full argv first makes that impossible. `grep -qF`: $2 is a literal
-# (a path, which may hold regex metacharacters), never an ERE. The pipeline runs inside an `if`
-# so a no-match (grep rc 1) returns cleanly instead of tripping a caller's `set -e`, whatever
-# the call context. Empty/absent PID -> not ours (return 1).
+# True if process $1's FULL argv (ps -o command=) contains the fixed string $2. The single place
+# the "is this PID still really ours?" check lives, so the connect script's backstop + _end_browser
+# and vpnc-slice's _is_dnsroute can't drift. Used to RE-CONFIRM a PID right before signaling it: a
+# bg child's PID is freed the moment it's reaped, so a raw kill could hit a reused PID -- matching
+# the full argv first makes that (almost) impossible. `grep -qF`: $2 is a literal (a path, which may
+# hold regex metacharacters), never an ERE. Empty/absent PID -> not ours.
+#
+# This is a BOOLEAN predicate: it returns non-zero on a no-match or an empty PID, which WOULD trip a
+# bare-statement caller's `set -e` exactly as any other failing command does. It is safe ONLY
+# because every caller uses it in a condition context (if / && / ||), never as a bare statement --
+# an earlier comment wrongly claimed the if/return wrapper made it errexit-proof "whatever the call
+# context"; it does not, so the equivalent one-liner below replaces it.
+#
+# RESIDUAL (finding 12, DEFERRED): $2 is PER-REPO (a repo path), not per-RUN, so a PID reused onto a
+# CONCURRENT same-repo run's live process could still pass this confirm. Very narrow (needs PID
+# reuse landing on a live same-repo process); the connect script's _oc_pid clear (finding 4) shut
+# the biggest window. A per-run token is left to a future round.
 pid_argv_has() {
-    [ -n "${1:-}" ] || return 1
-    if ps -p "$1" -o command= 2>/dev/null | grep -qF -- "$2"; then
-        return 0
-    fi
-    return 1
+    [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -qF -- "$2"
 }
 
 # --- recovery timing ---------------------------------------------------------------
