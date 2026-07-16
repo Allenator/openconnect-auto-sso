@@ -176,3 +176,19 @@ def test_reveal_decision_url_change_resets_counter():
 def test_reveal_decision_threshold_one_reveals_first_idle():
     a, _, r = vb.reveal_decision(False, "https://idp", None, 0, threshold=1)
     assert (a, r) == ("reveal", 1)
+
+
+# --- write_own_pidfile: record our PID so the connect script reaps THIS run's helper (finding 8)
+def test_write_own_pidfile_records_our_pid(tmp_path, monkeypatch):
+    import os
+    pf = tmp_path / "helper.pid"
+    monkeypatch.setenv("VPN_BROWSER_PIDFILE", str(pf))
+    vb.write_own_pidfile()
+    assert pf.read_text().strip() == str(os.getpid())
+
+
+def test_write_own_pidfile_noop_without_env(tmp_path, monkeypatch):
+    # No env var -> no file written, and no exception (best-effort; must never stop the login).
+    monkeypatch.delenv("VPN_BROWSER_PIDFILE", raising=False)
+    vb.write_own_pidfile()   # must not raise
+    assert not (tmp_path / "helper.pid").exists()

@@ -194,11 +194,28 @@ def set_activation_policy(app, policy):
         pass
 
 
+def write_own_pidfile():
+    """Record our PID in $VPN_BROWSER_PIDFILE so the connect script's _end_browser can reap
+    EXACTLY this run's helper by PID -- never a concurrent same-repo run's live login (finding
+    8). Best effort: a failure here must not stop the login."""
+    path = os.environ.get("VPN_BROWSER_PIDFILE")
+    if not path:
+        return
+    try:
+        with open(path, "w") as fh:
+            fh.write("%d\n" % os.getpid())
+    except OSError:
+        pass
+
+
 def main(argv):
     if len(argv) < 2 or not argv[1]:
         print("usage: vpn_browser.py <url>", file=sys.stderr)
         return 2
     login_url = argv[1]
+
+    # Record our PID up front so the connect script can reap exactly this helper (finding 8).
+    write_own_pidfile()
 
     # Identify our parent up front (before Qt can crash): if it is openconnect, we can
     # fail Phase 1 LOUDLY on our own errors. openconnect awaits the loopback callback in

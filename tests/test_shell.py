@@ -812,6 +812,56 @@ def test_connect_refuses_when_executed_with_seam_var():
     assert "EXECUTED" in r.stderr
 
 
+def test_end_browser_reaps_only_the_recorded_pid(tmp_path):
+    # Finding 8: _end_browser reaps EXACTLY the PID this run's helper recorded in
+    # $VPN_BROWSER_PIDFILE -- NEVER a concurrent same-repo run's helper (a DIFFERENT live PID
+    # whose argv also matches). Stub kill/ps/pgrep so we observe targets without real signals;
+    # `kill -0 <p>` reports alive until <p> is TERM'd (a per-PID dead marker) so the wait ends.
+    H = "/x/src/vpn_browser.py"
+    pf = tmp_path / "helper.pid"; pf.write_text("11111\n")   # OUR recorded helper PID
+    kl = tmp_path / "killlog"; dm = str(tmp_path / "dead.")
+    body = (
+        'kill() { _s=$1; shift; case "$_s" in\n'
+        '  -0) [ -f "%s$1" ] && return 1; return 0 ;;\n'
+        '  *) for _p in "$@"; do echo "$_s $_p" >> "%s"; : > "%s$_p"; done ;;\n'
+        'esac; }\n'
+        'ps() { case "$*" in *11111*|*22222*) echo "/py %s u" ;; esac; }\n'
+        'pgrep() { echo 22222; }\n'         # a DIFFERENT run's LIVE helper (fallback would find it)
+        'sleep() { :; }\n'
+        '_HELPER_FULL="%s"\nVPN_BROWSER_PIDFILE="%s"\n'
+        '_end_browser\necho DONE\n'
+    ) % (dm, kl, dm, H, H, str(pf))
+    r = _sh(SRC_CONNECT, body)
+    assert r.returncode == 0, r.stderr
+    assert "DONE" in r.stdout
+    killed = kl.read_text() if kl.exists() else ""
+    assert "11111" in killed, "must reap the recorded helper PID"
+    assert "22222" not in killed, "must NOT touch a concurrent run's live helper (finding 8)"
+    assert not pf.exists(), "pidfile removed after reaping"
+
+
+def test_end_browser_falls_back_to_pattern_when_no_recorded_pid(tmp_path):
+    # If the helper crashed BEFORE writing its pidfile (no recorded PID), _end_browser still
+    # reaps it via the argv pattern -- a helper is never leaked.
+    H = "/x/src/vpn_browser.py"
+    kl = tmp_path / "killlog"; dm = str(tmp_path / "dead.")
+    body = (
+        'kill() { _s=$1; shift; case "$_s" in\n'
+        '  -0) [ -f "%s$1" ] && return 1; return 0 ;;\n'
+        '  *) for _p in "$@"; do echo "$_s $_p" >> "%s"; : > "%s$_p"; done ;;\n'
+        'esac; }\n'
+        'ps() { case "$*" in *33333*) echo "/py %s u" ;; esac; }\n'
+        'pgrep() { echo 33333; }\n'
+        'sleep() { :; }\n'
+        '_HELPER_FULL="%s"\nVPN_BROWSER_PIDFILE="%s"\n'     # pidfile path does NOT exist
+        '_end_browser\necho DONE\n'
+    ) % (dm, kl, dm, H, H, str(tmp_path / "nope.pid"))
+    r = _sh(SRC_CONNECT, body)
+    assert r.returncode == 0, r.stderr
+    killed = kl.read_text() if kl.exists() else ""
+    assert "33333" in killed, "fallback pattern reap should still kill the crashed-early helper"
+
+
 def test_connect_build_vs_full_includes_flags_and_quotes():
     # Phase-2 -s assembly: abs paths single-quoted (survive a space when openconnect re-splits
     # the string via sh), --proxy carries the validated names+port+quoted pidfile, and the

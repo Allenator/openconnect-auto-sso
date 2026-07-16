@@ -81,6 +81,64 @@ _build_vs() {
     return 0   # never let a false trailing `[ ] && ...` trip set -e in the caller
 }
 
+# --- Phase-1 helper reaping (defined here so the seam can unit-test the run-scoping) --------
+# Find our processes robustly: `pgrep -f` treats its pattern as an ERE, so we must NOT
+# splice $PROJ (any path char, incl. regex metacharacters) into it. Instead pgrep on a fixed
+# metachar-free literal ($1) to get candidates, then confirm each one's FULL argv with
+# `grep -qF -- $2` (fixed string). Robust to any path -- no path restriction needed.
+_pids_matching() {   # $1 = metachar-free pgrep -f substring; $2 = fixed full string to confirm
+    pgrep -f "$1" 2>/dev/null | while read -r _p; do
+        ps -p "$_p" -o command= 2>/dev/null | grep -qF -- "$2" && printf '%s\n' "$_p"
+    done
+}
+
+# Full argv fragments that identify OUR SSO helper and OUR Phase-1 openconnect (confirmed
+# with grep -F above). The helper's argv carries "$PROJ/src/vpn_browser.py"; Phase-1
+# openconnect's carries "--external-browser=$PROJ/bin/vpn-browser".
+_HELPER_FULL="$PROJ/src/vpn_browser.py"
+_P1_FULL="external-browser=$PROJ/bin/vpn-browser"
+
+# Filter a whitespace-separated PID list ($1) to those still alive AND still our helper
+# (re-confirm argv, so a PID reused during the TERM->KILL wait window is never signaled).
+_alive_pids() {
+    for _q in $1; do
+        kill -0 "$_q" 2>/dev/null || continue
+        ps -p "$_q" -o command= 2>/dev/null | grep -qF -- "$_HELPER_FULL" && printf '%s ' "$_q"
+    done
+}
+
+# End the SSO browser helper: SIGTERM it and WAIT for it to exit, rather than a
+# fire-and-forget kill. Chromium batches cookie commits (~30s), and the helper needs a
+# moment (its SIGTERM handler flushes and lingers ~1.5s) to durably write the session
+# cookie the login just earned -- killing it the instant Phase 1 ends can drop it (B2).
+# Bounded, then force-killed, so a wedged helper can never stall us. Safe to call
+# repeatedly: a no-op once the helper is gone.
+#
+# Reap by the EXACT PID this run's helper recorded in $VPN_BROWSER_PIDFILE (confirmed ours
+# via argv, so a reused PID can't be hit) -- so a concurrent same-repo run's live helper is
+# NEVER touched (finding 8). Fall back to the argv-pattern reap only if no recorded, live,
+# confirmed-ours PID exists (e.g. the helper crashed before writing it), so a helper is never
+# leaked. Removes the pidfile once done.
+_end_browser() {
+    _pf=${VPN_BROWSER_PIDFILE:-}
+    _rec=$([ -n "$_pf" ] && cat "$_pf" 2>/dev/null || true)
+    if [ -n "$_rec" ] && kill -0 "$_rec" 2>/dev/null \
+       && ps -p "$_rec" -o command= 2>/dev/null | grep -qF -- "$_HELPER_FULL"; then
+        _hp=$_rec                                            # run-scoped: exactly our helper
+    else
+        _hp=$(_pids_matching vpn_browser "$_HELPER_FULL")    # fallback: no recorded PID
+    fi
+    if [ -z "$_hp" ]; then [ -n "$_pf" ] && rm -f "$_pf" 2>/dev/null || true; return 0; fi
+    kill -TERM $_hp 2>/dev/null || true
+    _i=0
+    while _live=$(_alive_pids "$_hp"); [ -n "$_live" ]; do
+        _i=$((_i + 1))
+        [ "$_i" -ge 8 ] && { kill -KILL $_live 2>/dev/null || true; break; }
+        sleep 1
+    done
+    [ -n "$_pf" ] && rm -f "$_pf" 2>/dev/null || true
+}
+
 # --- everything below is the connect flow; OC_CONNECT_TEST=1 guards it off when sourced ---
 if [ "${OC_CONNECT_TEST:-}" != 1 ]; then
 
@@ -126,6 +184,11 @@ ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (serve
 ROUTE_SPLITS="${ROUTE_SPLITS:-0}"       # also add the server's split-include subnets
 PROXY_PORT="${PROXY_PORT:-45353}"       # loopback port for the DNS-routing proxy
 KA_DNS_FILE="${TMPDIR:-/tmp}/openconnect-auto-sso.dns.$$"     # keepalive @dns target
+# Per-run helper pidfile ($$ = THIS connect run). The SSO helper writes its own PID here on
+# startup so _end_browser can reap EXACTLY this run's helper by PID -- not every same-repo
+# helper by argv pattern, which would kill a CONCURRENT run's live login mid-flow (the
+# launchd agent + a manual run both in Phase 1). See finding 8 / _end_browser below.
+VPN_BROWSER_PIDFILE="${TMPDIR:-/tmp}/openconnect-auto-sso.helper.$$"
 # Proxy state file (PER-PORT path, keyed on $PROXY_PORT): line 1 = the dnsroute PID,
 # line 2 = the owning openconnect PID (VPNPID). A stable per-port path lets a fresh run on
 # the SAME port reason about a PREVIOUS run's proxy -- reclaim our own (in-process
@@ -141,8 +204,9 @@ KA_DNS_FILE="${TMPDIR:-/tmp}/openconnect-auto-sso.dns.$$"     # keepalive @dns t
 # and the invoking user isn't in group daemon. Only the wrapper (root) writes it.
 PROXY_PIDFILE="/var/run/openconnect-auto-sso.proxy.$PROXY_PORT"
 
-# The SSO browser helper (spawned by openconnect) reads these from the env.
-export PROFILE_NAME CALLBACK
+# The SSO browser helper (spawned by openconnect) reads these from the env. VPN_BROWSER_PIDFILE
+# is where it records its own PID so we can reap exactly this run's helper (finding 8).
+export PROFILE_NAME CALLBACK VPN_BROWSER_PIDFILE
 
 # --- startup guards for leftovers from failed teardowns ----------------------
 # Shared prompt tail: on a tty, ask QUESTION (default answer DEFAULT) and run
@@ -255,40 +319,6 @@ authenticate() {
 }
 
 COOKIE=''; HOST=''; CONNECT_URL=''; FINGERPRINT=''; RESOLVE=''
-
-# Find our processes robustly: `pgrep -f` treats its pattern as an ERE, so we must NOT
-# splice $PROJ (any path char, incl. regex metacharacters) into it. Instead pgrep on a fixed
-# metachar-free literal ($1) to get candidates, then confirm each one's FULL argv with
-# `grep -qF -- $2` (fixed string). Robust to any path -- no path restriction needed.
-_pids_matching() {   # $1 = metachar-free pgrep -f substring; $2 = fixed full string to confirm
-    pgrep -f "$1" 2>/dev/null | while read -r _p; do
-        ps -p "$_p" -o command= 2>/dev/null | grep -qF -- "$2" && printf '%s\n' "$_p"
-    done
-}
-
-# Full argv fragments that identify OUR SSO helper and OUR Phase-1 openconnect (confirmed
-# with grep -F above). The helper's argv carries "$PROJ/src/vpn_browser.py"; Phase-1
-# openconnect's carries "--external-browser=$PROJ/bin/vpn-browser".
-_HELPER_FULL="$PROJ/src/vpn_browser.py"
-_P1_FULL="external-browser=$PROJ/bin/vpn-browser"
-
-# End the SSO browser helper: SIGTERM it and WAIT for it to exit, rather than a
-# fire-and-forget kill. Chromium batches cookie commits (~30s), and the helper needs a
-# moment (its SIGTERM handler flushes and lingers ~1.5s) to durably write the session
-# cookie the login just earned -- killing it the instant Phase 1 ends can drop it (B2).
-# Bounded, then force-killed, so a wedged helper can never stall us. Safe to call
-# repeatedly: a no-op once the helper is gone.
-_end_browser() {
-    _hp=$(_pids_matching vpn_browser "$_HELPER_FULL")
-    [ -n "$_hp" ] || return 0                                # nothing running
-    kill -TERM $_hp 2>/dev/null || true
-    _i=0
-    while _hp=$(_pids_matching vpn_browser "$_HELPER_FULL"); [ -n "$_hp" ]; do
-        _i=$((_i + 1))
-        [ "$_i" -ge 8 ] && { kill -KILL $_hp 2>/dev/null || true; break; }
-        sleep 1
-    done
-}
 
 # Reap the helper on ANY exit from Phase 1. The EXIT trap also covers a FAILED Phase 1,
 # which previously left the hidden helper alive (its pkill sat after the `|| exit` and
