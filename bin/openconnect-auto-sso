@@ -190,7 +190,7 @@ KA_DNS_FILE="$_rundir/dns"                  # keepalive @dns target (root wrappe
 # run's helper by PID -- not every same-repo helper by argv pattern, which would kill a
 # CONCURRENT run's live login mid-flow (the launchd agent + a manual run both in Phase 1).
 # Inside $_rundir (private 0700), and the helper opens it O_NOFOLLOW (src/vpn_browser.py).
-# See finding 8 / _end_browser below.
+# See finding 8 / _end_browser (defined above).
 VPN_BROWSER_PIDFILE="$_rundir/helper.pid"
 # Proxy state file (PER-PORT path, keyed on $PROXY_PORT): line 1 = the dnsroute PID,
 # line 2 = the owning openconnect PID (VPNPID). A stable per-port path lets a fresh run on
@@ -428,8 +428,9 @@ fi
 set -- --cookie-on-stdin --servercert "$FINGERPRINT"
 [ -n "$RESOLVE" ] && set -- "$@" --resolve "$RESOLVE"
 [ -n "$PROTOCOL" ] && set -- "$@" --protocol="$PROTOCOL"
-# Budget for openconnect's own in-process reconnect; sized by supervisor presence above.
-# lib/common.sh owns the rationale (why a sleep needs a FRESH connect, not a reconnect).
+# Budget for openconnect's own in-process reconnect; sized by launch mode ($OC_LAUNCHD, via
+# apply_launch_budget above). lib/common.sh owns the rationale (why a sleep needs a FRESH
+# connect, not a reconnect).
 set -- "$@" --reconnect-timeout="$RECONNECT_TIMEOUT"
 if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUTE_SPLITS" = "1" ]; then
     # root's PATH usually excludes Homebrew, so resolve vpn-slice to an abs path.

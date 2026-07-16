@@ -65,11 +65,18 @@ fi
 # ($_port). Port-scoping means tearing down one tunnel never deletes another
 # tunnel's resolver files (a second tunnel necessarily uses a different port).
 #
+# SELF-GATED (finding 12): a leading `_may_touch_proxy || return 0` means removing resolver
+# files -- a mutation -- can NEVER touch a live DIFFERENT tunnel's state, by construction, so
+# no caller has to remember to wrap it in the gate. On the success path the pidfile we just
+# wrote records us as owner, so the gate passes; on a teardown/no-proxy path an absent or
+# reclaimable record likewise passes; only a live DIFFERENT owner stands it down.
+#
 # With no argument: removes ALL our-port files (teardown / no-proxy paths). With a
 # space-padded " d1 d2 " keep-list ($1): removes only our-port files whose domain is
 # NOT in it -- used on the success path to drop domains a reconnect no longer routes,
 # without disturbing (and momentarily un-resolving) the ones we just (re)wrote.
 _sweep_our_resolvers() {
+    _may_touch_proxy || return 0
     _keep=${1:-}
     for _rf in "$RESOLVER_DIR"/*; do
         [ -f "$_rf" ] || continue
@@ -109,10 +116,12 @@ _proxy_domains() {
 # line 2 = owning openconnect PID (VPNPID). _proxy_pid reads line 1; _proxy_owner reads
 # line 2. _is_dnsroute confirms a PID is really OUR dnsroute before we signal it as root
 # -- matched on the FULL "$PROJ/src/dnsroute.py" argv (not a bare "dnsroute.py" substring
-# an unrelated process could carry), guarding against PID reuse.
-_proxy_pid()   { [ -f "$_pidfile" ] && sed -n 1p "$_pidfile" 2>/dev/null || true; }
-_proxy_owner() { [ -f "$_pidfile" ] && sed -n 2p "$_pidfile" 2>/dev/null || true; }
-_is_dnsroute() { [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -qF -- "$PROJ/src/dnsroute.py"; }
+# an unrelated process could carry), guarding against PID reuse (via pid_argv_has, the shared
+# per-PID argv re-confirm in lib/common.sh -- finding 13). ${_pidfile:-} so a caller that has
+# not set it (e.g. the standalone resolver-sweep path) reads "no record", not a set -u abort.
+_proxy_pid()   { [ -f "${_pidfile:-}" ] && sed -n 1p "$_pidfile" 2>/dev/null || true; }
+_proxy_owner() { [ -f "${_pidfile:-}" ] && sed -n 2p "$_pidfile" 2>/dev/null || true; }
+_is_dnsroute() { pid_argv_has "${1:-}" "$PROJ/src/dnsroute.py"; }
 
 # Ownership invariant, gating EVERY proxy-state mutation (reclaim / disconnect teardown):
 # may we kill/rm/sweep this proxy's state? True when it is ours (owner == our VPNPID --
@@ -133,6 +142,22 @@ _may_touch_proxy() {
     _comm=$(ps -p "$_owner" -o comm= 2>/dev/null)
     [ "${_comm##*/}" = openconnect ] && return 1                   # a live DIFFERENT tunnel
     return 0                                                       # owner dead / reused -> reclaimable
+}
+
+# Tear down THIS port's proxy state, SELF-GATED (finding 12): kill our RECORDED dnsroute
+# (argv-confirmed via _is_dnsroute, so a reused PID is never signalled), remove the pidfile +
+# its .ready, and sweep our /etc/resolver files. The leading gate means a live DIFFERENT
+# tunnel's state is NEVER touched, by construction -- so the failed-bind and disconnect paths
+# can just call this without re-deriving the gate. Idempotent and safe when nothing is recorded.
+# NOT used on the reclaim path: that must kill+WAIT for the port to free WITHOUT sweeping the
+# resolver files up front (a gap where names would leak out the default interface -- see
+# _proxy_connect).
+_clear_proxy_state() {
+    _may_touch_proxy || return 0
+    _old=$(_proxy_pid)
+    _is_dnsroute "$_old" && kill "$_old" 2>/dev/null || true
+    rm -f "$_pidfile" "$_pidfile.ready" 2>/dev/null || true
+    _sweep_our_resolvers
 }
 
 # Bring up the DNS-routing proxy on connect|reconnect (uses $_names/$_port/$_pidfile).
@@ -164,17 +189,16 @@ _proxy_connect() {
     # These are unset only if the server pushed no IPv4 DNS / no tun device; guard
     # them (bare refs abort under set -u) and skip DNS-routing rather than crash.
     # No proxy is coming up on these branches. Sweep our OWN now-stale port files (so routed
-    # domains degrade to default DNS rather than black-holing) -- but ONLY when the ownership
-    # invariant permits: never delete a live DIFFERENT same-port tunnel's /etc/resolver files
-    # (finding 14). _may_touch_proxy in an `if` keeps set -e happy on its false branch.
+    # domains degrade to default DNS rather than black-holing) -- _sweep_our_resolvers self-gates,
+    # so it never deletes a live DIFFERENT same-port tunnel's /etc/resolver files (finding 14).
     _up=${INTERNAL_IP4_DNS:-}; _dev=${TUNDEV:-}
     if [ -z "$_up" ] || [ -z "$_dev" ]; then
-        if _may_touch_proxy; then _sweep_our_resolvers; fi
+        _sweep_our_resolvers
         echo ">> no VPN DNS/tun device pushed; DNS-routing disabled for:$_domains" >&2
         return 0
     fi
     if [ -z "$_domains" ]; then
-        if _may_touch_proxy; then _sweep_our_resolvers; fi
+        _sweep_our_resolvers
         echo ">> no domains to DNS-route (@server advertised none); proxy not started" >&2
         return 0
     fi
@@ -199,17 +223,15 @@ _proxy_connect() {
     done
     if [ ! -f "$_ready" ]; then
         # Kill ONLY the proxy WE just spawned ($_pid) -- it is ours and failed to signal
-        # ready. Then, IF the ownership invariant permits (our own dead proxy from an
-        # in-process reconnect, or an orphan -- NOT a live DIFFERENT tunnel that won the
-        # bind), clear our now-dead-port pidfile + /etc/resolver files so routed domains
-        # degrade to default DNS instead of black-holing at a port with nothing listening.
-        # If a live winner owns the port, leave its pidfile, .ready, and resolver files
-        # intact -- our bind simply lost with EADDRINUSE (finding 14).
+        # ready (always ours, so this kill is ungated). Then _clear_proxy_state self-gates:
+        # IF the ownership invariant permits (our own dead proxy from an in-process reconnect,
+        # or an orphan -- NOT a live DIFFERENT tunnel that won the bind), it clears our
+        # now-dead-port pidfile + /etc/resolver files so routed domains degrade to default DNS
+        # instead of black-holing at a port with nothing listening. If a live winner owns the
+        # port, it leaves the winner's pidfile, .ready, and resolver files intact -- our bind
+        # simply lost with EADDRINUSE (finding 14).
         kill "$_pid" 2>/dev/null || true
-        if _may_touch_proxy; then
-            rm -f "$_pidfile" 2>/dev/null || true
-            _sweep_our_resolvers
-        fi
+        _clear_proxy_state
         echo "WARNING: DNS-routing proxy failed to bind 127.0.0.1:$_port" \
              "(port busy, invalid, or dnspython missing); DNS-routing disabled." >&2
         return 0
@@ -257,24 +279,13 @@ while :; do
             case "${reason:-}" in
                 connect|reconnect) _proxy_connect ;;
                 disconnect)
-                    # Tear down ONLY if the ownership invariant permits: this proxy is
-                    # ours (owner == our VPNPID -- the openconnect running this very pass),
-                    # unowned, or owned by a dead/reused PID. If a live DIFFERENT
-                    # openconnect owns this port, do NOTHING -- leaving its proxy, pidfile,
-                    # and /etc/resolver files intact so one tunnel's disconnect never yanks
-                    # another same-port tunnel's DNS (finding 14).
-                    if _may_touch_proxy; then
-                        # Kill ONLY the dnsroute (line 1) -- never line 2's openconnect PID,
-                        # which is mid-teardown running this very pass. Verify it's ours first.
-                        _old=$(_proxy_pid)
-                        _is_dnsroute "$_old" && kill "$_old" 2>/dev/null || true
-                        rm -f "$_pidfile" "$_pidfile.ready" 2>/dev/null || true
-                        # Remove our resolver files by marker+port (see _sweep_our_resolvers)
-                        # rather than re-deriving domain names from a server env that may
-                        # differ/be absent now -- and scoped to this port so a second
-                        # tunnel's files are left intact.
-                        _sweep_our_resolvers
-                    fi ;;
+                    # Tear down via _clear_proxy_state, which SELF-GATES on the ownership
+                    # invariant: it kills ONLY our recorded dnsroute (line 1, argv-confirmed --
+                    # never line 2's openconnect PID, which is mid-teardown running this very
+                    # pass), removes the pidfile + .ready, and sweeps our marker+port resolver
+                    # files. If a live DIFFERENT openconnect owns this port it does NOTHING, so
+                    # one tunnel's disconnect never yanks another same-port tunnel's DNS (finding 14).
+                    _clear_proxy_state ;;
             esac ;;
         *) break ;;
     esac

@@ -336,6 +336,82 @@ def test_failed_bind_sweeps_our_own_dead_port_files(tmp_path):
     assert not (resolv / "mine.corp").exists(), "failed-bind should sweep our own dead-port file"
 
 
+# --- vpnc-slice: self-gated proxy primitives (E1 / finding 12) -------------------------
+def test_sweep_our_resolvers_self_gates_on_live_winner(tmp_path):
+    # E1/finding 12: _sweep_our_resolvers now self-gates (a leading `_may_touch_proxy || return
+    # 0`), so removing resolver files can NEVER touch a live DIFFERENT tunnel's, by construction
+    # -- even when called directly with no external gate. A live winner (55555) owns the port.
+    resolv = tmp_path / "resolver"; resolv.mkdir()
+    _mk_resolver(resolv / "keep.corp", 45353)
+    pf = tmp_path / "proxy"; pf.write_text("4242\n55555\n")   # owner 55555 = a live openconnect
+    body = (
+        'ps() { case "$*" in *55555*) echo /opt/homebrew/bin/openconnect ;; esac; }\n'
+        'VPNPID=999999\n_port=45353\n_pidfile="%s"\n'
+        '_sweep_our_resolvers\necho DONE\n'
+    ) % str(pf)
+    r = _sh(SRC_VPNC, body, extra_env={"RESOLVER_DIR": str(resolv)})
+    assert r.returncode == 0, r.stderr
+    assert "DONE" in r.stdout
+    assert (resolv / "keep.corp").exists(), "self-gate must protect a live winner's resolver file"
+
+
+def test_sweep_our_resolvers_still_sweeps_when_unowned(tmp_path):
+    # The self-gate must NOT over-refuse: with no recorded owner (no pidfile set), the sweep
+    # still runs (this is the teardown/no-proxy path the existing sweep tests rely on).
+    resolv = tmp_path / "resolver"; resolv.mkdir()
+    _mk_resolver(resolv / "mine.corp", 45353)
+    r = _sh(SRC_VPNC, '_port=45353\n_sweep_our_resolvers\necho DONE\n',
+            extra_env={"RESOLVER_DIR": str(resolv)})
+    assert r.returncode == 0, r.stderr
+    assert not (resolv / "mine.corp").exists(), "unowned sweep must still remove our-port files"
+
+
+def test_clear_proxy_state_clears_own_and_sweeps(tmp_path):
+    # _clear_proxy_state (self-gated teardown): when we own the record, kill our recorded
+    # dnsroute (argv-confirmed), remove the pidfile + .ready, and sweep our resolver files.
+    resolv = tmp_path / "resolver"; resolv.mkdir()
+    _mk_resolver(resolv / "mine.corp", 45353)
+    pf = tmp_path / "proxy"; pf.write_text("4242\n999999\n")   # owner == our VPNPID
+    kl = tmp_path / "killlog"
+    body = (
+        'kill() { echo "$@" >> "%s"; }\n'
+        'ps() { case "$*" in *4242*) echo "/x/.venv/bin/python /x/src/dnsroute.py --port 45353" ;; esac; }\n'
+        'PROJ="/x"\nVPNPID=999999\n_port=45353\n_pidfile="%s"\n'
+        ': > "%s.ready"\n'
+        '_clear_proxy_state\necho DONE\n'
+    ) % (str(kl), str(pf), str(pf))
+    r = _sh(SRC_VPNC, body, extra_env={"RESOLVER_DIR": str(resolv)})
+    assert r.returncode == 0, r.stderr
+    assert "DONE" in r.stdout
+    killed = kl.read_text() if kl.exists() else ""
+    assert "4242" in killed, "should kill our recorded dnsroute"
+    assert not pf.exists(), "pidfile removed"
+    assert not (tmp_path / "proxy.ready").exists(), ".ready removed"
+    assert not (resolv / "mine.corp").exists(), "our resolver file swept"
+
+
+def test_clear_proxy_state_leaves_live_different_owner(tmp_path):
+    # _clear_proxy_state must NO-OP when a live DIFFERENT openconnect owns the port (finding 14):
+    # its dnsroute, pidfile, and resolver files are all left intact.
+    resolv = tmp_path / "resolver"; resolv.mkdir()
+    _mk_resolver(resolv / "keep.corp", 45353)
+    pf = tmp_path / "proxy"; pf.write_text("4242\n55555\n")   # owner 55555 = a live openconnect
+    kl = tmp_path / "killlog"
+    body = (
+        'kill() { echo "$@" >> "%s"; }\n'
+        'ps() { case "$*" in *55555*) echo /opt/homebrew/bin/openconnect ;; '
+        '*4242*) echo "/x/src/dnsroute.py" ;; esac; }\n'
+        'PROJ="/x"\nVPNPID=999999\n_port=45353\n_pidfile="%s"\n'
+        '_clear_proxy_state\necho DONE\n'
+    ) % (str(kl), str(pf))
+    r = _sh(SRC_VPNC, body, extra_env={"RESOLVER_DIR": str(resolv)})
+    assert r.returncode == 0, r.stderr
+    killed = kl.read_text() if kl.exists() else ""
+    assert "4242" not in killed, "must not kill the winner's dnsroute"
+    assert pf.exists(), "winner's pidfile left intact"
+    assert (resolv / "keep.corp").exists(), "winner's resolver file left intact"
+
+
 # --- vpnc-slice: NC_BIN root-gate (off-root the override is still honored) -----------
 def test_vpnc_slice_nonroot_honors_nc_bin_override(tmp_path):
     # Off the root path (the test runs as non-root), vpnc-slice must NOT pin NC_BIN, so
