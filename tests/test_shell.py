@@ -1349,22 +1349,29 @@ def _stub_connect_env(tmp_path):
         "#!/bin/sh\n"
         "trap 'rm -f \"$HELPER_ALIVE\"; exit 0' TERM INT\n"
         "touch \"$HELPER_ALIVE\"\n"
-        # $2 = mode: short | long | longnopid. A 'nopid' mode SKIPS the pidfile write, simulating
-        # write_own_pidfile's best-effort write FAILING while the helper is still LIVE -- finding
-        # 5's secondary pgrep-child check must then keep the backstop from killing a real login.
+        # $2 = mode: short | shortnopid | long | longnopid. A '*nopid*' mode SKIPS the pidfile
+        # write, simulating write_own_pidfile's best-effort write FAILING while the helper is still
+        # LIVE (longnopid) or the helper crashing BEFORE it writes (shortnopid).
         "case \"$2\" in\n"
         "  *nopid*) : ;;\n"
         "  *) [ -n \"${VPN_BROWSER_PIDFILE:-}\" ] && printf '%s\\n' \"$$\" > \"$VPN_BROWSER_PIDFILE\" ;;\n"
         "esac\n"
         "case \"$2\" in\n"
-        # long: stay alive until signalled, but SELF-EXIT if orphaned (PPID -> 1 once openconnect
-        # dies) -- mirrors vpn_browser.py's parent-death watch, and stops a pidfile-less helper
-        # (longnopid) leaking past teardown when _end_browser has no recorded PID to reap.
-        "  long*) while :; do\n"
-        "           [ \"$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')\" = 1 ] && { rm -f \"$HELPER_ALIVE\"; exit 0; }\n"
-        "           sleep 1\n"
-        "         done ;;\n"
-        "  *)     rm -f \"$HELPER_ALIVE\"; exit 0 ;;\n"    # short: pidfile then exit
+        # longnopid ONLY: a LIVE helper that wrote NO pidfile, self-exiting if orphaned (PPID -> 1
+        # once openconnect dies) -- mirrors vpn_browser.py's parent-death watch, so a pidfile-less
+        # helper doesn't leak past teardown when _end_browser has no recorded PID to reap. Scoped to
+        # longnopid, NOT the whole long* glob: the plain `long` helper below deliberately has NO
+        # self-exit, so test_phase1_sigterm_kills_openconnect_and_helper depends on the pidfile
+        # export->write->read->reap chain to end it (a self-exiting long helper would mask a break).
+        "  longnopid) while :; do\n"
+        "               [ \"$(ps -o ppid= -p $$ 2>/dev/null | tr -d ' ')\" = 1 ] && { rm -f \"$HELPER_ALIVE\"; exit 0; }\n"
+        "               sleep 1\n"
+        "             done ;;\n"
+        # long: wrote its pidfile; stays alive until _end_browser TERMs it via that pidfile (the
+        # TERM trap above cleans up). Bounded (~5 min) so a hard test abort can't leak a spinner.
+        "  long) _n=0; while [ \"$_n\" -lt 300 ]; do sleep 1; _n=$((_n + 1)); done\n"
+        "        rm -f \"$HELPER_ALIVE\"; exit 0 ;;\n"
+        "  *)    rm -f \"$HELPER_ALIVE\"; exit 0 ;;\n"    # short / shortnopid: (pidfile or not) then exit
         "esac\n")
     helper.chmod(0o755)
 
@@ -1389,18 +1396,29 @@ def _stub_connect_env(tmp_path):
         "        while :; do sleep 1; done ;;\n"
         "      dead)\n"
         "        sh \"$STUB_HELPER\" \"$HELPER_MARKER\" short >/dev/null 2>&1 &\n"
-        # Reap the short-lived helper, then busy-wait with NO live child -- faithfully
-        # mirroring real openconnect blocking in select(NULL) with a DEAD helper. A `sleep`
-        # loop would leave a live `sleep` child that finding 5's `pgrep -P` correctly reads as
-        # "login still live", so the backstop would (rightly) never fire on it.
+        # Reap the short-lived helper (it wrote a pidfile, now dead), then busy-wait with NO live
+        # child -- faithfully mirroring real openconnect blocking in select(NULL) with a DEAD
+        # helper. Childless on purpose: a `sleep` loop's own live child would satisfy finding 5's
+        # `pgrep -P` and wrongly read as "login still live", so the backstop would never fire.
+        # BOUNDED (~4 min of pure arithmetic here) so a regressed/timed-out test can't peg a core
+        # forever; in the normal flow the backstop TERMs it at the ~2s deadline, long before the cap.
         "        wait\n"
-        "        while :; do :; done ;;\n"
+        "        _n=0; while [ \"$_n\" -lt 100000000 ]; do _n=$((_n + 1)); done ;;\n"
+        "      deadnopid)\n"
+        # Like dead, but the helper crashes BEFORE writing its pidfile (shortnopid): no recorded PID
+        # AND no live child, so the backstop's pidfile check reads "gone", the secondary pgrep -P
+        # finds no child, and it MUST fire. Pins the helper-died-pre-write case livenopid can't.
+        "        sh \"$STUB_HELPER\" \"$HELPER_MARKER\" shortnopid >/dev/null 2>&1 &\n"
+        "        wait\n"
+        "        _n=0; while [ \"$_n\" -lt 100000000 ]; do _n=$((_n + 1)); done ;;\n"
         "      livenopid)\n"
-        # A LIVE helper (openconnect's direct child) whose pidfile write FAILED: the helper stays
-        # up but records no PID, so the backstop's pidfile check reads "helper gone". Finding 5's
-        # secondary `pgrep -P` must see openconnect's live child and stand down (never kill it).
+        # A LIVE helper (openconnect's ONLY child) whose pidfile write FAILED: it records no PID, so
+        # the backstop's pidfile check reads "helper gone". Finding 5's secondary `pgrep -P` must see
+        # openconnect's live child (the helper) and stand down. `wait` (not a `sleep` loop) keeps
+        # openconnect alive with the HELPER as its ONLY child, so the stand-down genuinely depends on
+        # the helper being that live child -- a sleep loop's own child would satisfy pgrep regardless.
         "        sh \"$STUB_HELPER\" \"$HELPER_MARKER\" longnopid >/dev/null 2>&1 &\n"
-        "        while :; do sleep 1; done ;;\n"
+        "        wait ;;\n"
         "    esac ;;\n"
         "  *' --cookie-on-stdin '*)\n"
         "    cat >/dev/null 2>&1 || true\n"
@@ -1528,6 +1546,24 @@ def test_phase1_dead_helper_is_aborted_at_deadline(tmp_path):
     assert _wait_gone(m["oc_alive"]), "backstop should have TERMed the wedged openconnect"
 
 
+def test_phase1_helper_crashed_before_pidfile_is_aborted(tmp_path):
+    # Finding 5 (second half): the helper crashed BEFORE writing its pidfile (deadnopid) -- so no
+    # recorded PID AND openconnect has NO live child. The backstop's pidfile check reads "gone",
+    # its secondary `pgrep -P "$_oc_pid"` finds no live child, so it MUST fire the abort (TERM
+    # openconnect so `wait` returns and Phase 1 fails loudly). This pins the "helper died pre-write
+    # -> still unwedge" case that the livenopid stand-down (a LIVE child) deliberately does NOT.
+    env, m = _stub_connect_env(tmp_path)
+    env["STUB_MODE"] = "deadnopid"
+    env["PHASE1_DEADLINE"] = "2"
+    r = subprocess.run([CONNECT], capture_output=True, text=True, env=env,
+                       stdin=subprocess.DEVNULL, timeout=30)
+    assert r.returncode != 0
+    assert "Phase 1 stalled" in r.stderr, "backstop did not fire on a helper that never wrote a pidfile"
+    assert "authentication failed" in r.stderr
+    assert not m["phase2"].exists(), "must NOT reach Phase 2 on a failed auth"
+    assert _wait_gone(m["oc_alive"]), "backstop should have TERMed the wedged openconnect"
+
+
 def test_phase1_live_helper_without_pidfile_not_killed(tmp_path):
     # Finding 5: write_own_pidfile is best-effort (swallows OSError). If the pidfile write FAILS
     # while the helper is LIVE (openconnect's direct child), the backstop's pidfile-based check
@@ -1616,3 +1652,9 @@ def test_oc_pid_cleared_after_wait_reaps_openconnect():
         r'if wait "\$_oc_pid"; then _auth_rc=0; else _auth_rc=\$\?; fi[^\n]*\n\s*_oc_pid=\'\'',
         src)
     assert m, "expected `_oc_pid=''` to clear the reaped PID immediately after the wait (finding 4)"
+    # Pin the PROPERTY the clear protects, not just its adjacency: the Phase-1 INT/TERM trap must
+    # signal the GUARDED ${_oc_pid:-} (which the clear turns into an empty -> `kill "" 2>/dev/null
+    # || true` no-op), never a bare $_oc_pid that could raw-kill a freed/reused PID post-wait.
+    assert re.search(
+        r"trap '[^']*kill \"\$\{_oc_pid:-\}\" 2>/dev/null \|\| true[^']*' INT TERM", src), \
+        "the Phase-1 INT/TERM trap must kill the guarded ${_oc_pid:-} (finding 4)"
