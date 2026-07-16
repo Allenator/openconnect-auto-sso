@@ -1039,13 +1039,34 @@ def test_end_browser_reaps_only_the_recorded_pid(tmp_path):
         '_HELPER_FULL="%s"\nVPN_BROWSER_PIDFILE="%s"\n'
         '_end_browser\necho DONE\n'
     ) % (dm, kl, dm, H, H, str(pf))
-    r = _sh(SRC_CONNECT, body)
+    r = _sh(SRC_CONNECT, body, strict=True)
     assert r.returncode == 0, r.stderr
     assert "DONE" in r.stdout
     assert "PGREP_CALLED" not in r.stderr, "must never process-scan (findings 3/8)"
     killed = kl.read_text() if kl.exists() else ""
     assert "11111" in killed, "must reap the recorded helper PID"
     assert not pf.exists(), "pidfile removed after reaping"
+
+
+def test_end_browser_dead_recorded_pid_removes_pidfile_and_is_idempotent(tmp_path):
+    # Strict set -eu: a recorded PID that is NOT alive -> our helper already exited; _end_browser
+    # cleans up (removes the pidfile) and returns 0, never pattern-reaps. The trap-chained 2nd
+    # call reads no pidfile -> a clean no-op.
+    pf = tmp_path / "helper.pid"; pf.write_text("11111\n")
+    kl = tmp_path / "killlog"
+    body = (
+        'kill() { case "$1" in -0) return 1 ;; *) echo "$@" >> "%s" ;; esac; }\n'   # -0: always DEAD
+        'ps() { echo "/x/src/vpn_browser.py" ; }\n'
+        '_HELPER_FULL="/x/src/vpn_browser.py"\nVPN_BROWSER_PIDFILE="%s"\n'
+        '_end_browser\n'          # 1st: dead recorded PID -> cleanup, no signal
+        '_end_browser\n'          # 2nd: pidfile gone -> no-op
+        'echo DONE\n'
+    ) % (str(kl), str(pf))
+    r = _sh(SRC_CONNECT, body, strict=True)
+    assert r.returncode == 0, r.stderr
+    assert "DONE" in r.stdout
+    assert (kl.read_text() if kl.exists() else "") == "", "a dead recorded PID must never be signaled"
+    assert not pf.exists(), "pidfile removed"
 
 
 def test_end_browser_no_pattern_reap_without_recorded_pid(tmp_path):
@@ -1084,7 +1105,7 @@ def test_end_browser_skips_reused_pid_that_fails_argv(tmp_path):
         '_HELPER_FULL="/x/src/vpn_browser.py"\nVPN_BROWSER_PIDFILE="%s"\n'
         '_end_browser\necho DONE\n'
     ) % (str(kl), str(pf))
-    r = _sh(SRC_CONNECT, body)
+    r = _sh(SRC_CONNECT, body, strict=True)
     assert r.returncode == 0, r.stderr
     assert "DONE" in r.stdout
     killed = kl.read_text() if kl.exists() else ""
