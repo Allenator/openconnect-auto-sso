@@ -177,6 +177,13 @@ verify_repo_ancestors() {
 #     instead of being silently blessed; only the exact ./.venv/.lock is exempt so a STOCK repo
 #     still installs (finding 1).
 #
+# LIMITATION: the .venv/bin/* symlink exemption vets the link's location, not its TARGET (e.g.
+# /opt/homebrew/opt/python@3.14/..., group-writable by `admin` on a multi-admin Mac). The
+# interpreter target's safety is the system's Homebrew/OS posture, out of scope for this check:
+# swapping it needs admin-group membership (already ~root -- admins can sudo), a strictly stronger
+# position than this defends against, and vetting the target would false-positive on essentially
+# every Homebrew install (mirrors the ACL LIMITATION on _dir_component_safe).
+#
 # Robustness (findings 2b + 6): find runs in a subshell that `cd "$_p"` FIRST and uses RELATIVE
 # roots + LITERAL `./.venv/bin/*` patterns, so a glob metacharacter or space in $_p can never
 # corrupt a `-path` glob (a bracket in the repo path used to flag the legit python link -> a
