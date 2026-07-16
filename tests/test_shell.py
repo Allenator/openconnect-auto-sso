@@ -717,6 +717,89 @@ def test_verify_repo_interior_refuses_foreign_owned(tmp_path):
     assert r.stdout.strip() == "BAD"
 
 
+# Round-4 findings 1/2/6 rewrite -- the full 9-case matrix. The deep-.pth / clean-python-symlink /
+# src-symlink / foreign-owner cases are covered above; the remaining cases follow.
+def test_verify_repo_interior_accepts_stock_repo_with_uv_lock():
+    # Case 1 (finding 1, DEPLOY-BLOCKER): the REAL repo -- which carries uv's own .venv/.lock at
+    # mode 0666 -- must PASS. A group/other-writable DATA file (not *.py/*.pth/*.sh, not exec) is
+    # no code-exec vector, so it must not block a stock install (the old -perm -0002 arm flagged
+    # .venv/.lock and refused every real install; `chmod go-w` is undone by the next `uv sync`).
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "$OC_PROJ" && echo OK || echo BAD')
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "OK", r.stderr
+
+
+def test_verify_repo_interior_accepts_writable_noncode_data_file(tmp_path):
+    # Case 3: a group/other-writable NON-code data file (name not *.py/*.pth/*.sh, no exec bit)
+    # in an otherwise tight tree must PASS -- the writable-FILE check is scoped to code files
+    # root/agent actually sources or execs (finding 1). A generic name (not .lock) proves it is
+    # the code-file scoping, not a .venv/.lock special-case.
+    proj = os.path.realpath(str(tmp_path / "repo"))
+    os.makedirs(proj + "/.venv/lib")
+    with open(proj + "/.venv/lib/data.lock", "w") as f:
+        f.write("x\n")
+    os.chmod(proj + "/.venv/lib/data.lock", 0o666)      # world-writable, but NOT a code file
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "OK", r.stderr
+
+
+def test_verify_repo_interior_refuses_group_or_other_writable_dir(tmp_path):
+    # Case 4: a group/other-writable DIRECTORY under a code root is refused -- its write bit lets
+    # a non-owner unlink/replace the code inside. All dirs are checked (unlike files, which are
+    # scoped to code files).
+    proj = os.path.realpath(str(tmp_path / "repo"))
+    os.makedirs(proj + "/src/pkg")
+    os.chmod(proj + "/src/pkg", 0o777)                  # world-writable dir
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "BAD"
+    assert proj + "/src/pkg" in r.stderr
+
+
+def test_verify_repo_interior_refuses_symlink_below_venv_bin_direct_child(tmp_path):
+    # Case 8 (finding 2a): the .venv/bin exemption is for DIRECT children only. A symlink nested a
+    # level deeper (.venv/bin/sub/evil) is NOT exempt -- the old `-path "$_p/.venv/bin/*"` fnmatch
+    # `*` crossed `/` and wrongly exempted it. The legit direct-child python link still passes
+    # (present here too); the deeper planted link is refused.
+    proj = os.path.realpath(str(tmp_path / "repo"))
+    os.makedirs(proj + "/.venv/bin/sub")
+    os.symlink("/usr/bin/python3", proj + "/.venv/bin/python")   # legit direct child (exempt)
+    os.symlink("/etc/hosts", proj + "/.venv/bin/sub/evil")       # nested -> NOT exempt
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "BAD"
+    assert proj + "/.venv/bin/sub/evil" in r.stderr
+
+
+def test_verify_repo_interior_metachar_repo_path_passes(tmp_path):
+    # Case 9 (finding 2b): a glob metacharacter in the repo path ([ ] * ?) must NOT break the
+    # symlink exemption. The old `-path "$_p/.venv/bin/*"` spliced $_p into the glob, so a bracket
+    # made the pattern fail to match the legit python link -> it got flagged -> a fail-closed DoS.
+    # The rewrite cd's into $_p and uses a LITERAL relative pattern, so the metachar is harmless.
+    proj = os.path.realpath(str(tmp_path / "re[po]"))
+    os.makedirs(proj + "/.venv/bin")
+    os.makedirs(proj + "/bin")
+    with open(proj + "/bin/openconnect-auto-sso", "w") as f:
+        f.write("#!/bin/sh\n:\n")
+    os.chmod(proj + "/bin/openconnect-auto-sso", 0o755)
+    os.symlink("/usr/bin/python3", proj + "/.venv/bin/python")
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "OK", r.stderr
+
+
+def test_verify_repo_interior_fails_closed_on_missing_roots(tmp_path):
+    # Finding 6: if NONE of the code roots exist, the old find blessed an empty (unvetted) tree.
+    # An interior vet that inspected nothing must FAIL CLOSED (refuse), not pass.
+    proj = os.path.realpath(str(tmp_path / "empty-repo"))
+    os.makedirs(proj)                                   # no bin/lib/src/libexec/.venv
+    r = _sh(SRC_INSTALL, 'verify_repo_interior "%s" && echo OK || echo BAD' % proj)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "BAD"
+    assert "could not fully verify" in r.stderr
+
+
 # --- lib/common.sh: server_hostport + wait_for_server ---------------------------------
 # common.sh is constants + functions with no main body, so it needs NO test seam --
 # sourcing it directly is safe.

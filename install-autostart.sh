@@ -150,35 +150,79 @@ verify_repo_ancestors() {
 # code roots the login agent (as you) or the ROOT vpnc-script wrapper sources/execs/copies must
 # be unsubvertable. root sources lib/common.sh, execs .venv/bin/python + src/dnsroute.py, and
 # COPIES libexec/vpn-teardown to the root-owned NOPASSWD helper; the agent execs the bin/
-# scripts + src/*.py. A group/other-writable, symlinked, or foreign-owned file ANYWHERE under
+# scripts + src/*.py. A group/other-writable, symlinked, or foreign-owned entry ANYWHERE under
 # these is direct code-exec as you (-> passwordless root) or as root -- including a file DEEP
 # under .venv/lib/.../site-packages (a .pth root's python executes), which an enumerated
 # top-level list would miss. The recursive find is self-maintaining: a new src/ file or a deep
-# venv path is covered automatically. Roots absent before install.sh builds .venv are skipped
-# (find errors suppressed). Split out so the harness can exercise the ACCEPTED case too (which
-# can't run the full sudo install path). Returns 0 if clean; prints + returns 1 on the first bad.
+# venv path is covered automatically. Roots absent before install.sh builds .venv are skipped.
+# Split out so the harness can exercise the ACCEPTED case too (which can't run the full sudo
+# install path). Returns 0 if clean; prints + returns 1 on the first bad entry, OR fails CLOSED
+# (refuse) if the tree could not be fully inspected.
 #
-# Predicate: -perm -0020/-0002 = group/other-writable; ! -user 0 ! -user $uid = owned by
-# neither root nor you (a foreign non-root user who could redirect the code). find defaults to
-# -P (no symlink following), so a symlinked start point/component is reported as -type l and
-# rejected -- EXCEPT the legit interpreter links under .venv/bin (they point at the system/
-# Homebrew python; swapping one needs write on .venv/bin, whose own mode the non-symlink arm
-# checks). The whole OR is grouped so -print applies to BOTH arms (a bare `A -o B -print` would
-# bind -print to B only and silently skip the symlink arm). head -n1 -> report the first offender.
+# What is flagged (find is -P, so symlinks are NOT followed):
+#   - a SYMLINK anywhere, EXCEPT a DIRECT child of .venv/bin (the interpreter links uv makes,
+#     pointing at the system/Homebrew python; swapping one needs write on .venv/bin, whose own
+#     dir mode the dir arm below checks). fnmatch `*` crosses `/`, so the exemption is pinned to
+#     DIRECT children via `! -path './.venv/bin/*/*'` -- a planted .venv/bin/sub/evil is NOT
+#     exempt (finding 2a).
+#   - a FOREIGN-owned entry (! -user 0 ! -user $uid = owned by neither root nor you): a foreign
+#     non-root user who could redirect the code.
+#   - a group/other-writable DIR (-perm -0020/-0002): its write bit lets a non-owner unlink or
+#     replace what's inside.
+#   - a group/other-writable FILE, but ONLY a CODE file root/agent actually sources or execs
+#     (exec bit set, or name *.py / *.pth / *.sh). A benign group/other-writable DATA file (uv's
+#     own .venv/.lock, mode 0666, re-created by every `uv sync`) is NOT a code-exec vector --
+#     root/agent never runs it, and a safe parent DIR already stops it being replaced -- so it
+#     must NOT block a STOCK repo (finding 1).
+#
+# Robustness (findings 2b + 6): find runs in a subshell that `cd "$_p"` FIRST and uses RELATIVE
+# roots + LITERAL `./.venv/bin/*` patterns, so a glob metacharacter or space in $_p can never
+# corrupt a `-path` glob (a bracket in the repo path used to flag the legit python link -> a
+# fail-closed DoS). The root list holds only the roots that actually EXIST ([ -d ], word-split-
+# safe via `set --`). If NO root exists, we cannot enter the repo, or find itself errors (an
+# unreadable subtree), we FAIL CLOSED rather than bless a tree we could not inspect -- the old
+# `find ... 2>/dev/null` made an error indistinguishable from "clean". The subshell exit status
+# encodes the outcome: 0 clean, 1 offender found (its ./relative path on stdout), 2/3/4 refuse.
 verify_repo_interior() {
     _p=$1
-    _bad=$(find "$_p/bin" "$_p/lib" "$_p/src" "$_p/libexec" "$_p/.venv" \
-        \( \( -type l ! -path "$_p/.venv/bin/*" \) \
-           -o \( ! -type l \( -perm -0020 -o -perm -0002 \
-                              -o \( ! -user 0 ! -user "${uid:-$(id -u)}" \) \) \) \) \
-        -print 2>/dev/null | head -n1)
-    [ -z "$_bad" ] || {
-        echo "error: $_bad is group/other-writable, a symlink, or owned by another user;" >&2
+    _uid="${uid:-$(id -u)}"
+    _bad=$(
+        cd "$_p" 2>/dev/null || exit 3               # can't enter the repo -> fail closed
+        set --                                        # build the EXISTING-root list, word-split-safe
+        for _r in bin lib src libexec .venv; do
+            [ -d "$_r" ] && set -- "$@" "./$_r"
+        done
+        [ "$#" -gt 0 ] || exit 2                       # no code roots present -> nothing vetted -> refuse
+        # Capture find's OWN output+status (NOT piped to head, so its exit status survives): a
+        # traversal error (unreadable subtree) must fail closed, not read as clean (finding 6).
+        _found=$(find "$@" \
+            \( \
+               \( -type l ! \( -path './.venv/bin/*' ! -path './.venv/bin/*/*' \) \) \
+               -o \( ! -user 0 ! -user "$_uid" \) \
+               -o \( -type d \( -perm -0020 -o -perm -0002 \) \) \
+               -o \( -type f \( -perm -0020 -o -perm -0002 \) \
+                     \( -perm -0100 -o -perm -0010 -o -perm -0001 \
+                        -o -name '*.py' -o -name '*.pth' -o -name '*.sh' \) \) \
+            \) -print 2>/dev/null) || exit 4           # find errored (unreadable subtree) -> fail closed
+        [ -n "$_found" ] || exit 0                      # nothing flagged -> clean
+        printf '%s\n' "$_found" | head -n1              # first offender (relative "./...")
+        exit 1
+    )
+    _rc=$?
+    [ "$_rc" = 0 ] && return 0
+    if [ "$_rc" = 1 ]; then
+        # $_bad is "./<rel>"; strip the leading "." and prepend $_p for an absolute report.
+        echo "error: $_p${_bad#.} is group/other-writable, a symlink, or owned by another user;" >&2
         echo "       refusing to install -- the login agent or root wrapper runs code from it," >&2
         echo "       so a non-owner who can alter it gets code execution as you (passwordless" >&2
         echo "       root) or as root. chmod go-w (and fix ownership) and re-run." >&2
-        return 1
-    }
+    else
+        # 2 = no code roots, 3 = cd failed, 4 = find error / unreadable subtree: fail CLOSED.
+        echo "error: could not fully verify the repo interior under $_p (missing code roots," >&2
+        echo "       an unreadable subtree, or a find error) -- refusing rather than bless a tree" >&2
+        echo "       it could not inspect. Check permissions/ownership under the repo and re-run." >&2
+    fi
+    return 1
 }
 
 do_install() {
