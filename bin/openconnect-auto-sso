@@ -383,6 +383,12 @@ _oc_pid=$!
 # otherwise wedge `wait "$_oc_pid"` below forever. A live helper means a real (possibly slow:
 # password + Duo) login -- NEVER killed (mirrors the browser's own B9 hard-timer suspension). B1.
 (
+    # Ignore SIGPIPE inside the backstop (finding 3, part 2). The `|| true` on the stderr echo
+    # below only catches an EPIPE *return*; with SIGPIPE at its DEFAULT disposition a broken
+    # stderr pipe would KILL this subshell (status 141) BEFORE the kill -TERM that frees a wedged
+    # openconnect -> `wait "$_oc_pid"` then hangs the connect forever. `trap '' PIPE` makes the
+    # write return EPIPE (caught by the `|| true`) instead of signalling, so the kill still fires.
+    trap '' PIPE
     _n=0
     while [ "$_n" -lt "$PHASE1_DEADLINE" ]; do
         [ -e "$_p1_flag" ] || exit 0            # disarmed (Phase 1 finished) -> stand down

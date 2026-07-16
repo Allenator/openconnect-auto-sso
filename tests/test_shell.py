@@ -1559,25 +1559,28 @@ def test_phase1_live_helper_without_pidfile_not_killed(tmp_path):
 
 def test_backstop_survives_failed_stderr_write_and_still_kills(tmp_path):
     # Finding 3: the backstop's `echo "Phase 1 stalled" >&2` sits immediately before the
-    # `kill -TERM` that frees a wedged openconnect, guarded with `|| true`. A FAILED stderr write
-    # (ENOSPC, or EPIPE with SIGPIPE ignored) must NOT, under the subshell's set -e, abort BEFORE
-    # that kill -- else openconnect wedges and `wait` hangs the connect forever. Reproduce it on
-    # the REAL dead-helper flow: run with SIGPIPE IGNORED (so a broken-pipe write returns EPIPE
-    # rather than signalling) and CLOSE the stderr read end once Phase 1 is up, so the backstop's
-    # later stderr write fails. With `|| true` the kill still fires -> `wait` returns -> the script
-    # EXITS; removing the `|| true` makes it hang (this test then times out). Mutation-checked.
-    import signal
+    # `kill -TERM` that frees a wedged openconnect. A broken stderr pipe must NOT abort the
+    # subshell BEFORE that kill -- neither via set -e on an EPIPE return (guarded by `|| true`)
+    # NOR via SIGPIPE at its DEFAULT disposition, which would KILL the subshell (status 141)
+    # before the kill (guarded by `trap '' PIPE` at the top of the subshell). Either way, else
+    # openconnect wedges and `wait` hangs the connect forever. Reproduce it on the REAL dead-helper
+    # flow with SIGPIPE at DEFAULT -- no preexec_fn, so subprocess's restore_signals resets SIGPIPE
+    # to SIG_DFL in the child (the round-4 test SIG_IGN'd it and so only exercised the EPIPE-return
+    # half). CLOSE the stderr read end once Phase 1 is up so the backstop's later stderr write hits
+    # the broken pipe. With `trap '' PIPE` the write returns EPIPE, `|| true` swallows it, and the
+    # kill still fires -> `wait` returns -> the script EXITS; removing `trap '' PIPE` lets SIGPIPE
+    # kill the subshell before the kill and the connect hangs (this test then times out).
+    # Mutation-checked.
     env, m = _stub_connect_env(tmp_path)
     env["STUB_MODE"] = "dead"
     env["PHASE1_DEADLINE"] = "3"
     proc = subprocess.Popen(
         [CONNECT], stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
-        env=env, text=True,
-        preexec_fn=lambda: signal.signal(signal.SIGPIPE, signal.SIG_IGN))
+        env=env, text=True)
     try:
         # Read stderr until Phase 1 is authenticating, THEN break the stderr pipe (close our read
-        # end) so the backstop's later `echo >&2` fails with EPIPE (SIGPIPE ignored -> a return
-        # code, not a fatal signal -- exactly the ENOSPC/EPIPE class finding 3 guards against).
+        # end) so the backstop's later `echo >&2` hits a broken pipe -> SIGPIPE at DEFAULT (which
+        # `trap '' PIPE` must convert to an EPIPE return so the kill below still runs).
         end = time.time() + 10
         seen = False
         while time.time() < end:
@@ -1588,8 +1591,8 @@ def test_backstop_survives_failed_stderr_write_and_still_kills(tmp_path):
                 seen = True
                 break
         assert seen, "never reached Phase 1"
-        proc.stderr.close()                     # break the pipe -> backstop's stderr write EPIPEs
-        proc.wait(timeout=15)                   # with `|| true` the kill still runs -> script exits
+        proc.stderr.close()                     # break the pipe -> backstop's stderr write SIGPIPEs
+        proc.wait(timeout=15)                   # with `trap '' PIPE` the kill still runs -> script exits
     finally:
         if proc.poll() is None:
             proc.kill()
