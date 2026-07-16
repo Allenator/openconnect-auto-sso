@@ -140,15 +140,22 @@ do_install() {
     verify_repo_ancestors "$proj" || exit 1
     # $proj is now vetted, so its INTERIOR only needs each component's OWN mode checked (a safe
     # $proj prevents these being unlinked/replaced). Vet every dir + file the agent or the root
-    # wrapper sources/execs -- root sources lib/common.sh and execs .venv/bin/python +
-    # src/dnsroute.py; the agent execs the bin/ scripts + src/*.py. A group/other-writable,
-    # symlinked, or foreign-owned one of these is direct code-exec as you (-> passwordless root)
-    # or as root. .venv may not exist yet (install.sh builds it); skip whatever is absent. (We
-    # vet .venv/bin rather than the python symlink inside it, which legitimately points at the
-    # system/Homebrew interpreter -- swapping that symlink needs write on .venv/bin.)
-    for _c in bin lib src .venv .venv/bin \
+    # wrapper sources/execs -- root sources lib/common.sh, execs .venv/bin/python + src/dnsroute.py,
+    # and COPIES libexec/vpn-teardown to the root-owned NOPASSWD helper; the agent execs the bin/
+    # scripts + src/*.py. A group/other-writable, symlinked, or foreign-owned one of these is
+    # direct code-exec as you (-> passwordless root) or as root. .venv may not exist yet (install.sh
+    # builds it); skip whatever is absent. (We vet .venv/bin rather than the python symlink inside
+    # it, which legitimately points at the system/Homebrew interpreter -- swapping that symlink
+    # needs write on .venv/bin.)
+    #
+    # NOTE (step-3 follow-up): this is an ENUMERATED list; it checks each named dir's OWN mode but
+    # NOT its whole subtree -- e.g. a group-writable file DEEP under .venv/lib/.../site-packages
+    # (a .pth that root's python executes) would pass. A recursive walk of the code roots is the
+    # self-maintaining fix and is planned; this list closes the concrete high-value paths.
+    for _c in bin lib src libexec .venv .venv/bin .venv/lib \
               bin/openconnect-auto-sso bin/vpnc-slice bin/vpn-browser \
-              lib/common.sh src/dnsroute.py src/vpn_browser.py src/loadconfig.py; do
+              lib/common.sh src/dnsroute.py src/vpn_browser.py src/loadconfig.py \
+              libexec/vpn-teardown; do
         [ -e "$proj/$_c" ] || continue
         dir_ok_for_repo "$proj/$_c" && continue
         echo "error: $proj/$_c is group/other-writable, a symlink, or owned by another user;" >&2

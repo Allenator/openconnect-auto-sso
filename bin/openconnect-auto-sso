@@ -87,9 +87,15 @@ _build_vs() {
 # metachar-free literal ($1) to get candidates, then confirm each one's FULL argv with
 # `grep -qF -- $2` (fixed string). Robust to any path -- no path restriction needed.
 _pids_matching() {   # $1 = metachar-free pgrep -f substring; $2 = fixed full string to confirm
+    # The OUTPUT is the result, never the exit status. The trailing `|| true` is REQUIRED (a
+    # following `return 0` does NOT suffice): the pipeline's status is the LAST candidate's
+    # `grep -qF` (1 when that candidate isn't ours), and under `set -e` that aborts AT the
+    # pipeline -- before any later statement runs -- which silently killed a
+    # `_x=$(_pids_matching ...)` caller: a successful connect died before Phase 2, and the
+    # backstop self-disabled. (The test harness masked it by running bodies under `set +eu`.)
     pgrep -f "$1" 2>/dev/null | while read -r _p; do
         ps -p "$_p" -o command= 2>/dev/null | grep -qF -- "$2" && printf '%s\n' "$_p"
-    done
+    done || true
 }
 
 # Full argv fragments that identify OUR SSO helper and OUR Phase-1 openconnect (confirmed
@@ -104,7 +110,7 @@ _alive_pids() {
     for _q in $1; do
         kill -0 "$_q" 2>/dev/null || continue
         ps -p "$_q" -o command= 2>/dev/null | grep -qF -- "$_HELPER_FULL" && printf '%s ' "$_q"
-    done
+    done || true   # OUTPUT is the result; `|| true` stops the loop's last status aborting a set -e caller
 }
 
 # End the SSO browser helper: SIGTERM it and WAIT for it to exit, rather than a

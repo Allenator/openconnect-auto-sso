@@ -35,12 +35,20 @@ SRC_CONNECT = 'export OC_CONNECT_TEST=1; . "%s"' % CONNECT
 TEARDOWN = os.path.join(REPO, "libexec", "vpn-teardown")
 
 
-def _sh(setup_source, body, extra_env=None):
-    """Source `setup_source`, relax set -eu, then run `body`; return CompletedProcess."""
+def _sh(setup_source, body, extra_env=None, strict=False):
+    """Source `setup_source`, then run `body`; return CompletedProcess.
+
+    By default the body runs with `set +eu` (relaxed) so tests can use unguarded constructs.
+    Pass strict=True to run the body under the sourced script's OWN `set -eu` -- REQUIRED to
+    catch errexit regressions (a function that leaks a non-zero status and aborts a
+    `_x=$(...)` caller). The relaxed default MASKS that class -- it is exactly what hid the
+    `_pids_matching` set -e abort (finding 1) through two review rounds.
+    """
     env = dict(os.environ, OC_PROJ=REPO)
     if extra_env:
         env.update(extra_env)
-    script = "%s\nset +eu\n%s\n" % (setup_source, body)
+    relax = "" if strict else "set +eu\n"
+    script = "%s\n%s%s\n" % (setup_source, relax, body)
     # timeout so a loop-termination regression (e.g. a wait_for_server that never gives up)
     # FAILS the test instead of hanging the whole run forever.
     return subprocess.run(["sh", "-c", script], capture_output=True, text=True, env=env,
@@ -550,6 +558,26 @@ def test_do_install_refuses_group_or_other_writable_interior_dir(tmp_path):
     assert rp + "/lib" in r.stderr
 
 
+def test_do_install_refuses_group_or_other_writable_libexec(tmp_path):
+    # Finding 2: $proj/libexec/vpn-teardown is `sudo install`ed root-owned and NOPASSWD-granted,
+    # so a group/other-writable libexec (where an attacker could swap the teardown SOURCE before
+    # install copies it to root) must be refused -- it was missing from the interior vet list.
+    proj = tmp_path / "repo"
+    (proj / "bin").mkdir(parents=True)
+    (proj / "libexec").mkdir()
+    (proj / "libexec" / "vpn-teardown").write_text("#!/bin/sh\n:\n")
+    connect = proj / "bin" / "openconnect-auto-sso"
+    connect.write_text("#!/bin/sh\n:\n"); connect.chmod(0o755)
+    proj.chmod(0o755); (proj / "bin").chmod(0o755)
+    (proj / "libexec").chmod(0o777)                      # libexec world-writable
+    rp = os.path.realpath(str(proj))
+    body = ('proj="%s"\nconnect="%s/bin/openconnect-auto-sso"\ndo_install\n') % (rp, rp)
+    r = _sh(SRC_INSTALL, body)
+    assert r.returncode != 0
+    assert "runs code from it" in r.stderr
+    assert rp + "/libexec" in r.stderr
+
+
 # --- lib/common.sh: server_hostport + wait_for_server ---------------------------------
 # common.sh is constants + functions with no main body, so it needs NO test seam --
 # sourcing it directly is safe.
@@ -860,6 +888,38 @@ def test_end_browser_falls_back_to_pattern_when_no_recorded_pid(tmp_path):
     assert r.returncode == 0, r.stderr
     killed = kl.read_text() if kl.exists() else ""
     assert "33333" in killed, "fallback pattern reap should still kill the crashed-early helper"
+
+
+def test_pids_matching_no_set_e_abort_when_last_candidate_not_ours():
+    # Finding 1 regression, under STRICT set -eu (the relaxed default masks it): _pids_matching
+    # must exit 0 even when pgrep's LAST candidate fails the argv confirm, or the bare assignment
+    # `_hp=$(_pids_matching ...)` aborts the caller -- which silently killed a successful connect
+    # before Phase 2 and disabled the backstop.
+    body = (
+        'pgrep() { echo 99999; }\n'                              # one candidate...
+        'ps() { echo "/usr/bin/vim /other/vpn_browser.py"; }\n'  # ...whose argv is NOT ours
+        '_hp=$(_pids_matching vpn_browser "/x/src/vpn_browser.py")\n'
+        'echo "REACHED hp=[$_hp]"\n'
+    )
+    r = _sh(SRC_CONNECT, body, strict=True)
+    assert r.returncode == 0, r.stderr
+    assert "REACHED hp=[]" in r.stdout          # no abort, and no false-positive PID
+
+
+def test_end_browser_no_set_e_abort_on_unconfirmed_candidate():
+    # Finding 1 regression, end to end under strict set -eu: _end_browser's fallback branch
+    # (`_hp=$(_pids_matching ...)`) must not abort when pgrep returns a non-ours candidate.
+    body = (
+        'VPN_BROWSER_PIDFILE="/nonexistent/helper.pid"\n'         # no recorded PID -> fallback
+        '_HELPER_FULL="/x/src/vpn_browser.py"\n'
+        'pgrep() { echo 99999; }\n'
+        'ps() { echo "/usr/bin/vim /other/vpn_browser.py"; }\n'   # not ours -> nothing to reap
+        'kill() { :; }\n'
+        '_end_browser\necho DONE\n'
+    )
+    r = _sh(SRC_CONNECT, body, strict=True)
+    assert r.returncode == 0, r.stderr
+    assert "DONE" in r.stdout
 
 
 def test_connect_build_vs_full_includes_flags_and_quotes():
