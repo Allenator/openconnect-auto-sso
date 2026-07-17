@@ -870,6 +870,51 @@ def test_verify_repo_interior_fails_closed_on_missing_roots(tmp_path):
     assert "could not fully verify" in r.stderr
 
 
+# --- install-autostart: load_agent verify-and-retry (guards against a false "loaded") ---
+_STUB_LAUNCHCTL = '''#!/bin/sh
+# Stub launchctl: `bootstrap` fails with EIO until its SUCCEED_AT-th call, then "loads";
+# `print` reports loaded only after a bootstrap has succeeded since the last bootout. Models
+# the transient the real installer hit (Load failed: 5) so the retry+verify path is exercised.
+d=$STUB_DIR
+case $1 in
+  bootout)   rm -f "$d/loaded"; exit 0 ;;
+  bootstrap) n=$(cat "$d/n" 2>/dev/null || echo 0); n=$((n + 1)); printf %s "$n" > "$d/n"
+             if [ "$n" -ge "${SUCCEED_AT:-1}" ]; then : > "$d/loaded"; exit 0; fi
+             echo "Load failed: 5: Input/output error" >&2; exit 5 ;;
+  load)      echo "load -w unsupported" >&2; exit 1 ;;
+  print)     [ -f "$d/loaded" ] && exit 0 || exit 1 ;;
+  *)         exit 0 ;;
+esac
+'''
+
+
+def _stub_launchctl(tmp_path, succeed_at):
+    stub = tmp_path / "launchctl"
+    stub.write_text(_STUB_LAUNCHCTL)
+    stub.chmod(0o755)
+    (tmp_path / "lc-state").mkdir()
+    return {"LAUNCHCTL": str(stub), "STUB_DIR": str(tmp_path / "lc-state"),
+            "SUCCEED_AT": str(succeed_at), "LOAD_RETRY_SLEEP": "0"}
+
+
+def test_load_agent_retries_then_confirms_loaded(tmp_path):
+    # The real installer hit a transient EIO on bootstrap, then printed ">> loaded" without
+    # checking -- leaving the agent unloaded. load_agent must RETRY and return 0 only once
+    # `launchctl print` confirms the label loaded. Stub succeeds on the 2nd bootstrap.
+    env = _stub_launchctl(tmp_path, succeed_at=2)
+    r = _sh(SRC_INSTALL, 'load_agent; echo "rc=$?"', extra_env=env)
+    assert "rc=0" in r.stdout, r.stdout + r.stderr
+    assert int((tmp_path / "lc-state" / "n").read_text()) >= 2   # actually retried
+
+
+def test_load_agent_fails_closed_when_load_never_takes(tmp_path):
+    # If the load never takes (print never confirms), load_agent must return non-zero so
+    # do_install reports an honest error instead of a false ">> loaded".
+    env = _stub_launchctl(tmp_path, succeed_at=999)
+    r = _sh(SRC_INSTALL, 'load_agent; echo "rc=$?"', extra_env=env)
+    assert "rc=1" in r.stdout, r.stdout + r.stderr
+
+
 # --- lib/common.sh: server_hostport + wait_for_server ---------------------------------
 # common.sh is constants + functions with no main body, so it needs NO test seam --
 # sourcing it directly is safe.

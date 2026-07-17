@@ -231,6 +231,28 @@ verify_repo_interior() {
     return 1
 }
 
+# Load (or reload) the LaunchAgent, VERIFYING it actually took rather than trusting the
+# loader's exit status. A `bootout` immediately followed by a `bootstrap` can transiently
+# fail with EIO (errno 5, "Input/output error") while the old job drains -- and some
+# launchctl builds print that yet still exit 0 -- so retry with a short backoff and CONFIRM
+# with `launchctl print`. `load -w` stays as a fallback for older launchctl. Returns 0 once
+# the label is confirmed loaded, else 1. $LAUNCHCTL / $LOAD_RETRY_SLEEP are honored only
+# under the OC_INSTALL_TEST seam; a real install always uses the real launchctl.
+load_agent() {
+    _lc=launchctl; _slp=1
+    if [ "${OC_INSTALL_TEST:-}" = 1 ]; then _lc=${LAUNCHCTL:-launchctl}; _slp=${LOAD_RETRY_SLEEP:-1}; fi
+    _i=0
+    while [ "$_i" -lt 5 ]; do
+        "$_lc" bootout "gui/$uid/$label" 2>/dev/null || true
+        "$_lc" bootstrap "gui/$uid" "$plist" 2>/dev/null \
+            || "$_lc" load -w "$plist" 2>/dev/null || true
+        "$_lc" print "gui/$uid/$label" >/dev/null 2>&1 && return 0
+        _i=$((_i + 1))
+        sleep "$_slp"
+    done
+    return 1
+}
+
 do_install() {
     [ -x "$connect" ] || { echo "error: $connect not found/executable" >&2; exit 1; }
     # The LaunchAgent runs $connect as YOU on every login, and $connect reaches root via the
@@ -387,13 +409,22 @@ PLIST
     install -m 0644 "$ptmp" "$plist"; _did_plist=y
     echo "   $plist"
 
-    launchctl bootout "gui/$uid/$label" 2>/dev/null || true
-    if ! launchctl bootstrap "gui/$uid" "$plist" 2>/dev/null; then
-        launchctl load -w "$plist"    # fallback for older launchctl
+    rm -f "$ptmp" 2>/dev/null || true
+
+    if ! load_agent; then
+        # Files installed correctly; only the runtime load failed (usually a transient
+        # EIO). KEEP them -- rolling back would drop the sudoers rule the user just entered
+        # a password for -- and tell them how to finish the load.
+        trap - EXIT
+        echo "error: installed the files, but launchd would not load the agent after" >&2
+        echo "       several tries (a transient 'Input/output error' is the usual cause)." >&2
+        echo "       Finish the load, then check status:" >&2
+        echo "         launchctl bootout gui/$uid/$label 2>/dev/null; launchctl bootstrap gui/$uid \"$plist\"" >&2
+        echo "         ./install-autostart.sh status" >&2
+        exit 1
     fi
 
-    trap - EXIT           # success: disarm rollback
-    rm -f "$ptmp" 2>/dev/null || true
+    trap - EXIT           # success: disarm the partial-install rollback
     if [ "$keepalive" = true ]; then
         echo ">> loaded. Connects now and at every login; reconnects on drop."
     else
