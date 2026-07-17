@@ -484,8 +484,8 @@ set -- --cookie-on-stdin --servercert "$FINGERPRINT"
 [ -n "$RESOLVE" ] && set -- "$@" --resolve "$RESOLVE"
 [ -n "$PROTOCOL" ] && set -- "$@" --protocol="$PROTOCOL"
 # Budget for openconnect's own in-process reconnect; sized by launch mode ($OC_LAUNCHD, via
-# apply_launch_budget above). lib/common.sh owns the rationale (why a sleep needs a FRESH
-# connect, not a reconnect).
+# apply_launch_budget above). lib/common.sh owns the rationale (what this budget can and cannot
+# shorten, and why it is sized by "will anything respawn me").
 set -- "$@" --reconnect-timeout="$RECONNECT_TIMEOUT"
 if [ -n "$SPLIT_ROUTES$PROXY_NAMES" ] || [ "$ROUTE_INTERNAL" = "1" ] || [ "$ROUTE_SPLITS" = "1" ]; then
     # root's PATH usually excludes Homebrew, so resolve vpn-slice to an abs path.

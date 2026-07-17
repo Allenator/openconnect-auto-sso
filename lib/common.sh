@@ -40,15 +40,27 @@ pid_argv_has() {
 # These values are ONE design, so they are owned here rather than scattered. They serve
 # TWO INDEPENDENT concerns, and OC_LAUNCHD ("keepalive" | "once" | unset) drives BOTH:
 #
-# (1) Respawn budget -> RECONNECT_TIMEOUT. openconnect's in-process reconnect CANNOT
-# survive a macOS sleep -- on wake its socket is still bound to local addresses that no
-# longer exist, so every retry fails ("Can't assign requested address") until the budget
-# expires. A FRESH openconnect connects fine. So we give up FAST (30s) and let a fresh
-# connect happen ONLY when something will respawn us -- that is `keepalive` (launchd's
-# KeepAlive restarts the connect script on exit). With `--once` (KeepAlive=false) and
-# interactively NOTHING respawns us, so we KEEP openconnect's own long budget (300s): a
-# short give-up there would kill a tunnel that a >30s blip should have ridden out, with no
-# restart to recover it. The deciding bit here is "will I be respawned", NOT "am I at login".
+# (1) Respawn budget -> RECONNECT_TIMEOUT. What defeats openconnect's in-process reconnect is
+# the LOCAL ADDRESS going away -- waking on a DIFFERENT network, or an outage long enough to
+# drop it: every retry then fails ("Can't assign requested address") until the budget expires,
+# and only a FRESH openconnect recovers. When the address survives -- as it does across an
+# ordinary same-network sleep, since macOS generally holds the interface's lease -- the
+# in-process reconnect simply works and this budget is never spent. (It is NOT true that a
+# macOS sleep defeats the reconnect; a 92s sleep resumes in place. Address loss defeats it.)
+#
+# TWO CLOCKS, easy to conflate: openconnect declares the peer dead 2*dpd after the last packet
+# RECEIVED (mainloop.c: overdue = last_rx + 2*dpd), and that packet can already be dpd old when
+# the drop lands -- so detection takes dpd..2*dpd (30-60s at the usual server-pushed dpd=30).
+# ONLY THEN does it start spending RECONNECT_TIMEOUT. So this value cannot shorten that first
+# 30-60s; it only decides how long we keep retrying afterwards. Giving up is the sum: 60-90s at
+# 30, or 330-360s at 300.
+#
+# We give up FAST (30s) and take a fresh connect ONLY when something will respawn us -- that is
+# `keepalive` (launchd's KeepAlive restarts the connect script on exit). With `--once`
+# (KeepAlive=false) and interactively NOTHING respawns us, so we KEEP openconnect's own long
+# budget (300s): a short give-up there would kill a tunnel that a 60-90s blip should have ridden
+# out, with no restart to recover it. The deciding bit here is "will I be respawned", NOT "am I
+# at login".
 #
 # (2) Boot network-wait -> NET_WAIT_MAX. Before connecting we wait for the server to become
 # REACHABLE instead of exiting into launchd's throttle. BOTH at-login modes (`once` AND
