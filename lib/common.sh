@@ -45,8 +45,8 @@ pid_argv_has() {
 # drop it: every retry then fails ("Can't assign requested address") until the budget expires,
 # and only a FRESH openconnect recovers. When the address survives -- as it does across an
 # ordinary same-network sleep, since macOS generally holds the interface's lease -- the
-# in-process reconnect simply works and this budget is never spent. (It is NOT true that a
-# macOS sleep defeats the reconnect; a 92s sleep resumes in place. Address loss defeats it.)
+# in-process reconnect simply works and this budget is never spent. Sleep itself is NOT what
+# defeats it; address loss is.
 #
 # TWO CLOCKS, easy to conflate: openconnect declares the peer dead 2*dpd after the last packet
 # RECEIVED (mainloop.c: overdue = last_rx + 2*dpd), and that packet can already be dpd old when

@@ -11,6 +11,7 @@ signal real PIDs).
 macOS-only: the scripts use BSD `stat -f`, /etc/resolver, and utun conventions.
 """
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -1543,7 +1544,9 @@ def _stub_connect_env(tmp_path, extra_cfg=""):
         "  *' --authenticate '*)\n"
         "    touch \"$OC_ALIVE\"\n"
         "    case \"${STUB_MODE:-normal}\" in\n"
-        "      normal)\n"
+        # phase2hold behaves exactly like normal HERE (Phase 1 must complete for Phase 2 to run
+        # at all); it only diverges in the --cookie-on-stdin branch below.
+        "      normal|phase2hold)\n"
         "        sh \"$STUB_HELPER\" \"$HELPER_MARKER\" short >/dev/null 2>&1 &\n"
         "        sleep 0.5\n"
         "        printf 'COOKIE=abc123\\nHOST=test.example\\n"
@@ -1581,6 +1584,16 @@ def _stub_connect_env(tmp_path, extra_cfg=""):
         "  *' --cookie-on-stdin '*)\n"
         "    cat >/dev/null 2>&1 || true\n"
         "    printf '%s\\n' \"$*\" > \"$PHASE2_MARKER\"\n"
+        # phase2hold: stay up like a REAL tunnel, so a signal test can observe whether we were
+        # reaped (the TERM trap at the top rm's $OC_ALIVE -- that absence IS the observation).
+        # Every other mode keeps the old fire-and-exit behavior. Bounded (~5 min), like `long`
+        # and `dead` above, so a hard test abort can't leak a spinner.
+        "    case \"${STUB_MODE:-normal}\" in\n"
+        "      phase2hold)\n"
+        "        touch \"$OC_ALIVE\"\n"
+        "        _n=0; while [ \"$_n\" -lt 300 ]; do sleep 1; _n=$((_n + 1)); done\n"
+        "        rm -f \"$OC_ALIVE\"; exit 0 ;;\n"
+        "    esac\n"
         "    exit 0 ;;\n"
         "esac\n")
     oc.chmod(0o755)
@@ -1660,6 +1673,50 @@ def test_phase1_sigterm_kills_openconnect_and_helper(tmp_path):
     assert proc.returncode == 130, "TERM trap should exit 130"
     assert _wait_gone(m["oc_alive"]), "openconnect left alive after SIGTERM (launchd orphan)"
     assert _wait_gone(m["helper_alive"]), "helper left alive after SIGTERM"
+
+
+def test_phase2_sigterm_to_process_group_reaps_openconnect(tmp_path):
+    # The contract Phase 2 leans on, and the one nothing covered: what stops the tunnel is
+    # PROCESS-GROUP delivery. launchd signals the whole job (and a terminal's Ctrl-C the foreground
+    # group), so the root openconnect gets the signal ITSELF and disconnects cleanly; the script's
+    # trap only runs once the pipeline returns, to give the 143 the EXIT trap turns into cleanup.
+    #
+    # Contrast Phase 1 above, which reaps openconnect on a SCRIPT-ONLY SIGTERM: it backgrounds
+    # openconnect and `wait`s, and `wait` is interruptible. Phase 2 blocks in a foreground pipeline,
+    # where sh defers a trap until the command finishes -- so a script-only signal is deferred with
+    # nothing to release it. That limitation is documented at the trap and deliberately NOT pinned
+    # here: asserting it would block the eventual fix.
+    env, m = _stub_connect_env(tmp_path)
+    env["STUB_MODE"] = "phase2hold"   # Phase 1 as normal, then Phase-2 openconnect stays up
+    env["PHASE1_DEADLINE"] = "30"
+
+    # start_new_session: the script leads its OWN group, so killpg hits only the test's processes
+    # (never the pytest runner) and models launchd/Ctrl-C group delivery faithfully.
+    proc = subprocess.Popen([CONNECT], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, env=env, text=True, start_new_session=True)
+    try:
+        # Wait on the PHASE-2 marker, not oc_alive: the shared stub touches OC_ALIVE in its
+        # --authenticate branch too, so waiting on that alone signals during PHASE 1 and exercises
+        # the wrong trap (it exits 130, not 143). Require phase2 first, THEN oc_alive.
+        end = time.time() + 25
+        while time.time() < end and not (m["phase2"].exists() and m["oc_alive"].exists()):
+            time.sleep(0.05)
+        assert m["phase2"].exists(), "Phase 2 never ran"
+        assert m["oc_alive"].exists(), "Phase-2 openconnect never came up"
+        # Guarded like the finally's copy: if the script died early (a regression), getpgid would
+        # raise and report a traceback instead of the assertion that names the real problem.
+        assert proc.poll() is None, "the script exited before Phase 2 could be signalled"
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        proc.wait(timeout=15)
+    finally:
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+            proc.kill()
+    assert _wait_gone(m["oc_alive"]), "openconnect survived a group SIGTERM -> tunnel would strand"
+    assert proc.returncode == 143, "the Phase-2 trap should exit 143 once the pipeline returns"
 
 
 def test_phase1_slow_live_helper_not_killed_at_deadline(tmp_path):
