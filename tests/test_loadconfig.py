@@ -20,8 +20,8 @@ LOADCONFIG_PY = os.path.join(os.path.dirname(__file__), "..", "src", "loadconfig
 # --- classify_via_vpn --------------------------------------------------------
 def test_bare_names_go_to_proxy_names():
     proxy, splits, internal, spl = loadconfig.classify_via_vpn(
-        ["yale.edu", "ood-grace.ycrc.yale.edu"])
-    assert proxy == ["yale.edu", "ood-grace.ycrc.yale.edu"]
+        ["corp.example.com", "host.corp.example.com"])
+    assert proxy == ["corp.example.com", "host.corp.example.com"]
     assert splits == []
     assert internal is False
     assert spl is False
@@ -50,8 +50,8 @@ def test_internal_and_splits_tokens_set_flags():
 
 
 def test_trailing_dot_fqdn_is_stripped():
-    proxy, _, _, _ = loadconfig.classify_via_vpn(["yale.edu."])
-    assert proxy == ["yale.edu"]
+    proxy, _, _, _ = loadconfig.classify_via_vpn(["corp.example.com."])
+    assert proxy == ["corp.example.com"]
 
 
 def test_underscore_labels_accepted():
@@ -60,8 +60,8 @@ def test_underscore_labels_accepted():
 
 
 def test_string_is_treated_as_single_entry():
-    proxy, _, _, _ = loadconfig.classify_via_vpn("yale.edu")
-    assert proxy == ["yale.edu"]
+    proxy, _, _, _ = loadconfig.classify_via_vpn("corp.example.com")
+    assert proxy == ["corp.example.com"]
 
 
 def test_unknown_token_rejected():
@@ -87,7 +87,7 @@ def test_bad_percent_exclude_rejected():
 
 
 # --- validators --------------------------------------------------------------
-@pytest.mark.parametrize("good", ["a.b.c", "yale.edu", "_dmarc.example.com", "x-1.corp"])
+@pytest.mark.parametrize("good", ["a.b.c", "corp.example.com", "_dmarc.example.com", "x-1.corp"])
 def test_is_hostname_accepts(good):
     assert loadconfig.is_hostname(good)
 
@@ -121,22 +121,22 @@ def _run_cli(toml_text):
 
 def test_valid_config_emits_expected_vars():
     r = _run_cli(
-        'server = "access.yale.edu"\n'
-        'via_vpn = ["yale.edu", "%100.64.0.0/10", "@internal"]\n'
+        'server = "vpn.example.com"\n'
+        'via_vpn = ["corp.example.com", "%100.64.0.0/10", "@internal"]\n'
         'allow_incoming = true\n'
     )
     assert r.returncode == 0, r.stderr
     out = dict(line.split("=", 1) for line in r.stdout.splitlines())
-    assert out["SERVER"] == "access.yale.edu"
+    assert out["SERVER"] == "vpn.example.com"
     assert out["ALLOW_INCOMING"] == "1"
-    assert out["PROXY_NAMES"] == "yale.edu"
+    assert out["PROXY_NAMES"] == "corp.example.com"
     assert out["SPLIT_ROUTES"] == "%100.64.0.0/10"   # shlex-safe, emitted bare
     assert out["ROUTE_INTERNAL"] == "1"
     assert out["ROUTE_SPLITS"] == "0"
 
 
 def test_missing_server_fails():
-    r = _run_cli('via_vpn = ["yale.edu"]\n')
+    r = _run_cli('via_vpn = ["corp.example.com"]\n')
     assert r.returncode == 1
     assert "server" in r.stderr
 
