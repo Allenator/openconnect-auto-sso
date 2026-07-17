@@ -164,7 +164,7 @@ verify_repo_ancestors() {
 #     pointing at the system/Homebrew python; swapping one needs write on .venv/bin, whose own
 #     dir mode the writable arm below catches). fnmatch `*` crosses `/`, so the exemption is
 #     pinned to DIRECT children via `! -path './.venv/bin/*/*'` -- a planted .venv/bin/sub/evil
-#     is NOT exempt (finding 2a).
+#     is NOT exempt.
 #   - a FOREIGN-owned entry (! -user 0 ! -user $uid = owned by neither root nor you): a foreign
 #     non-root user who could redirect the code.
 #   - ANY group/other-writable entry (-perm -0020/-0002), file OR dir, EXCEPT the one known-benign
@@ -175,7 +175,7 @@ verify_repo_ancestors() {
 #     name. Flagging EVERY writable entry (a writable DIR also lets a non-owner unlink/replace
 #     what's inside) means the next unknown writable format fails CLOSED with a clear message
 #     instead of being silently blessed; only the exact ./.venv/.lock is exempt so a STOCK repo
-#     still installs (finding 1).
+#     still installs.
 #
 # LIMITATION: the .venv/bin/* symlink exemption vets the link's location, not its TARGET (e.g.
 # /opt/homebrew/opt/python@3.14/..., group-writable by `admin` on a multi-admin Mac). The
@@ -203,7 +203,7 @@ verify_repo_interior() {
         done
         [ "$#" -gt 0 ] || exit 2                       # no code roots present -> nothing vetted -> refuse
         # Capture find's OWN output+status (NOT piped to head, so its exit status survives): a
-        # traversal error (unreadable subtree) must fail closed, not read as clean (finding 6).
+        # traversal error (unreadable subtree) must fail closed, not read as clean.
         _found=$(find "$@" \
             \( \
                \( -type l ! \( -path './.venv/bin/*' ! -path './.venv/bin/*/*' \) \) \

@@ -42,7 +42,7 @@ def _sh(setup_source, body, extra_env=None, strict=False):
     Pass strict=True to run the body under the sourced script's OWN `set -eu` -- REQUIRED to
     catch errexit regressions (a function that leaks a non-zero status and aborts a
     `_x=$(...)` caller). The relaxed default MASKS that class -- it is exactly what hid the
-    `_pids_matching` set -e abort (finding 1) through two review rounds.
+    `_pids_matching` set -e abort through two review rounds.
     """
     env = dict(os.environ, OC_PROJ=REPO)
     if extra_env:
@@ -159,7 +159,7 @@ def test_is_dnsroute_matches_real_dnsroute_not_others():
 
 
 def test_is_dnsroute_rejects_arbitrary_dnsroute_py_command():
-    # Finding 8: the matcher keys on the FULL "$PROJ/src/dnsroute.py" argv, not a bare
+    # the matcher keys on the FULL "$PROJ/src/dnsroute.py" argv, not a bare
     # "dnsroute.py" substring -- else an unrelated process merely mentioning "dnsroute.py"
     # would be signalled as root. Spawn a decoy whose argv contains "dnsroute.py" but NOT
     # our real path, and confirm _is_dnsroute rejects it (the old substring match accepted it).
@@ -265,7 +265,7 @@ def test_may_touch_proxy_true_for_reused_non_openconnect_owner(tmp_path):
 
 
 def test_may_touch_proxy_true_for_openconnect_lookalike_owner(tmp_path):
-    # Finding 6: a reused owner PID belonging to an "openconnect-sso" / "openconnect-gui"
+    # a reused owner PID belonging to an "openconnect-sso" / "openconnect-gui"
     # process -- whose comm CONTAINS the substring "openconnect" but is NOT openconnect (this
     # user runs openconnect-sso) -- must read as reclaimable. The old `grep -q openconnect`
     # substring match wrongly LEFT it; the basename-exact compare correctly TOUCHes it.
@@ -281,7 +281,7 @@ def test_may_touch_proxy_true_for_openconnect_lookalike_owner(tmp_path):
 
 # --- vpnc-slice: failed-bind path is ownership-gated (findings 2 + 14) -----------------
 def test_failed_bind_leaves_a_live_winners_state_intact(tmp_path):
-    # Finding 14: when our dnsroute fails to bind because a live DIFFERENT tunnel holds the
+    # when our dnsroute fails to bind because a live DIFFERENT tunnel holds the
     # port, WARN ONLY -- never rm the pidfile or sweep the winner's /etc/resolver files. Make
     # _may_touch_proxy see a LIVE different owner by stubbing `ps` so the recorded owner (55555)
     # reads as an openconnect; stub `nohup` so dnsroute never starts (failed-bind branch).
@@ -310,7 +310,7 @@ def test_failed_bind_leaves_a_live_winners_state_intact(tmp_path):
 
 
 def test_failed_bind_sweeps_our_own_dead_port_files(tmp_path):
-    # Finding 2: on OUR OWN failed rebind (recorded owner == our VPNPID, or a dead/absent
+    # on OUR OWN failed rebind (recorded owner == our VPNPID, or a dead/absent
     # owner), the failed-bind path MUST clear our now-dead-port pidfile + resolver files so
     # routed domains degrade to default DNS instead of black-holing at a port nothing binds.
     resolv = tmp_path / "resolver"
@@ -336,9 +336,9 @@ def test_failed_bind_sweeps_our_own_dead_port_files(tmp_path):
     assert not (resolv / "mine.corp").exists(), "failed-bind should sweep our own dead-port file"
 
 
-# --- vpnc-slice: self-gated proxy primitives (E1 / finding 12) -------------------------
+# --- vpnc-slice: self-gated proxy primitives -------------------------
 def test_sweep_our_resolvers_self_gates_on_live_winner(tmp_path):
-    # E1/finding 12: _sweep_our_resolvers now self-gates (a leading `_may_touch_proxy || return
+    # _sweep_our_resolvers now self-gates (a leading `_may_touch_proxy || return
     # 0`), so removing resolver files can NEVER touch a live DIFFERENT tunnel's, by construction
     # -- even when called directly with no external gate. A live winner (55555) owns the port.
     resolv = tmp_path / "resolver"; resolv.mkdir()
@@ -391,7 +391,7 @@ def test_clear_proxy_state_clears_own_and_sweeps(tmp_path):
 
 
 def test_clear_proxy_state_leaves_live_different_owner(tmp_path):
-    # _clear_proxy_state must NO-OP when a live DIFFERENT openconnect owns the port (finding 14):
+    # _clear_proxy_state must NO-OP when a live DIFFERENT openconnect owns the port:
     # its dnsroute, pidfile, and resolver files are all left intact.
     resolv = tmp_path / "resolver"; resolv.mkdir()
     _mk_resolver(resolv / "keep.corp", 45353)
@@ -413,7 +413,7 @@ def test_clear_proxy_state_leaves_live_different_owner(tmp_path):
 
 
 def test_sweep_our_resolvers_no_unset_abort_without_port(tmp_path):
-    # Finding 8: _sweep_our_resolvers derefs $_port, guarded ${_port:-} consistently with the
+    # _sweep_our_resolvers derefs $_port, guarded ${_port:-} consistently with the
     # sibling _proxy_pid/_proxy_owner. A caller WITHOUT proxy context (the test harness sourcing
     # this file) must no-op, not abort the pass under set -u. A marked+port resolver file makes the
     # loop actually reach the $_port deref. (Mutation: a bare $_port aborts here under strict.)
@@ -427,7 +427,7 @@ def test_sweep_our_resolvers_no_unset_abort_without_port(tmp_path):
 
 
 def test_clear_proxy_state_no_unset_abort_without_pidfile(tmp_path):
-    # Finding 8: _clear_proxy_state derefs $_pidfile in its rm, guarded so a caller without proxy
+    # _clear_proxy_state derefs $_pidfile in its rm, guarded so a caller without proxy
     # context no-ops instead of aborting under set -u (and never rm's a stray ./.ready from CWD).
     # (Mutation: a bare $_pidfile aborts here under strict.)
     resolv = tmp_path / "resolver"; resolv.mkdir()
@@ -636,7 +636,7 @@ def test_do_install_refuses_writable_connect_dir(tmp_path):
 
 
 def test_do_install_refuses_group_or_other_writable_interior_dir(tmp_path):
-    # Finding 1: the ROOT vpnc-slice wrapper sources $proj/lib/common.sh and execs
+    # the ROOT vpnc-slice wrapper sources $proj/lib/common.sh and execs
     # $proj/src/dnsroute.py + $proj/.venv/bin/python as root, so those INTERIOR dirs must be
     # unsubvertable too -- not just $proj and $proj/bin. A private repo root but a world-writable
     # lib/ (whose common.sh root sources) is a plant-code-as-root vector; do_install must refuse.
@@ -660,7 +660,7 @@ def test_do_install_refuses_group_or_other_writable_interior_dir(tmp_path):
 
 
 def test_do_install_refuses_group_or_other_writable_libexec(tmp_path):
-    # Finding 2: $proj/libexec/vpn-teardown is `sudo install`ed root-owned and NOPASSWD-granted,
+    # $proj/libexec/vpn-teardown is `sudo install`ed root-owned and NOPASSWD-granted,
     # so a group/other-writable libexec (where an attacker could swap the teardown SOURCE before
     # install copies it to root) must be refused -- it was missing from the interior vet list.
     proj = tmp_path / "repo"
@@ -746,7 +746,7 @@ def test_verify_repo_interior_refuses_foreign_owned(tmp_path):
 # data file now REFUSE). The deep-.pth / clean-python-symlink / src-symlink / foreign-owner cases
 # are covered above; the remaining cases follow.
 def test_verify_repo_interior_accepts_stock_repo_with_uv_lock():
-    # Case 1 (finding 1, DEPLOY-BLOCKER): the REAL repo -- which carries uv's own .venv/.lock at
+    # Case 1 (DEPLOY-BLOCKER): the REAL repo -- which carries uv's own .venv/.lock at
     # mode 0666 -- must PASS. .venv/.lock is the single writable-file carve-out; every OTHER
     # group/other-writable entry now fails closed (see the .so / data-file REFUSE cases above), so
     # this test is also the MUTATION-CHECK for the exemption: dropping the `! -path './.venv/.lock'`
@@ -828,7 +828,7 @@ def test_verify_repo_interior_refuses_group_or_other_writable_dir(tmp_path):
 
 
 def test_verify_repo_interior_refuses_symlink_below_venv_bin_direct_child(tmp_path):
-    # Case 8 (finding 2a): the .venv/bin exemption is for DIRECT children only. A symlink nested a
+    # Case 8: the .venv/bin exemption is for DIRECT children only. A symlink nested a
     # level deeper (.venv/bin/sub/evil) is NOT exempt -- the old `-path "$_p/.venv/bin/*"` fnmatch
     # `*` crossed `/` and wrongly exempted it. The legit direct-child python link still passes
     # (present here too); the deeper planted link is refused.
@@ -843,7 +843,7 @@ def test_verify_repo_interior_refuses_symlink_below_venv_bin_direct_child(tmp_pa
 
 
 def test_verify_repo_interior_metachar_repo_path_passes(tmp_path):
-    # Case 9 (finding 2b): a glob metacharacter in the repo path ([ ] * ?) must NOT break the
+    # Case 9: a glob metacharacter in the repo path ([ ] * ?) must NOT break the
     # symlink exemption. The old `-path "$_p/.venv/bin/*"` spliced $_p into the glob, so a bracket
     # made the pattern fail to match the legit python link -> it got flagged -> a fail-closed DoS.
     # The rewrite cd's into $_p and uses a LITERAL relative pattern, so the metachar is harmless.
@@ -860,7 +860,7 @@ def test_verify_repo_interior_metachar_repo_path_passes(tmp_path):
 
 
 def test_verify_repo_interior_fails_closed_on_missing_roots(tmp_path):
-    # Finding 6: if NONE of the code roots exist, the old find blessed an empty (unvetted) tree.
+    # if NONE of the code roots exist, the old find blessed an empty (unvetted) tree.
     # An interior vet that inspected nothing must FAIL CLOSED (refuse), not pass.
     proj = os.path.realpath(str(tmp_path / "empty-repo"))
     os.makedirs(proj)                                   # no bin/lib/src/libexec/.venv
@@ -1106,7 +1106,7 @@ def test_connect_apply_launch_budget_config_reconnect_wins():
     "a+b", "a|b", "a(b)", "a*b", "a[b]", "a{b}", "a^b", "a.b",
 ])
 def test_connect_metachar_proj_path_sources_fine(tmp_path, name):
-    # Finding 7: the old B10 $PROJ-metacharacter guard is GONE -- the backstop / _end_browser now
+    # the old $PROJ-metacharacter guard is GONE -- the backstop / _end_browser now
     # match by a fixed literal + grep -F, never splicing $PROJ into an ERE -- so a repo path with
     # regex metacharacters (common on macOS: "Projects (work)", "C++") sources and runs fine.
     # Point $PROJ at such a dir whose lib/ symlinks to the real repo and confirm the seam sources
@@ -1120,7 +1120,7 @@ def test_connect_metachar_proj_path_sources_fine(tmp_path, name):
 
 
 def test_connect_refuses_when_executed_with_seam_var():
-    # Finding 10: OC_CONNECT_TEST=1 is a SOURCING seam for tests. If it leaks into a real
+    # OC_CONNECT_TEST=1 is a SOURCING seam for tests. If it leaks into a real
     # EXECUTED run, the whole connect flow would be guarded off and the script would exit 0
     # having done nothing (a silent no-op -- the worst failure for a VPN tool). Executing the
     # script with the var set must refuse LOUDLY (non-zero + a clear message). ($0 basename is
@@ -1133,7 +1133,7 @@ def test_connect_refuses_when_executed_with_seam_var():
 
 
 def test_connect_refuses_when_executed_via_renamed_symlink(tmp_path):
-    # Finding 7: the executed-refuse now keys on the RESOLVED basename (symlinks followed), so a
+    # the executed-refuse now keys on the RESOLVED basename (symlinks followed), so a
     # differently-NAMED symlink to the connect script can no longer bypass it. The old ${0##*/}
     # guard saw "vpnvpn" (!= openconnect-auto-sso) and silently no-op'd; the resolved guard
     # follows the link to openconnect-auto-sso and refuses. (Executing the symlink runs the real
@@ -1147,7 +1147,7 @@ def test_connect_refuses_when_executed_via_renamed_symlink(tmp_path):
 
 
 def test_install_refuses_when_executed_with_seam_var():
-    # Finding 7/10: OC_INSTALL_TEST=1 is a SOURCING seam. If it leaks into a real EXECUTED run
+    # OC_INSTALL_TEST=1 is a SOURCING seam. If it leaks into a real EXECUTED run
     # the dispatch is skipped -> the installer silently does nothing (and a poisoned OC_PROJ
     # could redirect $proj). Executing it with the var set must refuse LOUDLY, before sourcing
     # common.sh or touching sudo. Pass the read-only `status` subcommand so a regression that
@@ -1160,7 +1160,7 @@ def test_install_refuses_when_executed_with_seam_var():
 
 
 def test_vpnc_slice_refuses_when_executed_with_seam_var():
-    # Finding 7/10: OC_VPNC_SLICE_TEST=1 is a SOURCING seam. If it leaks into a real EXECUTED
+    # OC_VPNC_SLICE_TEST=1 is a SOURCING seam. If it leaks into a real EXECUTED
     # run (the root vpnc-script under openconnect) the directive loop + exec are skipped ->
     # routes/DNS silently never set up. Executing it with the var set must refuse LOUDLY, before
     # sourcing common.sh or running any directive.
@@ -1242,11 +1242,11 @@ def test_end_browser_no_pattern_reap_without_recorded_pid(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "DONE" in r.stdout
     killed = kl.read_text() if kl.exists() else ""
-    assert "33333" not in killed, "must NOT pattern-reap a helper it never recorded (finding 3)"
+    assert "33333" not in killed, "must NOT pattern-reap a helper it never recorded"
 
 
 def test_end_browser_skips_reused_pid_that_fails_argv(tmp_path):
-    # PID-reuse guard (finding 9): the recorded PID is ALIVE but its argv is NOT our helper (the
+    # PID-reuse guard: the recorded PID is ALIVE but its argv is NOT our helper (the
     # pid was freed and reused by an unrelated process). _end_browser must NOT signal it --
     # pid_argv_has fails -> skip the kill entirely, only remove the pidfile.
     pf = tmp_path / "helper.pid"; pf.write_text("11111\n")
@@ -1398,7 +1398,7 @@ def _stub_connect_env(tmp_path):
         "        sh \"$STUB_HELPER\" \"$HELPER_MARKER\" short >/dev/null 2>&1 &\n"
         # Reap the short-lived helper (it wrote a pidfile, now dead), then busy-wait with NO live
         # child -- faithfully mirroring real openconnect blocking in select(NULL) with a DEAD
-        # helper. Childless on purpose: a `sleep` loop's own live child would satisfy finding 5's
+        # helper. Childless on purpose: a `sleep` loop's own live child would satisfy the backstop's
         # `pgrep -P` and wrongly read as "login still live", so the backstop would never fire.
         # BOUNDED (~4 min of pure arithmetic here) so a regressed/timed-out test can't peg a core
         # forever; in the normal flow the backstop TERMs it at the ~2s deadline, long before the cap.
@@ -1413,7 +1413,7 @@ def _stub_connect_env(tmp_path):
         "        _n=0; while [ \"$_n\" -lt 100000000 ]; do _n=$((_n + 1)); done ;;\n"
         "      livenopid)\n"
         # A LIVE helper (openconnect's ONLY child) whose pidfile write FAILED: it records no PID, so
-        # the backstop's pidfile check reads "helper gone". Finding 5's secondary `pgrep -P` must see
+        # the backstop's pidfile check reads "helper gone". The secondary `pgrep -P` must see
         # openconnect's live child (the helper) and stand down. `wait` (not a `sleep` loop) keeps
         # openconnect alive with the HELPER as its ONLY child, so the stand-down genuinely depends on
         # the helper being that live child -- a sleep loop's own child would satisfy pgrep regardless.
@@ -1547,7 +1547,7 @@ def test_phase1_dead_helper_is_aborted_at_deadline(tmp_path):
 
 
 def test_phase1_helper_crashed_before_pidfile_is_aborted(tmp_path):
-    # Finding 5 (second half): the helper crashed BEFORE writing its pidfile (deadnopid) -- so no
+    # the helper crashed BEFORE writing its pidfile (deadnopid) -- so no
     # recorded PID AND openconnect has NO live child. The backstop's pidfile check reads "gone",
     # its secondary `pgrep -P "$_oc_pid"` finds no live child, so it MUST fire the abort (TERM
     # openconnect so `wait` returns and Phase 1 fails loudly). This pins the "helper died pre-write
@@ -1565,7 +1565,7 @@ def test_phase1_helper_crashed_before_pidfile_is_aborted(tmp_path):
 
 
 def test_phase1_live_helper_without_pidfile_not_killed(tmp_path):
-    # Finding 5: write_own_pidfile is best-effort (swallows OSError). If the pidfile write FAILS
+    # write_own_pidfile is best-effort (swallows OSError). If the pidfile write FAILS
     # while the helper is LIVE (openconnect's direct child), the backstop's pidfile-based check
     # reads "helper gone" -- but a secondary `pgrep -P "$_oc_pid"` sees openconnect's live child
     # and stands down, so a real (possibly slow) login is NEVER killed just because its pidfile
@@ -1594,7 +1594,7 @@ def test_phase1_live_helper_without_pidfile_not_killed(tmp_path):
 
 
 def test_backstop_survives_failed_stderr_write_and_still_kills(tmp_path):
-    # Finding 3: the backstop's `echo "Phase 1 stalled" >&2` sits immediately before the
+    # the backstop's `echo "Phase 1 stalled" >&2` sits immediately before the
     # `kill -TERM` that frees a wedged openconnect. A broken stderr pipe must NOT abort the
     # subshell BEFORE that kill -- neither via set -e on an EPIPE return (guarded by `|| true`)
     # NOR via SIGPIPE at its DEFAULT disposition, which would KILL the subshell (status 141)
@@ -1638,7 +1638,7 @@ def test_backstop_survives_failed_stderr_write_and_still_kills(tmp_path):
 
 
 def test_oc_pid_cleared_after_wait_reaps_openconnect():
-    # Finding 4: after `wait "$_oc_pid"` reaps the Phase-1 openconnect, its PID is FREED (and may
+    # after `wait "$_oc_pid"` reaps the Phase-1 openconnect, its PID is FREED (and may
     # be reused). The INT/TERM trap raw-`kill`s `${_oc_pid:-}`, so a signal in the post-wait /
     # _end_browser window (before Phase 2 replaces the trap) would signal a freed/reused PID. The
     # fix clears `_oc_pid=''` immediately after the wait, making the trap's `kill` a safe no-op.
@@ -1651,10 +1651,10 @@ def test_oc_pid_cleared_after_wait_reaps_openconnect():
     m = re.search(
         r'if wait "\$_oc_pid"; then _auth_rc=0; else _auth_rc=\$\?; fi[^\n]*\n\s*_oc_pid=\'\'',
         src)
-    assert m, "expected `_oc_pid=''` to clear the reaped PID immediately after the wait (finding 4)"
+    assert m, "expected `_oc_pid=''` to clear the reaped PID immediately after the wait"
     # Pin the PROPERTY the clear protects, not just its adjacency: the Phase-1 INT/TERM trap must
     # signal the GUARDED ${_oc_pid:-} (which the clear turns into an empty -> `kill "" 2>/dev/null
     # || true` no-op), never a bare $_oc_pid that could raw-kill a freed/reused PID post-wait.
     assert re.search(
         r"trap '[^']*kill \"\$\{_oc_pid:-\}\" 2>/dev/null \|\| true[^']*' INT TERM", src), \
-        "the Phase-1 INT/TERM trap must kill the guarded ${_oc_pid:-} (finding 4)"
+        "the Phase-1 INT/TERM trap must kill the guarded ${_oc_pid:-}"

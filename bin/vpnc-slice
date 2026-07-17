@@ -31,7 +31,7 @@ set -eu
 # wrapper is the root vpnc-script under openconnect -- the routes/DNS would silently never be
 # set up. Refuse LOUDLY here, BEFORE sourcing. openconnect always invokes us by our real path
 # ($PROJ/bin/vpnc-slice, basename vpnc-slice, no renamed-symlink path); a `.`-source leaves $0
-# as the caller's ("sh" under the harness), so the seam is unaffected. (finding 7/10)
+# as the caller's ("sh" under the harness), so the seam is unaffected.
 if [ "${OC_VPNC_SLICE_TEST:-}" = 1 ]; then
     case ${0##*/} in
         vpnc-slice)
@@ -65,7 +65,7 @@ fi
 # ($_port). Port-scoping means tearing down one tunnel never deletes another
 # tunnel's resolver files (a second tunnel necessarily uses a different port).
 #
-# SELF-GATED (finding 12): a leading `_may_touch_proxy || return 0` means removing resolver
+# SELF-GATED: a leading `_may_touch_proxy || return 0` means removing resolver
 # files -- a mutation -- can NEVER touch a live DIFFERENT tunnel's state, by construction, so
 # no caller has to remember to wrap it in the gate. On the success path the pidfile we just
 # wrote records us as owner, so the gate passes; on a teardown/no-proxy path an absent or
@@ -117,7 +117,7 @@ _proxy_domains() {
 # line 2. _is_dnsroute confirms a PID is really OUR dnsroute before we signal it as root
 # -- matched on the FULL "$PROJ/src/dnsroute.py" argv (not a bare "dnsroute.py" substring
 # an unrelated process could carry), guarding against PID reuse (via pid_argv_has, the shared
-# per-PID argv re-confirm in lib/common.sh -- finding 13). ${_pidfile:-} so a caller that has not
+# per-PID argv re-confirm in lib/common.sh). ${_pidfile:-} so a caller that has not
 # set it reads "no record", not a set -u abort. In PRODUCTION every caller sets $_pidfile (from the
 # --proxy directive args); this guard exists only for the TEST harness, which sources this file and
 # exercises these helpers in isolation -- there is no production "caller without proxy context".
@@ -146,7 +146,7 @@ _may_touch_proxy() {
     return 0                                                       # owner dead / reused -> reclaimable
 }
 
-# Tear down THIS port's proxy state, SELF-GATED (finding 12): kill our RECORDED dnsroute
+# Tear down THIS port's proxy state, SELF-GATED: kill our RECORDED dnsroute
 # (argv-confirmed via _is_dnsroute, so a reused PID is never signalled), remove the pidfile +
 # its .ready, and sweep our /etc/resolver files. The leading gate means a live DIFFERENT
 # tunnel's state is NEVER touched, by construction -- so the failed-bind and disconnect paths
@@ -195,7 +195,7 @@ _proxy_connect() {
     # them (bare refs abort under set -u) and skip DNS-routing rather than crash.
     # No proxy is coming up on these branches. Sweep our OWN now-stale port files (so routed
     # domains degrade to default DNS rather than black-holing) -- _sweep_our_resolvers self-gates,
-    # so it never deletes a live DIFFERENT same-port tunnel's /etc/resolver files (finding 14).
+    # so it never deletes a live DIFFERENT same-port tunnel's /etc/resolver files.
     _up=${INTERNAL_IP4_DNS:-}; _dev=${TUNDEV:-}
     if [ -z "$_up" ] || [ -z "$_dev" ]; then
         _sweep_our_resolvers
@@ -234,7 +234,7 @@ _proxy_connect() {
         # now-dead-port pidfile + /etc/resolver files so routed domains degrade to default DNS
         # instead of black-holing at a port with nothing listening. If a live winner owns the
         # port, it leaves the winner's pidfile, .ready, and resolver files intact -- our bind
-        # simply lost with EADDRINUSE (finding 14).
+        # simply lost with EADDRINUSE.
         kill "$_pid" 2>/dev/null || true
         _clear_proxy_state
         echo "WARNING: DNS-routing proxy failed to bind 127.0.0.1:$_port" \
@@ -289,7 +289,7 @@ while :; do
                     # never line 2's openconnect PID, which is mid-teardown running this very
                     # pass), removes the pidfile + .ready, and sweeps our marker+port resolver
                     # files. If a live DIFFERENT openconnect owns this port it does NOTHING, so
-                    # one tunnel's disconnect never yanks another same-port tunnel's DNS (finding 14).
+                    # one tunnel's disconnect never yanks another same-port tunnel's DNS.
                     _clear_proxy_state ;;
             esac ;;
         *) break ;;

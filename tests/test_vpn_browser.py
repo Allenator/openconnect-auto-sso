@@ -21,7 +21,7 @@ def test_parse_callback_defaults():
 
 def test_parse_callback_bad_port_defaults_not_raises():
     # A malformed CALLBACK port must NOT raise pre-QApplication (that would wedge
-    # openconnect's callback wait forever -- B1); it defaults instead.
+    # openconnect's callback wait forever); it defaults instead.
     assert vb.parse_callback("host:notaport") == ("host", 29786)
     assert vb.parse_callback("host:") == ("host", 29786)
 
@@ -50,7 +50,7 @@ def test_env_int_falls_back(monkeypatch):
 
 
 def test_env_int_clamps_to_int32(monkeypatch):
-    # B11: values feed QTimer.singleShot / QTimer.start, whose C++ int OverflowErrors
+    # values feed QTimer.singleShot / QTimer.start, whose C++ int OverflowErrors
     # outside signed int32. env_int must clamp so Qt never sees an out-of-range value.
     monkeypatch.setenv("OC_TEST_INT", str(2**40))
     assert vb.env_int("OC_TEST_INT", 0) == 2**31 - 1          # above max -> clamped
@@ -73,7 +73,7 @@ def test_is_host_loopback():
 
 
 def test_is_host_loopback_rejects_lookalike_hostnames():
-    # B2: a `h.startswith("127.")` string test wrongly accepts these DNS names that are
+    # a `h.startswith("127.")` string test wrongly accepts these DNS names that are
     # NOT the loopback interface. Parsing as an IP rejects them (ValueError -> False).
     for h in ("127.evil.com", "127.0.0.1.evil.com", "127.0.0.1.nip.io",
               "localhost.evil.com", "127foo"):
@@ -83,7 +83,7 @@ def test_is_host_loopback_rejects_lookalike_hostnames():
         assert vb.is_host_loopback(h), h
 
 
-# --- is_callback (loopback-shape tolerant; B5b) ---
+# --- is_callback (loopback-shape tolerant) ---
 def _cb(url, host="localhost", port=29786):
     return vb.is_callback(QUrl(url), host, port)
 
@@ -95,7 +95,7 @@ def test_is_callback_localhost_and_127():
 
 def test_is_callback_ipv6_loopback():
     # openconnect listens on ::1; a redirect to the [::1] spelling must still count,
-    # otherwise finish() (self-close + cookie flush) never fires. This is the B5b fix.
+    # otherwise finish() (self-close + cookie flush) never fires.
     assert _cb("http://[::1]:29786/callback?code=abc")
 
 
@@ -109,7 +109,7 @@ def test_is_callback_non_loopback_host_rejected():
 
 
 def test_is_callback_rejects_lookalike_loopback_host():
-    # B2: a look-alike host on the right port must NOT be mistaken for the loopback
+    # a look-alike host on the right port must NOT be mistaken for the loopback
     # callback -- otherwise finish() (self-close) could fire on an attacker-controlled
     # 127.evil.com redirect. The IP-parse in is_host_loopback closes that bypass.
     assert not _cb("http://127.evil.com:29786/callback?code=abc")
@@ -123,7 +123,7 @@ def test_is_callback_custom_host_requires_exact_match():
     assert not vb.is_callback(QUrl("http://127.0.0.1:29786/"), "vpn.corp", 29786)
 
 
-# --- is_allowed_url (B4: only http/https logins) ---
+# --- is_allowed_url (only http/https logins) ---
 def test_is_allowed_url_accepts_web_schemes():
     assert vb.is_allowed_url("http://vpn.example/login")
     assert vb.is_allowed_url("https://vpn.example/login")
@@ -144,7 +144,7 @@ def test_comm_is_openconnect():
         assert not vb._comm_is_openconnect(c), repr(c)
 
 
-# --- reveal_decision (B3: reveal after N idle rounds on the same URL) ---
+# --- reveal_decision (reveal after N idle rounds on the same URL) ---
 def test_reveal_decision_reveals_immediately_with_input():
     action, url, rounds = vb.reveal_decision(True, "https://idp/login", None, 0)
     assert action == "reveal" and url == "https://idp/login"
@@ -178,7 +178,7 @@ def test_reveal_decision_threshold_one_reveals_first_idle():
     assert (a, r) == ("reveal", 1)
 
 
-# --- write_own_pidfile: record our PID so the connect script reaps THIS run's helper (finding 8)
+# --- write_own_pidfile: record our PID so the connect script reaps THIS run's helper
 def test_write_own_pidfile_records_our_pid(tmp_path, monkeypatch):
     import os
     pf = tmp_path / "helper.pid"
@@ -195,7 +195,7 @@ def test_write_own_pidfile_noop_without_env(tmp_path, monkeypatch):
 
 
 def test_write_own_pidfile_refuses_symlink_target(tmp_path, monkeypatch):
-    # Finding 5: a pre-planted symlink at the pidfile path must NOT redirect our write to its
+    # a pre-planted symlink at the pidfile path must NOT redirect our write to its
     # target. Unlink-first + O_NOFOLLOW replace the symlink with a fresh 0600 regular file and
     # write our PID there, leaving the pointed-at target untouched. (A plain open("w") would
     # follow the link and clobber the target -- the mutation this pins.)

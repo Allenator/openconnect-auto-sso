@@ -156,8 +156,8 @@ def test_inflight_released_even_when_route_raises():
     "fe80::1",     # link-local v6
     "ff02::1",     # multicast v6
     "::",          # unspecified v6
-    "::ffff:127.0.0.1",   # finding 11: v4-mapped loopback (not is_loopback on Py<3.13)
-    "::ffff:169.254.1.1", # finding 11: v4-mapped link-local (never is_link_local w/o ipv4_mapped)
+    "::ffff:127.0.0.1",   # v4-mapped loopback (not is_loopback on Py<3.13)
+    "::ffff:169.254.1.1", # v4-mapped link-local (never is_link_local w/o ipv4_mapped)
 ])
 def test_bogus_scope_ip_is_not_routed(bogus):
     with mock.patch.object(dnsroute.subprocess, "run", side_effect=_run_ok) as run:

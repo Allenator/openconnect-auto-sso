@@ -28,9 +28,9 @@ TEARDOWN_BIN="$LIBEXEC_DIR/vpn-teardown"
 # an earlier comment wrongly claimed the if/return wrapper made it errexit-proof "whatever the call
 # context"; it does not, so the equivalent one-liner below replaces it.
 #
-# RESIDUAL (finding 12, DEFERRED): $2 is PER-REPO (a repo path), not per-RUN, so a PID reused onto a
+# RESIDUAL (DEFERRED): $2 is PER-REPO (a repo path), not per-RUN, so a PID reused onto a
 # CONCURRENT same-repo run's live process could still pass this confirm. Very narrow (needs PID
-# reuse landing on a live same-repo process); the connect script's _oc_pid clear (finding 4) shut
+# reuse landing on a live same-repo process); the connect script's _oc_pid clear shut
 # the biggest window. A per-run token is left to a future round.
 pid_argv_has() {
     [ -n "${1:-}" ] && ps -p "$1" -o command= 2>/dev/null | grep -qF -- "$2"
