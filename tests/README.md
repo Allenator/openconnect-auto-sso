@@ -10,7 +10,7 @@ Unit tests for the Python modules and the POSIX-sh scripts. Everything runs unde
 uv run pytest               # equivalent, if you use uv
 ```
 
-Requires the project venv (`uv sync`). No root, no network, and no real routes/DNS are touched — `/sbin/route` is mocked, the resolver sweep is pointed at a temp dir, and the server-reachability probe's `nc` is replaced with a stub via `NC_BIN`.
+Requires the project venv (`uv sync`). No root, no network, and no real routes/DNS are touched — `/sbin/route` is mocked, the resolver sweep is pointed at a temp dir, and the server-reachability probe's `nc` is replaced with a stub via `NC_BIN`, and `launchctl` is stubbed (via `LAUNCHCTL`) for the agent-load test.
 
 ## Layout
 

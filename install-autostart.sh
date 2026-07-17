@@ -232,23 +232,24 @@ verify_repo_interior() {
 }
 
 # Load (or reload) the LaunchAgent, VERIFYING it actually took rather than trusting the
-# loader's exit status. A `bootout` immediately followed by a `bootstrap` can transiently
-# fail with EIO (errno 5, "Input/output error") while the old job drains -- and some
-# launchctl builds print that yet still exit 0 -- so retry with a short backoff and CONFIRM
-# with `launchctl print`. `load -w` stays as a fallback for older launchctl. Returns 0 once
-# the label is confirmed loaded, else 1. $LAUNCHCTL / $LOAD_RETRY_SLEEP are honored only
-# under the OC_INSTALL_TEST seam; a real install always uses the real launchctl.
+# loader's exit status. Bootstrapping right after booting out the old job can transiently
+# fail with EIO (errno 5, "Input/output error") while that job drains -- and some launchctl
+# builds print the error yet still exit 0 -- so bootout ONCE (repeating it would tear down a
+# just-loaded agent on a print race), then retry `bootstrap` with a short backoff and CONFIRM
+# with `launchctl print` (the same load-check do_status uses). Requires a launchctl with
+# bootstrap/print (macOS 10.10+). Returns 0 once the label is confirmed loaded, else 1.
+# $LAUNCHCTL / $LOAD_RETRY_SLEEP are honored only under the OC_INSTALL_TEST seam; a real
+# install always uses the real launchctl.
 load_agent() {
     _lc=launchctl; _slp=1
     if [ "${OC_INSTALL_TEST:-}" = 1 ]; then _lc=${LAUNCHCTL:-launchctl}; _slp=${LOAD_RETRY_SLEEP:-1}; fi
+    "$_lc" bootout "gui/$uid/$label" 2>/dev/null || true    # drop any prior agent (once)
     _i=0
     while [ "$_i" -lt 5 ]; do
-        "$_lc" bootout "gui/$uid/$label" 2>/dev/null || true
-        "$_lc" bootstrap "gui/$uid" "$plist" 2>/dev/null \
-            || "$_lc" load -w "$plist" 2>/dev/null || true
+        "$_lc" bootstrap "gui/$uid" "$plist" 2>/dev/null || true
         "$_lc" print "gui/$uid/$label" >/dev/null 2>&1 && return 0
         _i=$((_i + 1))
-        sleep "$_slp"
+        [ "$_i" -lt 5 ] && sleep "$_slp"    # backoff BETWEEN attempts, not after the last
     done
     return 1
 }

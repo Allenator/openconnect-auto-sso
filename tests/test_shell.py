@@ -881,7 +881,6 @@ case $1 in
   bootstrap) n=$(cat "$d/n" 2>/dev/null || echo 0); n=$((n + 1)); printf %s "$n" > "$d/n"
              if [ "$n" -ge "${SUCCEED_AT:-1}" ]; then : > "$d/loaded"; exit 0; fi
              echo "Load failed: 5: Input/output error" >&2; exit 5 ;;
-  load)      echo "load -w unsupported" >&2; exit 1 ;;
   print)     [ -f "$d/loaded" ] && exit 0 || exit 1 ;;
   *)         exit 0 ;;
 esac
@@ -901,8 +900,10 @@ def test_load_agent_retries_then_confirms_loaded(tmp_path):
     # The real installer hit a transient EIO on bootstrap, then printed ">> loaded" without
     # checking -- leaving the agent unloaded. load_agent must RETRY and return 0 only once
     # `launchctl print` confirms the label loaded. Stub succeeds on the 2nd bootstrap.
+    # Call it exactly as do_install does (an `if` condition) under the script's real `set -eu`.
     env = _stub_launchctl(tmp_path, succeed_at=2)
-    r = _sh(SRC_INSTALL, 'load_agent; echo "rc=$?"', extra_env=env)
+    r = _sh(SRC_INSTALL, 'if load_agent; then rc=0; else rc=$?; fi; echo "rc=$rc"',
+            extra_env=env, strict=True)
     assert "rc=0" in r.stdout, r.stdout + r.stderr
     assert int((tmp_path / "lc-state" / "n").read_text()) >= 2   # actually retried
 
@@ -911,7 +912,8 @@ def test_load_agent_fails_closed_when_load_never_takes(tmp_path):
     # If the load never takes (print never confirms), load_agent must return non-zero so
     # do_install reports an honest error instead of a false ">> loaded".
     env = _stub_launchctl(tmp_path, succeed_at=999)
-    r = _sh(SRC_INSTALL, 'load_agent; echo "rc=$?"', extra_env=env)
+    r = _sh(SRC_INSTALL, 'if load_agent; then rc=0; else rc=$?; fi; echo "rc=$rc"',
+            extra_env=env, strict=True)
     assert "rc=1" in r.stdout, r.stdout + r.stderr
 
 
