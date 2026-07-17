@@ -7,7 +7,7 @@ Connect to browser-SSO (SAML) VPNs with [`openconnect`](https://www.infradead.or
 - a browser window appears **only when you actually need to log in** — otherwise the connect is silent;
 - optional **split-tunnel** routing — by subnet *or* by DNS name (a name's traffic is routed to wherever it resolves) — via [`vpn-slice`](https://github.com/dlenski/vpn-slice).
 
-Everything site-specific (server, protocol, routes) lives in a config file outside the repo (`~/.config/openconnect-auto-sso/config.toml`) — nothing about any organization or identity provider is hardcoded.
+Everything site-specific (server, protocol, routes) lives in a config file outside the repo (`~/.config/openconnect-auto-sso/config.toml`): nothing about any organization or identity provider is hardcoded.
 
 ## How it works
 
@@ -57,7 +57,7 @@ Config is a TOML file at `~/.config/openconnect-auto-sso/config.toml` (outside t
 | `allow_incoming` | bool | `true` allows incoming from the VPN (no pf firewall) so iCloud Private Relay keeps working (default `false`). |
 | `keepalive_host` | string | Host to ping through the tunnel to avoid idle-disconnects. `"@dns"` auto-targets the VPN's own pushed DNS server (recommended); or a specific in-VPN host. `""` = off. |
 | `keepalive_interval` | int | Seconds between keepalive pings (default 30). |
-| `mtu_healthcheck` | bool | Heal a tunnel whose path MTU collapsed after an in-process reconnect by forcing a fresh reconnect (default `true`). Only active when keepalive is on — see [Keeping an idle tunnel alive](#keeping-an-idle-tunnel-alive). |
+| `mtu_healthcheck` | bool | Heal a tunnel whose path MTU collapsed after an in-process reconnect by forcing a fresh reconnect (default `true`). Only active when keepalive is on (see [Keeping an idle tunnel alive](#keeping-an-idle-tunnel-alive)). |
 | `reconnect_timeout` | int | Seconds openconnect retries in-process after a drop before giving up and exiting (`0` = give up at once). The default depends on launch mode: **30** under the `KeepAlive` auto-start agent (launchd respawns a fresh connect) and **300** under `install --once` or a manual run (nothing will restart it). See [Sleep and wake](#sleep-and-wake). |
 | `profile_name` | string | Qt persistent-profile storage key. Usually leave default. |
 | `callback` | string | openconnect external-browser callback `host:port`. Rarely changed. |
@@ -79,7 +79,7 @@ Press `Ctrl-C` to disconnect.
 
 | Entry | Example | What it does |
 |-------|---------|--------------|
-| DNS name (bare) | `example.com`, `host.corp.example.com` | Resolve it via the VPN's DNS **and** route every IP it answers with through the tunnel. A macOS `/etc/resolver` **suffix** match — `example.com` covers `example.com` *and* all its subdomains; a full host covers just that host. |
+| DNS name (bare) | `example.com`, `host.corp.example.com` | Resolve it via the VPN's DNS **and** route every IP it answers with through the tunnel. A macOS `/etc/resolver` **suffix** match: `example.com` covers `example.com` *and* all its subdomains; a full host covers just that host. |
 | IP or CIDR | `10.0.0.0/8`, `10.1.2.3` | A static route through the VPN. |
 | `%CIDR` | `%100.64.0.0/10` | **Exclude** that range from the VPN. |
 | `@server` | | Proxy whatever split-DNS domains the server advertises (`CISCO_SPLIT_DNS` / default domain) — so you needn't name them. |
@@ -93,15 +93,15 @@ via_vpn = ["corp.example.com", "%100.64.0.0/10"]       # a whole domain, minus a
 via_vpn = ["@server", "@internal"]                     # whatever the server advertises
 ```
 
-An empty list (`via_vpn = []`) is a **full tunnel** — everything goes through the VPN and no proxy or `/etc/resolver` files are created.
+An empty list (`via_vpn = []`) is a **full tunnel**: everything goes through the VPN and no proxy or `/etc/resolver` files are created.
 
 ### How name-based routing works
 
-Naming a host or domain does two things at once: its DNS *and* its traffic go through the VPN. On connect, each name gets a macOS `/etc/resolver/<name>` file pointing at a small loopback DNS proxy (`src/dnsroute.py`, started as root by the wrapper). The proxy forwards those lookups to the VPN's own DNS servers and, for **every** IP each answer returns, adds a host route out the tunnel device — installed *before* the DNS answer is handed back, so even the very first packet takes the tunnel. So a load-balanced or rotating host gets a route for whatever IP it actually resolves to — you don't have to know or hardcode its addresses. On disconnect the proxy is stopped and the resolver files are removed (a reconnect replaces the proxy rather than stacking a second one); the injected routes vanish with the tunnel interface.
+Naming a host or domain does two things at once: its DNS *and* its traffic go through the VPN. On connect, each name gets a macOS `/etc/resolver/<name>` file pointing at a small loopback DNS proxy (`src/dnsroute.py`, started as root by the wrapper). The proxy forwards those lookups to the VPN's own DNS servers and, for **every** IP each answer returns, adds a host route out the tunnel device, installed *before* the DNS answer is handed back, so even the very first packet takes the tunnel. So a load-balanced or rotating host gets a route for whatever IP it actually resolves to: you don't have to know or hardcode its addresses. On disconnect the proxy is stopped and the resolver files are removed (a reconnect replaces the proxy rather than stacking a second one); the injected routes vanish with the tunnel interface.
 
-Not every answer gets a route. Addresses in a scope that could never be a valid tunnel destination — loopback, link-local, multicast, or the unspecified address — are skipped, so a split-horizon `127.0.0.x` answer can't blackhole loopback with a bogus host route. Both private and public IPs *are* routed, since a name-scoped resource may legitimately live on either.
+Not every answer gets a route. Addresses in a scope that could never be a valid tunnel destination (loopback, link-local, multicast, or the unspecified address) are skipped, so a split-horizon `127.0.0.x` answer can't blackhole loopback with a bogus host route. Both private and public IPs *are* routed, since a name-scoped resource may legitimately live on either.
 
-Two guard rails: the proxy **never routes the VPN gateway's own IP** through the tunnel (the gateway carries the tunnel itself — even when the gateway's hostname falls under a proxied domain, as it typically does); and the connect script **sweeps leftover resolver files** at startup (they're tagged with an `# openconnect-auto-sso` marker, so only this tool's own files are ever touched) — a straggler from a crashed teardown would otherwise point its domains at a proxy that no longer exists.
+Two guard rails: the proxy **never routes the VPN gateway's own IP** through the tunnel (the gateway carries the tunnel itself, even when the gateway's hostname falls under a proxied domain, as it typically does); and the connect script **sweeps leftover resolver files** at startup (they're tagged with an `# openconnect-auto-sso` marker, so only this tool's own files are ever touched). A straggler from a crashed teardown would otherwise point its domains at a proxy that no longer exists.
 
 > **Resolver-bypass caveat.** A route is injected only for lookups that go through the **system resolver**. An app that does its own DoH/DoT — e.g. a browser with "Secure DNS" on — bypasses `/etc/resolver`, so no route is added for names it resolves itself. For those destinations, put a **CIDR** in `via_vpn` (a static route needs no DNS).
 
@@ -109,24 +109,24 @@ The connect script resolves `vpn-slice` to an absolute path, since `sudo` (Phase
 
 ## Keeping an idle tunnel alive
 
-Many VPN servers disconnect a tunnel that carries no traffic (openconnect reports `Received server disconnect: ... 'Idle Timeout'`). In split-tunnel mode that happens easily, since only your routed subnets generate traffic. Set `keepalive_host` to a host that is reachable **inside** the VPN — i.e. one covered by `via_vpn` (or anything, in full-tunnel mode) — and the connect script pings it every `keepalive_interval` seconds while connected, stopping automatically on disconnect. The easiest choice is `keepalive_host = "@dns"`, which auto-targets the VPN's own pushed DNS server — always routed and always up, so you don't have to name it.
+Many VPN servers disconnect a tunnel that carries no traffic (openconnect reports `Received server disconnect: ... 'Idle Timeout'`). In split-tunnel mode that happens easily, since only your routed subnets generate traffic. Set `keepalive_host` to a host reachable **inside** the VPN (one covered by `via_vpn`, or anything in full-tunnel mode), and the connect script pings it every `keepalive_interval` seconds while connected, stopping automatically on disconnect. The easiest choice is `keepalive_host = "@dns"`, which auto-targets the VPN's own pushed DNS server: always routed and always up, so you don't have to name it.
 
 ### Healing a collapsed tunnel MTU
 
-openconnect probes the tunnel's path MTU whenever it (re)connects. On an *in-process* reconnect — after a same-IP Wi-Fi blip, or on waking from sleep, which [normally resumes in place](#sleep-and-wake) — it re-probes while the path is still lossy, can misread lost probes as "MTU too big", and ratchets the MTU down to the 576 floor — where it **stays** (it never re-probes upward). The result is a tunnel that reports "connected" but silently drops large packets: small requests work while big ones (most web pages) time out. A *fresh* connect re-probes on a settled path and comes up at the correct MTU, so it never hits this. (This is distinct from a full drop, which [Sleep and wake](#sleep-and-wake) already recovers.)
+openconnect probes the tunnel's path MTU whenever it (re)connects, including an *in-process* reconnect after a same-IP Wi-Fi blip, or on waking from sleep (which [normally resumes in place](#sleep-and-wake)). Re-probing while the path is still lossy, it can misread lost probes as "MTU too big" and ratchet the MTU down to the 576 floor, where it **stays** (it never re-probes upward). The result is a tunnel that reports "connected" but silently drops large packets: small requests work while big ones (most web pages) time out. A *fresh* connect re-probes on a settled path and comes up at the correct MTU, so it never hits this. (This is distinct from a full drop, which [Sleep and wake](#sleep-and-wake) already recovers.)
 
-When `mtu_healthcheck` is on (the default), the keepalive loop watches for exactly this signature — the target answers a small ping but not a large *don't-fragment* one, for two checks in a row — and forces a fresh reconnect: openconnect exits, and the auto-start agent's `KeepAlive` respawns the connect script, which reconnects on a settled path. To avoid false heals it first confirms the target *does* answer a large don't-fragment ping while the tunnel is healthy; a target that blocks large ICMP simply disables the check for that session (logged) rather than triggering a reconnect loop.
+When `mtu_healthcheck` is on (the default), the keepalive loop watches for exactly this signature (the target answers a small ping but not a large *don't-fragment* one, for two checks in a row) and forces a fresh reconnect: openconnect exits, and the auto-start agent's `KeepAlive` respawns the connect script, which reconnects on a settled path. To avoid false heals it first confirms the target *does* answer a large don't-fragment ping while the tunnel is healthy; a target that blocks large ICMP simply disables the check for that session (logged) rather than triggering a reconnect loop.
 
 Healing therefore has two requirements, and turns itself off (with a logged line) when either is missing:
 
 - **`keepalive_host` must be set** — the check reuses the keepalive target and loop, so with keepalive off it does nothing.
-- **You must be running under the `KeepAlive` auto-start agent** (`./install-autostart.sh install`) — healing deliberately drops the tunnel, which only helps if something restarts it. Under `install --once` or a manual run nothing does, so healing there would take a degraded-but-usable tunnel permanently down; the loop refuses instead. This is the same "is anyone watching?" asymmetry that sizes `reconnect_timeout` below.
+- **You must be running under the `KeepAlive` auto-start agent** (`./install-autostart.sh install`): healing deliberately drops the tunnel, which only helps if something restarts it. Under `install --once` or a manual run nothing does, so healing there would take a degraded-but-usable tunnel permanently down; the loop refuses instead. This is the same "is anyone watching?" asymmetry that sizes `reconnect_timeout` below.
 
 ## Sleep and wake
 
 What defeats openconnect's built-in reconnect is not sleep — it is the **local address going away**. If the socket's address is gone when openconnect retries, every attempt fails (`Can't assign requested address`) until its retry budget expires and it exits; a *fresh* process then connects fine. If the address is still there, the in-process reconnect just works and the tunnel **resumes**.
 
-What matters is therefore not how long the network was out, but whether the address survived it. An ordinary sleep usually **resumes**: macOS commonly holds the interface's lease across sleep (subject to your `pmset` settings — `tcpkeepalive`, `powernap`, `standby`), so on wake the address is still valid however long the lid was shut. An outage long enough to drop the address, or waking on a *different* network, is what forces the fresh path.
+What matters is therefore not how long the network was out, but whether the address survived it. An ordinary sleep usually **resumes**: macOS commonly holds the interface's lease across sleep (subject to your `pmset` settings: `tcpkeepalive`, `powernap`, `standby`), so on wake the address is still valid however long the lid was shut. An outage long enough to drop the address, or waking on a *different* network, is what forces the fresh path.
 
 Timing only decides when openconnect stops trying. It declares the peer dead `2 × dpd` after the last packet it *received* — 30–60 s after a drop at the usual 30 s `dpd` — and *only then* starts spending `reconnect_timeout`. So it gives up **60–90 s** in under the agent, or **330–360 s** under `install --once` or a manual run; a shorter outage resumes.
 
@@ -134,9 +134,9 @@ Timing only decides when openconnect stops trying. It declares the peer dead `2 
 
 Resuming is not always the better outcome, though: it is the path that can come back with a [collapsed MTU](#healing-a-collapsed-tunnel-mtu). An ordinary lid-close and lid-open takes exactly that path, which is what `mtu_healthcheck` catches.
 
-Before authenticating, the connect script waits for the VPN server to become **reachable** (up to 5 minutes under the agent, 10 s in a terminal). It is a TCP probe rather than a default-route check, so it also covers "the Wi-Fi is up but the WAN is down" and DNS that isn't ready yet. Waiting beats exiting: launchd delays a respawn by `ThrottleInterval` *minus* how long the job ran, so a job that waits the outage out respawns immediately, whereas one that fails fast idles out the remainder. (A captive portal that redirects the VPN port can still make the probe report "reachable" — it is a readiness gate, not a guarantee; Phase 1 then reports the real error.)
+Before authenticating, the connect script waits for the VPN server to become **reachable** (up to 5 minutes under the agent, 10 s in a terminal). It is a TCP probe rather than a default-route check, so it also covers "the Wi-Fi is up but the WAN is down" and DNS that isn't ready yet. Waiting beats exiting: launchd delays a respawn by `ThrottleInterval` *minus* how long the job ran, so a job that waits the outage out respawns immediately, whereas one that fails fast idles out the remainder. (A captive portal that redirects the VPN port can still make the probe report "reachable": it is a readiness gate, not a guarantee; Phase 1 then reports the real error.)
 
-The trade-off is worth stating plainly: an outage that outlasts **detection plus `reconnect_timeout`** ends the tunnel and costs a fresh connect rather than an in-process resume. With a warm cookie that fresh connect is silent, but it does mint a new VPN session — which matters if your gateway caps concurrent sessions, or your identity provider forces MFA on every fresh authentication. Raise `reconnect_timeout` toward 300 if you would rather ride out long outages on the existing session.
+The trade-off is worth stating plainly: an outage that outlasts **detection plus `reconnect_timeout`** ends the tunnel and costs a fresh connect rather than an in-process resume. With a warm cookie that fresh connect is silent, but it does mint a new VPN session, which matters if your gateway caps concurrent sessions, or your identity provider forces MFA on every fresh authentication. Raise `reconnect_timeout` toward 300 if you would rather ride out long outages on the existing session.
 
 ## Recipes
 
@@ -148,9 +148,9 @@ via_vpn = ["<your-vpn-subnets-or-names>", "%100.64.0.0/10"]
 
 With a split tunnel the VPN only claims your corporate routes, so Tailscale's default route and `100.64.0.0/10` are untouched.
 
-**Keep iCloud Private Relay working.** macOS disables Private Relay when it sees a default-route rule, a DNS takeover, *or* a packet-filter change. A route-only split tunnel avoids the first two, but `vpn-slice`'s default "block incoming" firewall adds a pf anchor that trips the third. Set `allow_incoming = true` (passes `vpn-slice -i`) to drop that firewall so Private Relay stays on — weigh it against letting VPN hosts reach open ports on your machine.
+**Keep iCloud Private Relay working.** macOS disables Private Relay when it sees a default-route rule, a DNS takeover, *or* a packet-filter change. A route-only split tunnel avoids the first two, but `vpn-slice`'s default "block incoming" firewall adds a pf anchor that trips the third. Set `allow_incoming = true` (passes `vpn-slice -i`) to drop that firewall so Private Relay stays on. Weigh that against letting VPN hosts reach open ports on your machine.
 
-That firewall can also *leak*: `vpn-slice` appends its anchor to `/etc/pf.conf` and sometimes fails to remove it on teardown, leaving the anchor loaded on every boot — which keeps Private Relay disabled even with no VPN connected. `openconnect-auto-sso` **warns at startup** if it finds such a leftover and offers to clean it (strip the line and reload pf). `allow_incoming = true` avoids creating it in the first place.
+That firewall can also *leak*: `vpn-slice` appends its anchor to `/etc/pf.conf` and sometimes fails to remove it on teardown, leaving the anchor loaded on every boot, which keeps Private Relay disabled even with no VPN connected. `openconnect-auto-sso` **warns at startup** if it finds such a leftover and offers to clean it (strip the line and reload pf). `allow_incoming = true` avoids creating it in the first place.
 
 **Skip the sudo prompt.** Add a scoped `sudoers` rule (via `sudo visudo`) so only `openconnect` can run without a password:
 
@@ -162,7 +162,7 @@ youruser ALL=(root) NOPASSWD: /opt/homebrew/bin/openconnect
 
 To bring the tunnel up at login and keep it up, `install-autostart.sh` installs a per-user **LaunchAgent**, a small **root-owned teardown helper**, and the NOPASSWD `sudoers` rule they need (a launchd job has no terminal to type a password into):
 
-Run `./install.sh` first so a config exists — `install` refuses to load an agent that would just fail-loop with no config.
+Run `./install.sh` first so a config exists: `install` refuses to load an agent that would just fail-loop with no config.
 
 ```sh
 ./install-autostart.sh install         # connect at login + reconnect on drop
@@ -172,20 +172,20 @@ Run `./install.sh` first so a config exists — `install` refuses to load an age
 tail -f ~/Library/Logs/openconnect-auto-sso.log
 ```
 
-> **Upgrading an existing install.** Re-run `./install-autostart.sh install` (or `install --once`) after pulling changes. The LaunchAgent plist bakes in a copy of `OC_LAUNCHD` and `ThrottleInterval` at install time, so a plist written by an older version keeps stale values — it may lack `OC_LAUNCHD` (or carry a retired variable) and pin an out-of-date throttle window — until you regenerate it.
+> **Upgrading an existing install.** Re-run `./install-autostart.sh install` (or `install --once`) after pulling changes. The LaunchAgent plist bakes in a copy of `OC_LAUNCHD` and `ThrottleInterval` at install time, so a plist written by an older version keeps stale values until you regenerate it: it may lack `OC_LAUNCHD` (or carry a retired variable), and pin an out-of-date throttle window.
 
-The agent runs in your GUI session (`Aqua`), so a **warm** cookie connects silently while a **cold** one still pops the SSO window at login. By default it reconnects if the tunnel drops. Note that a *persistent* failure keeps retrying roughly every 5 minutes — for a dead network that cadence comes from the reachability wait (see [Sleep and wake](#sleep-and-wake)), and for an SSO login you keep dismissing it comes from launchd's throttle, which re-pops the login each time; use `--once` (or `uninstall`) if that's not what you want.
+The agent runs in your GUI session (`Aqua`), so a **warm** cookie connects silently while a **cold** one still pops the SSO window at login. By default it reconnects if the tunnel drops. Note that a *persistent* failure keeps retrying roughly every 5 minutes. For a dead network that cadence comes from the reachability wait (see [Sleep and wake](#sleep-and-wake)), and for an SSO login you keep dismissing it comes from launchd's throttle, which re-pops the login each time; use `--once` (or `uninstall`) if that's not what you want.
 
-Because the agent runs as you but the tunnel runs as root, it can't signal openconnect directly. That gap matters for **`uninstall`**, which uses the teardown helper (via a scoped NOPASSWD rule) to stop a running tunnel before removing anything — so it never strands a root tunnel with leftover routes/DNS. On **logout** the helper isn't needed: launchd signals the whole job, so openconnect gets the signal directly and runs its own clean disconnect. (If openconnect is ever `SIGKILL`ed instead — e.g. a crash — that clean path is skipped; a stray `/etc/resolver/<name>` can then block the next connect until you `sudo rm` it, which the startup sweep points out.)
+Because the agent runs as you but the tunnel runs as root, it can't signal openconnect directly. That gap matters for **`uninstall`**, which uses the teardown helper (via a scoped NOPASSWD rule) to stop a running tunnel before removing anything, so it never strands a root tunnel with leftover routes/DNS. On **logout** the helper isn't needed: launchd signals the whole job, so openconnect gets the signal directly and runs its own clean disconnect. (If openconnect is ever `SIGKILL`ed instead, e.g. by a crash, that clean path is skipped; a stray `/etc/resolver/<name>` can then block the next connect until you `sudo rm` it, which the startup sweep points out.)
 
-> **Security.** The `sudoers` rule grants passwordless `sudo openconnect`, and openconnect can run arbitrary commands as root via its `-s` vpnc-script option — so it is effectively passwordless root for any process running as you. That is the price of unattended auto-connect; `uninstall` removes it. (The second NOPASSWD entry, for the teardown helper, does **not** widen this: the helper is root-owned and self-contained — it only signals openconnect by name, so it can't be pointed at attacker code the way a user-writable script could.) Prefer to keep the prompt? Skip this and connect manually (see *Skip the sudo prompt* above). For what the tool itself does and doesn't touch, see [Security notes](#security-notes).
+> **Security.** The `sudoers` rule grants passwordless `sudo openconnect`, and openconnect can run arbitrary commands as root via its `-s` vpnc-script option, so it is effectively passwordless root for any process running as you. That is the price of unattended auto-connect; `uninstall` removes it. (The second NOPASSWD entry, for the teardown helper, does **not** widen this: the helper is root-owned and self-contained, and only signals openconnect by name, so it can't be pointed at attacker code the way a user-writable script could.) Prefer to keep the prompt? Skip this and connect manually (see *Skip the sudo prompt* above). For what the tool itself does and doesn't touch, see [Security notes](#security-notes).
 
 ## Security notes
 
 These cover the tool's own behavior. The separate trade-off of the auto-start agent's passwordless `sudo` is in [Start automatically at login](#start-automatically-at-login).
 
-- **The browser is never root.** Phase 1 runs as you; only Phase 2 (the tunnel) uses `sudo`. openconnect keeps root for the tunnel's lifetime — on macOS this is required so that *disconnecting* can cleanly restore your routes and DNS. (Dropping privileges with `--setuid` makes teardown run unprivileged, which fails to restore them and can strand your network.)
-- **No secrets are stored by this tool.** Authentication uses your real IdP session (passkeys, Duo, Touch ID…). The only persisted item is the IdP's own browser cookie, in a profile under your user account — exactly like any browser's "stay signed in".
+- **The browser is never root.** Phase 1 runs as you; only Phase 2 (the tunnel) uses `sudo`. openconnect keeps root for the tunnel's lifetime; on macOS this is required so that *disconnecting* can cleanly restore your routes and DNS. (Dropping privileges with `--setuid` makes teardown run unprivileged, which fails to restore them and can strand your network.)
+- **No secrets are stored by this tool.** Authentication uses your real IdP session (passkeys, Duo, Touch ID…). The only persisted item is the IdP's own browser cookie, in a profile under your user account, exactly like any browser's "stay signed in".
 - **The server certificate is pinned** from Phase 1 (`--servercert`) when connecting.
 
 ## Troubleshooting
@@ -200,12 +200,12 @@ Environment knobs (browser helper and connect script):
 | `VPN_BROWSER_TIMEOUT_MS` | overall safety timeout (default 300000)            |
 | `OC_AUTO_SSO_CONFIG`     | path to an alternate config file                   |
 | `OC_DUMP`                | dump the server-advertised env vars to this file   |
-| `OC_LAUNCHD`             | auto-start mode, baked into the plist by `install-autostart.sh`: `keepalive` reconnects on drop, `once` connects at login only; unset = interactive. Selects the reconnect budget + network-wait bound (see [Sleep and wake](#sleep-and-wake)) — leave it to the installer, don't set it by hand. |
+| `OC_LAUNCHD`             | auto-start mode, baked into the plist by `install-autostart.sh`: `keepalive` reconnects on drop, `once` connects at login only; unset = interactive. Selects the reconnect budget + network-wait bound (see [Sleep and wake](#sleep-and-wake)). Leave it to the installer; don't set it by hand. |
 | `PHASE1_DEADLINE`        | seconds Phase 1 waits for the SSO helper before aborting a wedged login (default 420) |
 
 ## Scope
 
-Targets openconnect servers that use the **external-browser SSO flow** (the `localhost:29786` loopback callback). Any identity provider works — the helper is a generic web view with no per-provider knowledge.
+Targets openconnect servers that use the **external-browser SSO flow** (the `localhost:29786` loopback callback). Any identity provider works: the helper is a generic web view with no per-provider knowledge.
 
 ## License
 
