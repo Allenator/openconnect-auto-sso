@@ -111,7 +111,7 @@ Many VPN servers disconnect a tunnel that carries no traffic (openconnect report
 
 ### Healing a collapsed tunnel MTU
 
-openconnect probes the tunnel's path MTU whenever it (re)connects. On an *in-process* reconnect after a same-IP Wi-Fi blip it re-probes while the path is still lossy, can misread lost probes as "MTU too big", and ratchets the MTU down to the 576 floor — where it **stays** (it never re-probes upward). The result is a tunnel that reports "connected" but silently drops large packets: small requests work while big ones (most web pages) time out. A *fresh* connect re-probes on a settled path and comes up at the correct MTU, so it never hits this. (This is distinct from a full drop, which [Sleep and wake](#sleep-and-wake) already recovers.)
+openconnect probes the tunnel's path MTU whenever it (re)connects. On an *in-process* reconnect — after a same-IP Wi-Fi blip, or on waking from sleep, which [normally resumes in place](#sleep-and-wake) — it re-probes while the path is still lossy, can misread lost probes as "MTU too big", and ratchets the MTU down to the 576 floor — where it **stays** (it never re-probes upward). The result is a tunnel that reports "connected" but silently drops large packets: small requests work while big ones (most web pages) time out. A *fresh* connect re-probes on a settled path and comes up at the correct MTU, so it never hits this. (This is distinct from a full drop, which [Sleep and wake](#sleep-and-wake) already recovers.)
 
 When `mtu_healthcheck` is on (the default), the keepalive loop watches for exactly this signature — the target answers a small ping but not a large *don't-fragment* one, for two checks in a row — and forces a fresh reconnect: openconnect exits, and the auto-start agent's `KeepAlive` respawns the connect script, which reconnects on a settled path. To avoid false heals it first confirms the target *does* answer a large don't-fragment ping while the tunnel is healthy; a target that blocks large ICMP simply disables the check for that session (logged) rather than triggering a reconnect loop.
 
@@ -122,9 +122,28 @@ Healing therefore has two requirements, and turns itself off (with a logged line
 
 ## Sleep and wake
 
-openconnect's built-in reconnect cannot survive a macOS sleep: on wake its socket is still bound to local addresses that no longer exist, so every retry fails (`Can't assign requested address`) until its retry budget expires — and only then does it exit. A *fresh* openconnect process connects fine. So the recovery strategy is to give up quickly and let a fresh connect take over, rather than to keep reconnecting.
+What defeats openconnect's built-in reconnect is not sleep itself — it is the **local address going away**. If the socket's address is gone when openconnect retries, every attempt fails (`Can't assign requested address`) until its retry budget expires, and only then does it exit; a *fresh* process then connects fine. If the address is still there, the in-process reconnect simply works and the tunnel carries on.
 
-That only makes sense when something will actually restart you, so `reconnect_timeout` defaults by launch mode: **30 s under the `KeepAlive` auto-start agent** (launchd respawns the connect script) and **300 s under `install --once` or a manual run** — openconnect's own default — because nothing respawns those, so in-process recovery is the only recovery they have. Set `reconnect_timeout` explicitly to override either.
+Which case you land in is decided by two *separate* clocks, and keeping them apart is the whole trick:
+
+1. **Detection** — openconnect declares the peer dead `2 × dpd` after the last packet it *received*, not after the drop (`dpd` is whatever the server pushes, commonly 30 s; openconnect logs it as `CSTP connected. DPD 30, Keepalive 30`). Since that last packet can already be up to `dpd` old when the drop lands, detection takes **`dpd` to `2 × dpd`** — 30–60 s at a 30 s `dpd`. Nothing you can configure shortens this.
+2. **Retrying** — *only then* does openconnect begin spending `reconnect_timeout`. This is the part you control.
+
+Giving up is the sum of the two. Under the auto-start agent (`reconnect_timeout` = 30 s) that lands **60–90 s** after the drop:
+
+| Network gone for | What happens (agent defaults: `dpd` 30 s, `reconnect_timeout` 30 s) |
+|---|---|
+| under ~60 s | openconnect has not declared the peer dead yet, or reconnects in place — the tunnel **resumes** in the same process, at the risk of a [collapsed MTU](#healing-a-collapsed-tunnel-mtu) |
+| ~60–90 s | a race — **resume** (same MTU risk) if the network returns before the budget expires, **fresh** if it doesn't |
+| over ~90 s | the budget expires, openconnect exits, and a **fresh** connect replaces it: a clean tunnel, but a new VPN session |
+
+Those boundaries are the agent's. Under `install --once` or a manual run `reconnect_timeout` is 300 s, so giving up moves out to **330–360 s** and every row shifts with it — a 90 s outage resumes there rather than going fresh.
+
+**A macOS sleep does not fit that table at all**, and the reason is the useful part: the process is *frozen*, so it observes no outage. On wake it finds `last_rx` long stale, declares the peer dead immediately, and retries — against a network that is already back. So what decides the outcome is not how long you slept but whether the **address survived**. It usually does (macOS commonly holds the interface's lease across sleep, though that depends on your `pmset` settings — `tcpkeepalive`, `powernap`, `standby`), and then the tunnel **resumes** in place however long the lid was shut. Waking on a *different* network is what strands the socket on an address that no longer exists and forces the fresh path.
+
+`reconnect_timeout` therefore sizes only the retry clock, and defaults by launch mode: **30 s under the `KeepAlive` auto-start agent** (launchd respawns the connect script, so conceding early is free) and **300 s under `install --once` or a manual run** — openconnect's own default — because nothing respawns those, so in-process recovery is the only recovery they have. Set it explicitly to override either. Lowering it *does* pull giving up earlier — down to the 30–60 s detection floor at `0` — but it can never beat that floor, because detection elapses while the network is still down whatever you set.
+
+The resume path is the one that can come back with a [collapsed MTU](#healing-a-collapsed-tunnel-mtu), and per the sleep paragraph above, closing the lid and opening it again lands squarely there. So the most ordinary event of all takes the path that looks healthiest while it can silently degrade — which is exactly what `mtu_healthcheck` is there to catch.
 
 Before authenticating, the connect script waits for the VPN server to become **reachable** (up to 5 minutes under the agent, 10 s in a terminal). It is a TCP probe rather than a default-route check, so it also covers "the Wi-Fi is up but the WAN is down" and DNS that isn't ready yet. Waiting beats exiting: launchd delays a respawn by `ThrottleInterval` *minus* how long the job ran, so a job that waits the outage out respawns immediately, whereas one that fails fast idles out the remainder. (A captive portal that redirects the VPN port can still make the probe report "reachable" — it is a readiness gate, not a guarantee; Phase 1 then reports the real error.)
 

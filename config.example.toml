@@ -67,9 +67,11 @@ server = "vpn.example.com"
 # How long openconnect retries in-process after a drop before giving up (seconds; 0 = give
 # up at once). There is no single default: it is 30 under the KeepAlive auto-start agent
 # (which respawns a fresh connect) and 300 under `install --once` or a manual run (nothing
-# restarts those), so leaving this unset is usually right. openconnect cannot reconnect
-# across a macOS sleep -- a fresh connect is what actually recovers -- and an outage longer
-# than this ends the tunnel. Read "Sleep and wake" in the README before pinning a value here.
+# restarts those), so leaving this unset is usually right. This budget is only spent AFTER
+# openconnect declares the peer dead, which takes 30-60s from the drop (it fires 2*dpd after
+# the last packet RECEIVED, and that packet can already be dpd old). So lowering this pulls
+# the give-up point in but can never beat that 30-60s floor, and an outage outlasting
+# detection + this budget ends the tunnel. Read "Sleep and wake" in the README first.
 # reconnect_timeout = 30      # 300 under --once/manual; unset = pick automatically
 
 # Advanced (usually leave default):
