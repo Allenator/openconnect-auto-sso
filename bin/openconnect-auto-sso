@@ -452,13 +452,22 @@ exec 3<&-                             # release the preserved stdin before Phase
 # (terminate-then-wait, so its just-earned cookie is durably flushed first).
 _end_browser
 
-# Phase 2 signal handling. In a terminal, Ctrl-C reaches the root openconnect child
-# directly via the foreground process group, so we clear our trap and let openconnect
-# run its own clean disconnect. Under launchd there is no controlling tty, so the
-# signal reaches only this (user) script and not the root child -- so invoke the
-# privileged teardown helper (installed root-owned + scoped-NOPASSWD by
-# install-autostart.sh) to SIGTERM openconnect for a clean disconnect. `sudo -n`
-# never prompts: if the helper/rule isn't present it fails fast and we just exit.
+# Phase 2 signal handling. What actually stops the tunnel is PROCESS-GROUP delivery: both a
+# terminal's Ctrl-C and launchd (which signals the whole job) reach the root openconnect
+# directly, and it runs its own clean disconnect. Neither relies on this trap.
+#
+# This trap CANNOT preempt that, and it is worth being explicit about why: sh defers a trap
+# until the current foreground command finishes, and Phase 2 below is a foreground pipeline
+# (printf | sudo openconnect). So while openconnect is alive the trap never runs; it runs only
+# AFTER the pipeline returns -- i.e. after openconnect has already exited. Its job is therefore
+# just to give us a defined status, which the EXIT trap turns into run-dir cleanup.
+#
+# Known limitation of the same mechanism: a signal delivered ONLY to this script's pid (`kill
+# <pid>`, or a supervisor that does not signal the group) is deferred with nothing to release
+# it -- the script keeps waiting and openconnect keeps running. Backgrounding the pipeline and
+# `wait`-ing (as Phase 1 does) would fix that, at the cost of putting sudo's tty password
+# prompt behind a background job; not worth it for a case launchd and Ctrl-C both avoid.
+#
 # Test stdin (matches the startup sweep's `[ ! -t 0 ]`), so a manual run with only
 # stderr redirected still takes the terminal path.
 if [ -t 0 ]; then

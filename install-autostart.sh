@@ -5,8 +5,10 @@
 #   1. a per-user LaunchAgent (~/Library/LaunchAgents/openconnect-auto-sso.plist)
 #      that runs the connect script at login and reconnects if the tunnel drops;
 #   2. a root-owned teardown helper (/usr/local/libexec/openconnect-auto-sso/
-#      vpn-teardown) that cleanly stops the tunnel on logout/uninstall -- the agent
-#      runs as you and can't signal the root openconnect directly;
+#      vpn-teardown) that `uninstall` uses to cleanly stop a running tunnel -- this
+#      script runs as you and can't signal the root openconnect directly. (Logout does
+#      not need it: launchd signals the whole job, so openconnect gets the signal
+#      itself and disconnects cleanly.)
 #   3. a NOPASSWD sudoers drop-in (/etc/sudoers.d/openconnect-auto-sso) so Phase 2's
 #      `sudo openconnect` and the teardown helper never prompt (a LaunchAgent has no
 #      TTY to type into).
