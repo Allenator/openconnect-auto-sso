@@ -1377,6 +1377,117 @@ def test_connect_refuse_block_removed():
     assert "already connected" not in src
 
 
+# --- bin/openconnect-auto-sso: _mtu_degraded (MTU-collapse detection) ------------------
+# _mtu_degraded is a pure helper (before the seam guard), so it's exercised via OC_CONNECT_TEST=1
+# with a PING_BIN stub. STRICT set -eu throughout: the detection sits inside the keepalive
+# subshell, so a probe that leaks a non-zero status must return a verdict, never abort the loop.
+def _ping_stub(tmp_path):
+    """A fake /sbin/ping whose behavior is $MODE-driven. A "large" probe is detected by a -D or
+    -s flag (the don't-fragment MTU probe carries both); the plain keepalive/small ping has
+    neither. degraded = answer small, refuse large; healthy = answer both; unreach = refuse all."""
+    stub = tmp_path / "ping"
+    stub.write_text(
+        "#!/bin/sh\n"
+        "large=0\n"
+        'for a in "$@"; do case "$a" in -D|-s) large=1 ;; esac; done\n'
+        'case "${MODE:-healthy}" in\n'
+        "  unreach)  exit 1 ;;\n"
+        '  degraded) [ "$large" = 1 ] && exit 1 || exit 0 ;;\n'
+        "  *)        exit 0 ;;\n"
+        "esac\n")
+    stub.chmod(0o755)
+    return str(stub)
+
+
+def test_mtu_degraded_true_when_small_ok_large_fails(tmp_path):
+    # The collapse signature: the target answers a small ping but NOT a large don't-fragment one
+    # -> _mtu_degraded returns 0 (degraded), which arms the heal path.
+    r = _sh(SRC_CONNECT, '_mtu_degraded host && echo DEGRADED || echo OK\n',
+            extra_env={"PING_BIN": _ping_stub(tmp_path), "MODE": "degraded"}, strict=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "DEGRADED"
+
+
+def test_mtu_degraded_false_when_large_ok(tmp_path):
+    # A healthy tunnel answers BOTH pings -> not degraded (return 1), so the heal path never fires.
+    r = _sh(SRC_CONNECT, '_mtu_degraded host && echo DEGRADED || echo OK\n',
+            extra_env={"PING_BIN": _ping_stub(tmp_path), "MODE": "healthy"}, strict=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "OK"
+
+
+def test_mtu_degraded_false_when_unreachable(tmp_path):
+    # MUTATION-CHECK anchor: the small-ping gate. An unreachable target (small ping ALSO fails) is
+    # a plain outage, NOT an MTU collapse -> must return 1 ("can't tell"), never 0. Dropping the
+    # small-ping gate would make this read as degraded and fire a false heal on any outage.
+    r = _sh(SRC_CONNECT, '_mtu_degraded host && echo DEGRADED || echo OK\n',
+            extra_env={"PING_BIN": _ping_stub(tmp_path), "MODE": "unreach"}, strict=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "OK"
+
+
+def test_mtu_degraded_set_u_safe_without_ping_bin(tmp_path):
+    # PING_BIN's default is assigned INSIDE the OC_CONNECT_TEST seam, so the helper must default it
+    # itself: a sourced caller under `set -u` with PING_BIN unset would otherwise die "unbound
+    # variable" instead of returning a verdict. Probes LOOPBACK with the real /sbin/ping (no
+    # network, no DNS): it answers both sizes, so this must report OK, not abort.
+    r = _sh(SRC_CONNECT, 'unset PING_BIN\n_mtu_degraded 127.0.0.1 && echo DEGRADED || echo OK\n',
+            strict=True)
+    assert "unbound variable" not in r.stderr, r.stderr
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "OK"
+
+
+def test_mtu_heal_refuses_when_nothing_would_respawn_the_tunnel(tmp_path):
+    # THE mode gate: healing deliberately drops the tunnel, so it is only safe when something
+    # respawns us. A manual run (OC_LAUNCHD unset, as with `install --once`) has no respawner --
+    # healing there would take a degraded-but-usable tunnel permanently DOWN, strictly worse than
+    # the collapsed MTU. The loop must refuse and say so. MODE=healthy so no heal can fire either
+    # way. keepalive_interval = 1 is a HARNESS need, not part of the assertion: the backgrounded
+    # keepalive's `sleep` inherits our stderr pipe and outlives the trap that kills its subshell,
+    # so a 30s interval would hold the pipe open past capture_output's read and time the test out.
+    env, m = _stub_connect_env(tmp_path, extra_cfg='keepalive_host = "10.0.0.1"\nkeepalive_interval = 1\nmtu_healthcheck = true\n')
+    env["STUB_MODE"] = "normal"; env["PHASE1_DEADLINE"] = "20"
+    env["PING_BIN"] = _ping_stub(tmp_path); env["MODE"] = "healthy"
+    env.pop("OC_LAUNCHD", None)                     # manual / --once: nobody is watching
+    r = subprocess.run([CONNECT], capture_output=True, text=True, env=env,
+                       stdin=subprocess.DEVNULL, timeout=30)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert "MTU healing off" in r.stderr, "unsupervised run must refuse to heal"
+    assert "also healing" not in r.stderr
+
+
+def test_mtu_heal_active_under_the_keepalive_agent(tmp_path):
+    # The other half of the gate (so the fix above can't pass by disabling healing outright):
+    # under the KeepAlive agent (OC_LAUNCHD=keepalive) launchd WILL respawn a healed tunnel, so
+    # healing must be active.
+    env, m = _stub_connect_env(tmp_path, extra_cfg='keepalive_host = "10.0.0.1"\nkeepalive_interval = 1\nmtu_healthcheck = true\n')
+    env["STUB_MODE"] = "normal"; env["PHASE1_DEADLINE"] = "20"
+    env["PING_BIN"] = _ping_stub(tmp_path); env["MODE"] = "healthy"
+    env["OC_LAUNCHD"] = "keepalive"
+    r = subprocess.run([CONNECT], capture_output=True, text=True, env=env,
+                       stdin=subprocess.DEVNULL, timeout=30)
+    assert r.returncode == 0, (r.stdout, r.stderr)
+    assert "also healing" in r.stderr, "supervised run must heal"
+    assert "MTU healing off" not in r.stderr
+
+
+def test_keepalive_mtu_heal_wiring_forces_reconnect_on_degradation():
+    # Structural (the loop is inline like the existing keepalive, so it's not directly callable):
+    # a confirmed collapse in the keepalive subshell must drive a FRESH reconnect via the root
+    # teardown helper. Pin that the MTU_HEALTHCHECK-gated block calls _mtu_degraded, counts
+    # MTU_HEALTHCHECK_FAILS consecutive readings, and on the threshold invokes sudo -n
+    # "$TEARDOWN_BIN" then breaks (openconnect exits -> script exits -> launchd respawns).
+    import re
+    with open(CONNECT) as f:
+        src = f.read()
+    # The break must be CONDITIONAL on the teardown succeeding: `sudo -n` fails when the NOPASSWD
+    # rule is missing, and breaking anyway would drop the watcher while the tunnel stayed degraded.
+    assert re.search(r'_mtu_degraded "\$host".*?MTU_HEALTHCHECK_FAILS.*?'
+                     r'if sudo -n "\$TEARDOWN_BIN"[^\n]*; then.*?\n\s*break', src, re.S), \
+        "the keepalive MTU-heal path must reconnect via the teardown helper and break only on success"
+
+
 # --- bin/openconnect-auto-sso: Phase-1 PID-capture flow (stub-openconnect integration) ---
 # These run the REAL connect script end-to-end (it is always `set -eu`, so they double as the
 # strict-mode check) with a stub `openconnect` + `sudo` + `nc` on PATH and a minimal config.
@@ -1384,7 +1495,7 @@ def test_connect_refuse_block_removed():
 # (Phase 2), and spawns a stub helper that writes $VPN_BROWSER_PIDFILE (the connect script sets +
 # exports it) and carries the vpn_browser.py marker in its argv so pid_argv_has confirms it. The
 # stubs touch/rm liveness marker files (via TERM traps) so the test can see who was killed.
-def _stub_connect_env(tmp_path):
+def _stub_connect_env(tmp_path, extra_cfg=""):
     bindir = tmp_path / "sbin"; bindir.mkdir()
     mark = tmp_path / "mark"; mark.mkdir()
     oc_alive = mark / "oc_alive"
@@ -1483,7 +1594,7 @@ def _stub_connect_env(tmp_path):
     nc.chmod(0o755)
 
     cfg = tmp_path / "config.toml"
-    cfg.write_text('server = "test.example"\n')
+    cfg.write_text('server = "test.example"\n' + extra_cfg)
 
     env = dict(os.environ)
     env["PATH"] = "%s:%s" % (bindir, env["PATH"])

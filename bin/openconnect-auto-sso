@@ -66,6 +66,26 @@ _shq() { printf "'"; printf '%s' "$1" | sed "s/'/'\\\\''/g"; printf "'"; }
 # (lib/common.sh owns the rationale). Wrapped so the seam can exercise the OC_LAUNCHD wiring.
 apply_launch_budget() { recovery_budget "${OC_LAUNCHD:-}"; }
 
+# _mtu_degraded: return 0 (degraded) iff $1 answers a SMALL ping but NOT a large don't-fragment
+# ping -- the signature of a tunnel whose path MTU collapsed to the 576 floor (openconnect's
+# in-process RESUME can re-probe over a still-flaky path, misread lost probes as "MTU too big",
+# ratchet down, and stay there: large packets fail while small ones work). The small-ping gate
+# rules out tunnel-down / unreachable false positives -- those return 1 ("not degraded / can't
+# tell"), NEVER 0, so the heal path can't fire on a plain outage. Best-effort and set-e-safe:
+# every ping is guarded (|| return / && return), so a failing probe returns a verdict, never
+# aborts a set -eu caller. macOS /sbin/ping: -c 1 = one packet, -t = timeout secs, -D = set the
+# don't-fragment bit, -s = payload bytes (1200+28 = 1228 > the 576 floor and <= a healthy ~1280).
+# PING_BIN / MTU_PROBE_SIZE are read at call time and defaulted HERE too, not just with the
+# other env vars below: those live inside the OC_CONNECT_TEST seam, so a sourced caller under
+# set -u would trip on an unset PING_BIN. PING_BIN is an override only so tests can stub the
+# probe (the keepalive runs as the user).
+_mtu_degraded() {   # $1 = probe host
+    _p="${PING_BIN:-/sbin/ping}"
+    "$_p" -c 1 -t 3 "$1" >/dev/null 2>&1 || return 1                                  # unreachable
+    "$_p" -c 1 -t 3 -D -s "${MTU_PROBE_SIZE:-1200}" "$1" >/dev/null 2>&1 && return 1  # large DF ok -> healthy
+    return 0                                                                           # small ok, large fails
+}
+
 # _build_vs: assemble the Phase-2 `-s` wrapper string into $vs from the config-derived globals
 # + the resolved $VPN_SLICE abs path. The caller appends `-s "$vs"` to openconnect's argv (the
 # `set --` stays in the caller so it edits the caller's positionals). Split out so the seam can
@@ -172,6 +192,8 @@ KEEPALIVE_INTERVAL="${KEEPALIVE_INTERVAL:-30}"
 # (nothing would respawn it). An explicit `reconnect_timeout` from the config still wins.
 apply_launch_budget
 ALLOW_INCOMING="${ALLOW_INCOMING:-0}"
+MTU_HEALTHCHECK="${MTU_HEALTHCHECK:-1}" # heal a collapsed tunnel MTU (needs keepalive; see below)
+PING_BIN="${PING_BIN:-/sbin/ping}"      # keepalive + MTU probes; override only for tests (runs as user)
 PROXY_NAMES="${PROXY_NAMES:-}"          # DNS names routed via the VPN (proxy + /etc/resolver)
 ROUTE_INTERNAL="${ROUTE_INTERNAL:-0}"   # also route the VPN's own subnet (server-pushed)
 ROUTE_SPLITS="${ROUTE_SPLITS:-0}"       # also add the server's split-include subnets
@@ -497,6 +519,16 @@ fi
 # Optional keepalive: some servers drop an idle tunnel. Ping a host *inside* the
 # VPN periodically so a little traffic keeps flowing. The subshell watches the
 # script's PID and stops when we exit (belt-and-suspenders with the EXIT trap).
+#
+# The same loop doubles as an MTU-collapse healer (MTU_HEALTHCHECK=1, default): openconnect's
+# in-process RESUME after a same-IP Wi-Fi blip can re-probe the path MTU over a still-flaky link,
+# ratchet it to the 576 floor, and stay there -- a "connected" tunnel where large packets fail
+# (browser timeouts) but small ones work. A FRESH connect re-probes on a settled path and is
+# immune, so when we PROVE the MTU collapsed we force a fresh reconnect via the root teardown
+# helper (openconnect exits -> this script exits -> launchd respawns a clean connect). The
+# subshell survives openconnect's in-process reconnects (it watches $$, the connect-script PID,
+# which is stable across them), so it can observe the post-resume degradation. Healing REUSES the
+# keepalive target + loop, so it is active only when keepalive is on.
 if [ -n "$KEEPALIVE_HOST" ]; then
     if [ "$KEEPALIVE_HOST" = "@dns" ]; then
         # KA_DNS_FILE ($_rundir/dns) is written by the ROOT wrapper once the tunnel is up; the
@@ -505,13 +537,62 @@ if [ -n "$KEEPALIVE_HOST" ]; then
     else
         echo ">> keepalive: ping $KEEPALIVE_HOST every ${KEEPALIVE_INTERVAL}s" >&2
     fi
-    ( while kill -0 "$$" 2>/dev/null; do
+    # Healing works by making openconnect EXIT and letting a respawn bring up a clean tunnel, so
+    # it is only safe when something WILL respawn us: the KeepAlive agent (OC_LAUNCHD=keepalive).
+    # Under `install --once` or a manual run nothing does (the same asymmetry recovery_budget
+    # encodes when it picks the reconnect budget), so healing there would take a degraded-but-up
+    # tunnel permanently down -- strictly worse than the collapsed MTU it fixes. Refuse instead.
+    if [ "$MTU_HEALTHCHECK" = "1" ] && [ "${OC_LAUNCHD:-}" != keepalive ]; then
+        MTU_HEALTHCHECK=0
+        echo ">> keepalive: MTU healing off (nothing would respawn a healed tunnel -- it needs" \
+             "the KeepAlive agent: ./install-autostart.sh install)" >&2 || true
+    fi
+    [ "$MTU_HEALTHCHECK" = "1" ] && \
+        echo ">> keepalive: also healing a collapsed tunnel MTU via a fresh reconnect" >&2 || true
+    # _mtu_base: pending -> ok (a large-DF ping got through once, so the target does NOT block
+    # large ICMP and we can trust the degradation check) -> off (never got through after a few
+    # tries: the target blocks large ICMP, or this connect is ALREADY degraded -- either way,
+    # disable the check to avoid a false heal / heal-loop). _fail: consecutive degraded readings.
+    # Everything here is best-effort (|| true / condition context) so nothing aborts the subshell.
+    ( _fail=0; _mtu_base=pending; _mtu_tries=0
+      while kill -0 "$$" 2>/dev/null; do
           if [ "$KEEPALIVE_HOST" = "@dns" ]; then
               host=$(cat "$KA_DNS_FILE" 2>/dev/null || true)
           else
               host="$KEEPALIVE_HOST"
           fi
-          [ -n "$host" ] && ping -c 1 -t 5 "$host" >/dev/null 2>&1 || true
+          [ -n "$host" ] && "$PING_BIN" -c 1 -t 5 "$host" >/dev/null 2>&1 || true
+          if [ "$MTU_HEALTHCHECK" = "1" ] && [ -n "$host" ] && [ "$_mtu_base" != off ]; then
+              if [ "$_mtu_base" = pending ]; then
+                  if "$PING_BIN" -c 1 -t 3 -D -s "${MTU_PROBE_SIZE:-1200}" "$host" >/dev/null 2>&1; then
+                      _mtu_base=ok
+                  else
+                      _mtu_tries=$((_mtu_tries + 1))
+                      if [ "$_mtu_tries" -ge "${MTU_HEALTHCHECK_BASELINE_TRIES:-5}" ]; then
+                          _mtu_base=off
+                          echo ">> keepalive: MTU healthcheck disabled ($host never answered a large" \
+                               "ping -- it blocks large ICMP, or the tunnel is already degraded)" >&2 || true
+                      fi
+                  fi
+              elif _mtu_degraded "$host"; then
+                  _fail=$((_fail + 1))
+                  if [ "$_fail" -ge "${MTU_HEALTHCHECK_FAILS:-2}" ]; then
+                      # Only claim the heal (and stop watching) if the teardown actually ran --
+                      # sudo -n fails when the NOPASSWD rule is missing, and reporting a reconnect
+                      # we never forced would leave a degraded tunnel up with the loop gone.
+                      if sudo -n "$TEARDOWN_BIN" 2>/dev/null; then
+                          echo ">> keepalive: tunnel MTU collapsed ($host answers small pings but" \
+                               "not large ones); forced a fresh reconnect" >&2 || true
+                          break                        # openconnect exits -> we exit -> respawn
+                      fi
+                      echo ">> keepalive: tunnel MTU collapsed ($host answers small pings but not" \
+                           "large ones) but the teardown helper did not run -- leaving it up" >&2 || true
+                      _fail=0                          # re-arm; retry rather than spin every check
+                  fi
+              else
+                  _fail=0
+              fi
+          fi
           sleep "$KEEPALIVE_INTERVAL"
       done ) &
     KA_PID=$!

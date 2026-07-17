@@ -57,6 +57,7 @@ Config is a TOML file at `~/.config/openconnect-auto-sso/config.toml` (outside t
 | `allow_incoming` | bool | `true` allows incoming from the VPN (no pf firewall) so iCloud Private Relay keeps working (default `false`). |
 | `keepalive_host` | string | Host to ping through the tunnel to avoid idle-disconnects. `"@dns"` auto-targets the VPN's own pushed DNS server (recommended); or a specific in-VPN host. `""` = off. |
 | `keepalive_interval` | int | Seconds between keepalive pings (default 30). |
+| `mtu_healthcheck` | bool | Heal a tunnel whose path MTU collapsed after an in-process reconnect by forcing a fresh reconnect (default `true`). Only active when keepalive is on — see [Keeping an idle tunnel alive](#keeping-an-idle-tunnel-alive). |
 | `reconnect_timeout` | int | Seconds openconnect retries in-process after a drop before giving up and exiting (`0` = give up at once). The default depends on launch mode: **30** under the `KeepAlive` auto-start agent (launchd respawns a fresh connect) and **300** under `install --once` or a manual run (nothing will restart it). See [Sleep and wake](#sleep-and-wake). |
 | `profile_name` | string | Qt persistent-profile storage key. Usually leave default. |
 | `callback` | string | openconnect external-browser callback `host:port`. Rarely changed. |
@@ -107,6 +108,17 @@ The connect script resolves `vpn-slice` to an absolute path, since `sudo` (Phase
 ## Keeping an idle tunnel alive
 
 Many VPN servers disconnect a tunnel that carries no traffic (openconnect reports `Received server disconnect: ... 'Idle Timeout'`). In split-tunnel mode that happens easily, since only your routed subnets generate traffic. Set `keepalive_host` to a host that is reachable **inside** the VPN — i.e. one covered by `via_vpn` (or anything, in full-tunnel mode) — and the connect script pings it every `keepalive_interval` seconds while connected, stopping automatically on disconnect. The easiest choice is `keepalive_host = "@dns"`, which auto-targets the VPN's own pushed DNS server — always routed and always up, so you don't have to name it.
+
+### Healing a collapsed tunnel MTU
+
+openconnect probes the tunnel's path MTU whenever it (re)connects. On an *in-process* reconnect after a same-IP Wi-Fi blip it re-probes while the path is still lossy, can misread lost probes as "MTU too big", and ratchets the MTU down to the 576 floor — where it **stays** (it never re-probes upward). The result is a tunnel that reports "connected" but silently drops large packets: small requests work while big ones (most web pages) time out. A *fresh* connect re-probes on a settled path and comes up at the correct MTU, so it never hits this. (This is distinct from a full drop, which [Sleep and wake](#sleep-and-wake) already recovers.)
+
+When `mtu_healthcheck` is on (the default), the keepalive loop watches for exactly this signature — the target answers a small ping but not a large *don't-fragment* one, for two checks in a row — and forces a fresh reconnect: openconnect exits, and the auto-start agent's `KeepAlive` respawns the connect script, which reconnects on a settled path. To avoid false heals it first confirms the target *does* answer a large don't-fragment ping while the tunnel is healthy; a target that blocks large ICMP simply disables the check for that session (logged) rather than triggering a reconnect loop.
+
+Healing therefore has two requirements, and turns itself off (with a logged line) when either is missing:
+
+- **`keepalive_host` must be set** — the check reuses the keepalive target and loop, so with keepalive off it does nothing.
+- **You must be running under the `KeepAlive` auto-start agent** (`./install-autostart.sh install`) — healing deliberately drops the tunnel, which only helps if something restarts it. Under `install --once` or a manual run nothing does, so healing there would take a degraded-but-usable tunnel permanently down; the loop refuses instead. This is the same "is anyone watching?" asymmetry that sizes `reconnect_timeout` below.
 
 ## Sleep and wake
 

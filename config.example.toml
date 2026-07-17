@@ -53,6 +53,17 @@ server = "vpn.example.com"
 # keepalive_host = ""
 # keepalive_interval = 30
 
+# Heal a collapsed tunnel MTU. After a same-IP Wi-Fi blip, openconnect's in-process reconnect
+# can re-probe the path MTU over a still-flaky link and ratchet it to the 576 floor and STAY
+# there -- large packets then fail (browser timeouts) while small ones work. When on, the
+# keepalive loop detects this (the target answers a small ping but not a large don't-fragment
+# one, for a couple of checks) and forces a fresh reconnect, which re-probes cleanly. Needs BOTH
+# keepalive (it reuses the keepalive target + loop, so it does nothing when keepalive_host = "")
+# and the KeepAlive auto-start agent: healing drops the tunnel on purpose, which only helps if
+# something respawns the connect script. Under `install --once` or a manual run nothing does, so
+# it turns itself off there (logged) rather than take a degraded-but-up tunnel permanently down.
+# mtu_healthcheck = true
+
 # How long openconnect retries in-process after a drop before giving up (seconds; 0 = give
 # up at once). There is no single default: it is 30 under the KeepAlive auto-start agent
 # (which respawns a fresh connect) and 300 under `install --once` or a manual run (nothing

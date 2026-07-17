@@ -34,6 +34,7 @@ SCALARS = {
     "server":             ("SERVER", "str"),
     "protocol":           ("PROTOCOL", "str"),
     "allow_incoming":     ("ALLOW_INCOMING", "bool"),
+    "mtu_healthcheck":    ("MTU_HEALTHCHECK", "bool"),
     "keepalive_host":     ("KEEPALIVE_HOST", "str"),
     "keepalive_interval": ("KEEPALIVE_INTERVAL", "int"),
     "reconnect_timeout":  ("RECONNECT_TIMEOUT", "int"),
